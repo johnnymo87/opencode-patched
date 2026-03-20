@@ -1,0 +1,130 @@
+name: Check Upstream Patch Status
+
+on:
+  schedule:
+    # Monthly on the 1st at 00:00 UTC
+    - cron: '0 0 1 * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  check-upstream:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check PR #5422 (caching) status
+        id: check_caching_pr
+        run: |
+          PR_STATE=$(gh pr view 5422 --repo anomalyco/opencode --json state --jq .state 2>/dev/null || echo "UNKNOWN")
+          echo "state=$PR_STATE" >> $GITHUB_OUTPUT
+          echo "Caching PR #5422: $PR_STATE"
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+      - name: Check PR #12679 (vim) status
+        id: check_vim_pr
+        run: |
+          PR_STATE=$(gh pr view 12679 --repo anomalyco/opencode --json state --jq .state 2>/dev/null || echo "UNKNOWN")
+          echo "state=$PR_STATE" >> $GITHUB_OUTPUT
+          echo "Vim PR #12679: $PR_STATE"
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+      - name: Create sunset recommendation
+        if: steps.check_caching_pr.outputs.state == 'MERGED' || steps.check_vim_pr.outputs.state == 'MERGED'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const cachingState = '${{ steps.check_caching_pr.outputs.state }}';
+            const vimState = '${{ steps.check_vim_pr.outputs.state }}';
+            const bothMerged = cachingState === 'MERGED' && vimState === 'MERGED';
+
+            let title, body;
+
+            if (bothMerged) {
+              title = 'Both upstream PRs merged - sunset this repo';
+              body = `
+            ## Both Patches Merged Upstream
+
+            - **Caching PR #5422**: MERGED
+            - **Vim PR #12679**: MERGED
+
+            Both patches are now available in official OpenCode releases. This repo can be archived.
+
+            ### Recommended Actions
+
+            1. Verify the latest upstream release includes both features
+            2. Update [workstation](https://github.com/johnnymo87/workstation) to use upstream OpenCode directly
+            3. Archive this repository
+            4. Archive [opencode-cached](https://github.com/johnnymo87/opencode-cached) too
+              `;
+            } else if (cachingState === 'MERGED') {
+              title = 'Caching PR #5422 merged - drop caching patch fetch';
+              body = `
+            ## Caching Patch Merged Upstream
+
+            - **Caching PR #5422**: MERGED
+            - **Vim PR #12679**: ${vimState}
+
+            The caching patch is now in official releases. Update \`apply.sh\` to stop fetching it.
+
+            ### Recommended Actions
+
+            1. Remove caching patch fetch from \`patches/apply.sh\`
+            2. Only apply \`vim.patch\` going forward
+            3. Update \`sync-cached.yml\` to check upstream releases directly (not opencode-cached)
+            4. Consider archiving [opencode-cached](https://github.com/johnnymo87/opencode-cached)
+              `;
+            } else {
+              title = 'Vim PR #12679 merged - drop vim patch';
+              body = `
+            ## Vim Patch Merged Upstream
+
+            - **Caching PR #5422**: ${cachingState}
+            - **Vim PR #12679**: MERGED
+
+            Vim keybindings are now in official releases.
+
+            ### Recommended Actions
+
+            1. Remove \`patches/vim.patch\`
+            2. Switch [workstation](https://github.com/johnnymo87/workstation) back to [opencode-cached](https://github.com/johnnymo87/opencode-cached) releases
+            3. Archive this repository
+              `;
+            }
+
+            const issues = await github.rest.issues.listForRepo({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              state: 'open',
+              labels: 'sunset-check'
+            });
+
+            const existingIssue = issues.data.find(i => i.labels.some(l => l.name === 'sunset-check'));
+
+            if (existingIssue) {
+              console.log(`Issue already exists: #${existingIssue.number}`);
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: existingIssue.number,
+                body: `Monthly check (${new Date().toISOString().split('T')[0]}): Caching PR: ${cachingState}, Vim PR: ${vimState}`
+              });
+            } else {
+              await github.rest.issues.create({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                title: title,
+                body: body,
+                labels: ['sunset-check', 'review-needed']
+              });
+              console.log('Created sunset issue');
+            }
+
+      - name: Report status
+        run: |
+          echo "Monthly upstream check complete"
+          echo "Caching PR #5422: ${{ steps.check_caching_pr.outputs.state }}"
+          echo "Vim PR #12679: ${{ steps.check_vim_pr.outputs.state }}"

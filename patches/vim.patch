@@ -1,0 +1,1811 @@
+diff --git a/packages/opencode/src/cli/cmd/tui/app.tsx b/packages/opencode/src/cli/cmd/tui/app.tsx
+index 3304d6be6a6..ef9274528ae 100644
+--- a/packages/opencode/src/cli/cmd/tui/app.tsx
++++ b/packages/opencode/src/cli/cmd/tui/app.tsx
+@@ -40,6 +40,7 @@ import { writeHeapSnapshot } from "v8"
+ import { PromptRefProvider, usePromptRef } from "./context/prompt"
+ import { TuiConfigProvider } from "./context/tui-config"
+ import { TuiConfig } from "@/config/tui"
++import { useVimEnabled } from "./component/vim"
+ 
+ async function getTerminalBackgroundColor(): Promise<"dark" | "light"> {
+   // can't set raw mode if not a TTY
+@@ -213,6 +214,7 @@ function App() {
+   const sync = useSync()
+   const exit = useExit()
+   const promptRef = usePromptRef()
++  const vim = useVimEnabled()
+ 
+   useKeyboard((evt) => {
+     if (!Flag.OPENCODE_EXPERIMENTAL_DISABLE_COPY_ON_SELECT) return
+@@ -636,6 +638,15 @@ function App() {
+         dialog.clear()
+       },
+     },
++    {
++      title: "Toggle vim mode",
++      value: "input.vim.toggle",
++      category: "System",
++      onSelect: (dialog) => {
++        kv.set("input_vim_mode", !vim())
++        dialog.clear()
++      },
++    },
+     {
+       title: kv.get("animations_enabled", true) ? "Disable animations" : "Enable animations",
+       value: "app.toggle.animations",
+diff --git a/packages/opencode/src/cli/cmd/tui/component/prompt/index.tsx b/packages/opencode/src/cli/cmd/tui/component/prompt/index.tsx
+index d63c248fb83..ec3d233d040 100644
+--- a/packages/opencode/src/cli/cmd/tui/component/prompt/index.tsx
++++ b/packages/opencode/src/cli/cmd/tui/component/prompt/index.tsx
+@@ -34,6 +34,11 @@ import { useToast } from "../../ui/toast"
+ import { useKV } from "../../context/kv"
+ import { useTextareaKeybindings } from "../textarea-keybindings"
+ import { DialogSkill } from "../dialog-skill"
++import { useVimEnabled } from "../vim"
++import { createVimState, type VimMode } from "../vim/vim-state"
++import { createVimHandler } from "../vim/vim-handler"
++import { vimScroll } from "../vim/vim-scroll"
++import { useVimIndicator } from "../vim/vim-indicator"
+ 
+ export type PromptProps = {
+   sessionID?: string
+@@ -57,6 +62,7 @@ export type PromptRef = {
+ 
+ const PLACEHOLDERS = ["Fix a TODO in the codebase", "What is the tech stack of this project?", "Fix broken tests"]
+ const SHELL_PLACEHOLDERS = ["ls -la", "git status", "pwd"]
++let lastVimMode: VimMode = "insert"
+ 
+ export function Prompt(props: PromptProps) {
+   let input: TextareaRenderable
+@@ -77,6 +83,7 @@ export function Prompt(props: PromptProps) {
+   const renderer = useRenderer()
+   const { theme, syntax } = useTheme()
+   const kv = useKV()
++  const vimEnabled = useVimEnabled()
+ 
+   function promptModelWarning() {
+     toast.show({
+@@ -113,6 +120,19 @@ export function Prompt(props: PromptProps) {
+     if (!props.disabled) input.cursorColor = theme.text
+   })
+ 
++  createEffect(() => {
++    if (!input || input.isDestroyed) return
++    if (vimEnabled() && store.mode === "normal") {
++      if (vimState.isInsert()) {
++        input.cursorStyle = { style: "line", blinking: true }
++        return
++      }
++      input.cursorStyle = { style: "block", blinking: false }
++      return
++    }
++    input.cursorStyle = { style: "block", blinking: true }
++  })
++
+   const lastUserMessage = createMemo(() => {
+     if (!props.sessionID) return undefined
+     const messages = sync.data.message[props.sessionID]
+@@ -136,6 +156,37 @@ export function Prompt(props: PromptProps) {
+     extmarkToPartIndex: new Map(),
+     interrupt: 0,
+   })
++  const vimState = createVimState({
++    enabled: vimEnabled,
++    initial: () => lastVimMode,
++  })
++  onCleanup(() => {
++    if (vimEnabled()) lastVimMode = vimState.mode()
++  })
++  const vimIndicator = useVimIndicator({
++    enabled: vimEnabled,
++    active: () => store.mode === "normal",
++    state: vimState,
++  })
++  const vim = createVimHandler({
++    enabled: vimEnabled,
++    state: vimState,
++    textarea: () => input,
++    submit,
++    scroll(action) {
++      if (action === "line-down") command.trigger("session.line.down")
++      if (action === "line-up") command.trigger("session.line.up")
++      if (action === "half-down") command.trigger("session.half.page.down")
++      if (action === "half-up") command.trigger("session.half.page.up")
++      if (action === "page-down") command.trigger("session.page.down")
++      if (action === "page-up") command.trigger("session.page.up")
++    },
++    jump(action) {
++      if (action === "top") command.trigger("session.first")
++      if (action === "bottom") command.trigger("session.last")
++    },
++    autocomplete: () => autocomplete.visible,
++  })
+ 
+   createEffect(
+     on(
+@@ -184,7 +235,6 @@ export function Prompt(props: PromptProps) {
+       {
+         title: "Submit prompt",
+         value: "prompt.submit",
+-        keybind: "input_submit",
+         category: "Prompt",
+         hidden: true,
+         onSelect: (dialog) => {
+@@ -220,9 +270,16 @@ export function Prompt(props: PromptProps) {
+         onSelect: (dialog) => {
+           if (autocomplete.visible) return
+           if (!input.focused) return
++          if (vimEnabled() && store.mode === "normal" && vimState.isInsert()) {
++            vimState.setMode("normal")
++            setStore("interrupt", 0)
++            dialog.clear()
++            return
++          }
+           // TODO: this should be its own command
+           if (store.mode === "shell") {
+             setStore("mode", "normal")
++            vimState.clearPending()
+             return
+           }
+           if (!props.sessionID) return
+@@ -389,9 +446,24 @@ export function Prompt(props: PromptProps) {
+ 
+   createEffect(() => {
+     if (props.visible !== false) input?.focus()
+-    if (props.visible === false) input?.blur()
++    if (props.visible === false) {
++      input?.blur()
++      vimState.clearPending()
++    }
+   })
+ 
++  function submitFromTextarea() {
++    if (store.mode !== "normal") {
++      submit()
++      return
++    }
++    if (vimEnabled() && vimState.isInsert()) {
++      input.insertText("\n")
++      return
++    }
++    submit()
++  }
++
+   function restoreExtmarksFromParts(parts: PromptInfo["parts"]) {
+     input.extmarks.clear()
+     setStore("extmarkToPartIndex", new Map())
+@@ -635,6 +707,7 @@ export function Prompt(props: PromptProps) {
+         })
+         .catch(() => {})
+     }
++    vimState.clearPending()
+     history.append({
+       ...store.prompt,
+       mode: currentMode,
+@@ -863,10 +936,11 @@ export function Prompt(props: PromptProps) {
+                   setStore("extmarkToPartIndex", new Map())
+                   return
+                 }
+-                if (keybind.match("app_exit", e)) {
++                const isVimScrollOverride =
++                  vimEnabled() && store.mode === "normal" && vimState.mode() === "normal" && !!vimScroll(e)
++                if (!isVimScrollOverride && keybind.match("app_exit", e)) {
+                   if (store.prompt.input === "") {
+                     await exit()
+-                    // Don't preventDefault - let textarea potentially handle the event
+                     e.preventDefault()
+                     return
+                   }
+@@ -880,11 +954,14 @@ export function Prompt(props: PromptProps) {
+                 if (store.mode === "shell") {
+                   if ((e.name === "backspace" && input.visualCursor.offset === 0) || e.name === "escape") {
+                     setStore("mode", "normal")
++                    vimState.clearPending()
+                     e.preventDefault()
+                     return
+                   }
+                 }
+                 if (store.mode === "normal") autocomplete.onKeyDown(e)
++                if (e.defaultPrevented) return
++                if (store.mode === "normal" && vim.handleKey(e)) return
+                 if (!autocomplete.visible) {
+                   if (
+                     (keybind.match("history_previous", e) && input.cursorOffset === 0) ||
+@@ -910,7 +987,7 @@ export function Prompt(props: PromptProps) {
+                     input.cursorOffset = input.plainText.length
+                 }
+               }}
+-              onSubmit={submit}
++              onSubmit={submitFromTextarea}
+               onPaste={async (event: PasteEvent) => {
+                 if (props.disabled) {
+                   event.preventDefault()
+@@ -1044,6 +1121,9 @@ export function Prompt(props: PromptProps) {
+           />
+         </box>
+         <box flexDirection="row" justifyContent="space-between">
++          <Show when={vimIndicator()}>
++            {(indicator) => <text fg={local.agent.color(local.agent.current().name)}>-- {indicator()} --</text>}
++          </Show>
+           <Show when={status().type !== "idle"} fallback={<text />}>
+             <box
+               flexDirection="row"
+diff --git a/packages/opencode/src/cli/cmd/tui/component/vim/index.ts b/packages/opencode/src/cli/cmd/tui/component/vim/index.ts
+new file mode 100644
+index 00000000000..453b03fa6d9
+--- /dev/null
++++ b/packages/opencode/src/cli/cmd/tui/component/vim/index.ts
+@@ -0,0 +1,14 @@
++import { createMemo } from "solid-js"
++import { useKV } from "../../context/kv"
++import { useTuiConfig } from "../../context/tui-config"
++
++export function useVimEnabled() {
++  const kv = useKV()
++  const config = useTuiConfig()
++
++  return createMemo(() => {
++    const stored = kv.get("input_vim_mode")
++    if (stored !== undefined) return stored
++    return config.vim ?? false
++  })
++}
+diff --git a/packages/opencode/src/cli/cmd/tui/component/vim/vim-handler.ts b/packages/opencode/src/cli/cmd/tui/component/vim/vim-handler.ts
+new file mode 100644
+index 00000000000..f4c59445119
+--- /dev/null
++++ b/packages/opencode/src/cli/cmd/tui/component/vim/vim-handler.ts
+@@ -0,0 +1,321 @@
++import type { Accessor } from "solid-js"
++import type { createVimState } from "./vim-state"
++import type { TextareaRenderable } from "@opentui/core"
++import { vimScroll, type VimScroll } from "./vim-scroll"
++import { vimJump, type VimJump } from "./vim-motion-jump"
++import {
++  appendAfterCursor,
++  appendLineEnd,
++  deleteLine,
++  deleteUnderCursor,
++  deleteWord,
++  insertLineStart,
++  moveBigWordEnd,
++  moveBigWordNext,
++  moveBigWordPrev,
++  moveFirstNonWhitespace,
++  moveLeft,
++  moveLineBeginning,
++  moveLineDown,
++  moveLineUp,
++  moveRight,
++  moveLineEnd,
++  moveWordEnd,
++  moveWordNext,
++  moveWordPrev,
++  openLineAbove,
++  openLineBelow,
++  substituteLine,
++} from "./vim-motions"
++
++export type VimEvent = {
++  name?: string
++  shift?: boolean
++  ctrl?: boolean
++  meta?: boolean
++  super?: boolean
++  preventDefault: () => void
++}
++
++export function createVimHandler(input: {
++  enabled: Accessor<boolean>
++  state: ReturnType<typeof createVimState>
++  textarea: Accessor<TextareaRenderable>
++  submit: () => void
++  scroll: (action: VimScroll) => void
++  jump: (action: VimJump) => void
++  autocomplete?: () => false | "@" | "/"
++}) {
++  function hasModifier(event: VimEvent) {
++    return !!event.ctrl || !!event.meta || !!event.super
++  }
++
++  function isPrintable(event: VimEvent) {
++    return !!event.name && event.name.length === 1
++  }
++
++  function isShifted(event: VimEvent, key: string) {
++    return event.name === key.toUpperCase() || (event.name === key && !!event.shift)
++  }
++
++  return {
++    handleKey(event: VimEvent) {
++      if (!input.enabled()) return false
++
++      if (input.state.isInsert()) {
++        if (event.name !== "escape") return false
++        input.state.setMode("normal")
++        event.preventDefault()
++        return true
++      }
++
++      const key = event.name ?? ""
++
++      const scroll = vimScroll(event)
++      if (scroll) {
++        input.state.clearPending()
++        input.scroll(scroll)
++        event.preventDefault()
++        return true
++      }
++
++      const jump = vimJump(event, input.state)
++      if (jump.handled) {
++        if (jump.action) {
++          input.state.clearPending()
++          input.jump(jump.action)
++        }
++        event.preventDefault()
++        return true
++      }
++
++      if (key === "escape") {
++        if (!input.state.pending()) return false
++        input.state.clearPending()
++        event.preventDefault()
++        return true
++      }
++
++      if (input.state.pending() === "c") {
++        if (key === "c" && !event.shift && !hasModifier(event)) {
++          substituteLine(input.textarea())
++          input.state.clearPending()
++          input.state.setMode("insert")
++          event.preventDefault()
++          return true
++        }
++
++        if (key === "w" && !event.shift && !hasModifier(event)) {
++          deleteWord(input.textarea())
++          input.state.clearPending()
++          input.state.setMode("insert")
++          event.preventDefault()
++          return true
++        }
++
++        if (hasModifier(event)) {
++          input.state.clearPending()
++          return false
++        }
++
++        input.state.clearPending()
++      }
++
++      if (input.state.pending() === "d") {
++        if (key === "d" && !event.shift && !hasModifier(event)) {
++          deleteLine(input.textarea())
++          input.state.clearPending()
++          event.preventDefault()
++          return true
++        }
++
++        if (key === "w" && !event.shift && !hasModifier(event)) {
++          deleteWord(input.textarea())
++          input.state.clearPending()
++          event.preventDefault()
++          return true
++        }
++
++        if (hasModifier(event)) {
++          input.state.clearPending()
++          return false
++        }
++
++        input.state.clearPending()
++      }
++
++      if (key === "return" && !hasModifier(event)) {
++        input.submit()
++        input.state.clearPending()
++        event.preventDefault()
++        return true
++      }
++
++      if ((key === "/" || key === "@") && !hasModifier(event)) {
++        if (input.autocomplete?.() && input.textarea().cursorOffset === 0 && input.textarea().plainText.length === 0) {
++          input.state.setMode("insert")
++          return false
++        }
++        event.preventDefault()
++        return true
++      }
++
++      if (key === "c" && !event.shift && !hasModifier(event)) {
++        input.state.setPending("c")
++        event.preventDefault()
++        return true
++      }
++
++      if (key === "d" && !event.shift && !hasModifier(event)) {
++        input.state.setPending("d")
++        event.preventDefault()
++        return true
++      }
++
++      if (isShifted(event, "s") && !hasModifier(event)) {
++        input.state.clearPending()
++        substituteLine(input.textarea())
++        input.state.setMode("insert")
++        event.preventDefault()
++        return true
++      }
++
++      if (key === "i" && !event.shift && !hasModifier(event)) {
++        input.state.setMode("insert")
++        event.preventDefault()
++        return true
++      }
++
++      if (isShifted(event, "i") && !hasModifier(event)) {
++        insertLineStart(input.textarea())
++        input.state.setMode("insert")
++        event.preventDefault()
++        return true
++      }
++
++      if (key === "a" && !event.shift && !hasModifier(event)) {
++        appendAfterCursor(input.textarea())
++        input.state.setMode("insert")
++        event.preventDefault()
++        return true
++      }
++
++      if (isShifted(event, "a") && !hasModifier(event)) {
++        appendLineEnd(input.textarea())
++        input.state.setMode("insert")
++        event.preventDefault()
++        return true
++      }
++
++      if (key === "o" && !event.shift && !hasModifier(event)) {
++        openLineBelow(input.textarea())
++        input.state.setMode("insert")
++        event.preventDefault()
++        return true
++      }
++
++      if (isShifted(event, "o") && !hasModifier(event)) {
++        openLineAbove(input.textarea())
++        input.state.setMode("insert")
++        event.preventDefault()
++        return true
++      }
++
++      if (key === "h" && !event.shift && !hasModifier(event)) {
++        moveLeft(input.textarea())
++        event.preventDefault()
++        return true
++      }
++
++      if (key === "l" && !event.shift && !hasModifier(event)) {
++        moveRight(input.textarea())
++        event.preventDefault()
++        return true
++      }
++
++      if (key === "j" && !event.shift && !hasModifier(event)) {
++        moveLineDown(input.textarea())
++        event.preventDefault()
++        return true
++      }
++
++      if (key === "k" && !event.shift && !hasModifier(event)) {
++        moveLineUp(input.textarea())
++        event.preventDefault()
++        return true
++      }
++
++      if (key === "0" && !event.shift && !hasModifier(event)) {
++        moveLineBeginning(input.textarea())
++        event.preventDefault()
++        return true
++      }
++
++      if (key === "^" && !hasModifier(event)) {
++        moveFirstNonWhitespace(input.textarea())
++        event.preventDefault()
++        return true
++      }
++
++      if (key === "$" && !hasModifier(event)) {
++        moveLineEnd(input.textarea())
++        event.preventDefault()
++        return true
++      }
++
++      if (key === "x" && !event.shift && !hasModifier(event)) {
++        deleteUnderCursor(input.textarea())
++        event.preventDefault()
++        return true
++      }
++
++      if (key === "w" && !event.shift && !hasModifier(event)) {
++        moveWordNext(input.textarea())
++        event.preventDefault()
++        return true
++      }
++
++      if (key === "b" && !event.shift && !hasModifier(event)) {
++        moveWordPrev(input.textarea())
++        event.preventDefault()
++        return true
++      }
++
++      if (key === "e" && !event.shift && !hasModifier(event)) {
++        moveWordEnd(input.textarea())
++        event.preventDefault()
++        return true
++      }
++
++      if (isShifted(event, "w") && !hasModifier(event)) {
++        moveBigWordNext(input.textarea())
++        event.preventDefault()
++        return true
++      }
++
++      if (isShifted(event, "b") && !hasModifier(event)) {
++        moveBigWordPrev(input.textarea())
++        event.preventDefault()
++        return true
++      }
++
++      if (isShifted(event, "e") && !hasModifier(event)) {
++        moveBigWordEnd(input.textarea())
++        event.preventDefault()
++        return true
++      }
++
++      if (key === "backspace" || key === "delete") {
++        event.preventDefault()
++        return true
++      }
++
++      if (isPrintable(event) && !hasModifier(event)) {
++        event.preventDefault()
++        return true
++      }
++
++      return false
++    },
++  }
++}
+diff --git a/packages/opencode/src/cli/cmd/tui/component/vim/vim-indicator.ts b/packages/opencode/src/cli/cmd/tui/component/vim/vim-indicator.ts
+new file mode 100644
+index 00000000000..7e6ec76012b
+--- /dev/null
++++ b/packages/opencode/src/cli/cmd/tui/component/vim/vim-indicator.ts
+@@ -0,0 +1,14 @@
++import { createMemo, type Accessor } from "solid-js"
++import type { createVimState } from "./vim-state"
++
++export function useVimIndicator(input: {
++  enabled: Accessor<boolean>
++  active: Accessor<boolean>
++  state: ReturnType<typeof createVimState>
++}) {
++  return createMemo(() => {
++    if (!input.enabled() || !input.active()) return
++    if (input.state.isInsert()) return "INSERT"
++    return undefined
++  })
++}
+diff --git a/packages/opencode/src/cli/cmd/tui/component/vim/vim-motion-jump.ts b/packages/opencode/src/cli/cmd/tui/component/vim/vim-motion-jump.ts
+new file mode 100644
+index 00000000000..279fe9a6ff5
+--- /dev/null
++++ b/packages/opencode/src/cli/cmd/tui/component/vim/vim-motion-jump.ts
+@@ -0,0 +1,32 @@
++import type { VimEvent } from "./vim-handler"
++import type { createVimState } from "./vim-state"
++
++export type VimJump = "top" | "bottom"
++
++export function vimJump(event: VimEvent, state: ReturnType<typeof createVimState>) {
++  const key = event.name ?? ""
++  const hasModifier = !!event.ctrl || !!event.meta || !!event.super
++
++  if (hasModifier) {
++    if (state.pending() === "g") state.clearPending()
++    return { handled: false }
++  }
++
++  if (key === "G" || (key === "g" && event.shift)) {
++    state.clearPending()
++    return { action: "bottom" as VimJump, handled: true }
++  }
++
++  if (key !== "g") {
++    if (state.pending() === "g") state.clearPending()
++    return { handled: false }
++  }
++
++  if (state.pending() === "g") {
++    state.clearPending()
++    return { action: "top" as VimJump, handled: true }
++  }
++
++  state.setPending("g")
++  return { handled: true }
++}
+diff --git a/packages/opencode/src/cli/cmd/tui/component/vim/vim-motions.ts b/packages/opencode/src/cli/cmd/tui/component/vim/vim-motions.ts
+new file mode 100644
+index 00000000000..c86a62bc285
+--- /dev/null
++++ b/packages/opencode/src/cli/cmd/tui/component/vim/vim-motions.ts
+@@ -0,0 +1,254 @@
++import type { TextareaRenderable } from "@opentui/core"
++
++function lineStart(text: string, offset: number) {
++  if (offset <= 0) return 0
++  const index = text.lastIndexOf("\n", offset - 1)
++  if (index === -1) return 0
++  return index + 1
++}
++
++function lineEnd(text: string, offset: number) {
++  const index = text.indexOf("\n", offset)
++  if (index === -1) return text.length
++  return index
++}
++
++function lineLast(text: string, offset: number) {
++  const start = lineStart(text, offset)
++  const end = lineEnd(text, offset)
++  if (end > start) return end - 1
++  return start
++}
++
++function prevLineStart(text: string, offset: number) {
++  const start = lineStart(text, offset)
++  if (start === 0) return undefined
++  return lineStart(text, start - 1)
++}
++
++function nextLineStart(text: string, offset: number) {
++  const end = lineEnd(text, offset)
++  if (end >= text.length) return undefined
++  return end + 1
++}
++
++function moveUp(text: string, offset: number) {
++  const currentStart = lineStart(text, offset)
++  const targetStart = prevLineStart(text, offset)
++  if (targetStart === undefined) return offset
++  const targetLast = lineLast(text, targetStart)
++  const col = offset - currentStart
++  return Math.min(targetStart + col, targetLast)
++}
++
++function moveDown(text: string, offset: number) {
++  const currentStart = lineStart(text, offset)
++  const targetStart = nextLineStart(text, offset)
++  if (targetStart === undefined) return offset
++  const targetLast = lineLast(text, targetStart)
++  const col = offset - currentStart
++  return Math.min(targetStart + col, targetLast)
++}
++
++export function moveLeft(textarea: TextareaRenderable) {
++  const text = textarea.plainText
++  const start = lineStart(text, textarea.cursorOffset)
++  textarea.cursorOffset = Math.max(start, textarea.cursorOffset - 1)
++}
++
++export function moveLineBeginning(textarea: TextareaRenderable) {
++  const text = textarea.plainText
++  textarea.cursorOffset = lineStart(text, textarea.cursorOffset)
++}
++
++export function moveFirstNonWhitespace(textarea: TextareaRenderable) {
++  const text = textarea.plainText
++  textarea.cursorOffset = firstNonWhitespace(text, textarea.cursorOffset)
++}
++
++export function moveLineEnd(textarea: TextareaRenderable) {
++  const text = textarea.plainText
++  textarea.cursorOffset = lineLast(text, textarea.cursorOffset)
++}
++
++export function moveRight(textarea: TextareaRenderable) {
++  const text = textarea.plainText
++  const last = lineLast(text, textarea.cursorOffset)
++  textarea.cursorOffset = Math.min(last, textarea.cursorOffset + 1)
++}
++
++export function moveLineUp(textarea: TextareaRenderable) {
++  const text = textarea.plainText
++  textarea.cursorOffset = moveUp(text, textarea.cursorOffset)
++}
++
++export function moveLineDown(textarea: TextareaRenderable) {
++  const text = textarea.plainText
++  textarea.cursorOffset = moveDown(text, textarea.cursorOffset)
++}
++
++function isWord(char: string) {
++  return /[A-Za-z0-9_]/.test(char)
++}
++
++function isBigWord(char: string) {
++  return !/\s/.test(char)
++}
++
++function nextWordStart(text: string, offset: number, big: boolean) {
++  const match = big ? isBigWord : isWord
++  let pos = offset
++  if (pos < text.length && match(text[pos])) {
++    while (pos < text.length && match(text[pos])) pos++
++  }
++  while (pos < text.length && !match(text[pos])) pos++
++  return pos
++}
++
++function prevWordStart(text: string, offset: number, big: boolean) {
++  const match = big ? isBigWord : isWord
++  let pos = offset
++  while (pos > 0 && !match(text[pos - 1])) pos--
++  while (pos > 0 && match(text[pos - 1])) pos--
++  return pos
++}
++
++function wordEnd(text: string, offset: number, big: boolean) {
++  if (text.length === 0) return 0
++  const match = big ? isBigWord : isWord
++  let pos = offset
++  if (pos >= text.length) pos = text.length - 1
++
++  if (match(text[pos]) && (pos + 1 >= text.length || !match(text[pos + 1]))) {
++    pos++
++  }
++
++  while (pos < text.length && !match(text[pos])) pos++
++  if (pos >= text.length) return text.length - 1
++
++  while (pos + 1 < text.length && match(text[pos + 1])) pos++
++  return pos
++}
++
++function deleteOffsets(textarea: TextareaRenderable, startOffset: number, endOffset: number) {
++  if (endOffset <= startOffset) return
++  textarea.cursorOffset = startOffset
++  const start = textarea.logicalCursor
++  textarea.cursorOffset = endOffset
++  const end = textarea.logicalCursor
++  textarea.deleteRange(start.row, start.col, end.row, end.col)
++  textarea.cursorOffset = startOffset
++}
++
++export function moveWordNext(textarea: TextareaRenderable) {
++  const text = textarea.plainText
++  textarea.cursorOffset = nextWordStart(text, textarea.cursorOffset, false)
++}
++
++export function moveWordPrev(textarea: TextareaRenderable) {
++  const text = textarea.plainText
++  textarea.cursorOffset = prevWordStart(text, textarea.cursorOffset, false)
++}
++
++export function moveWordEnd(textarea: TextareaRenderable) {
++  const text = textarea.plainText
++  textarea.cursorOffset = wordEnd(text, textarea.cursorOffset, false)
++}
++
++export function moveBigWordNext(textarea: TextareaRenderable) {
++  const text = textarea.plainText
++  textarea.cursorOffset = nextWordStart(text, textarea.cursorOffset, true)
++}
++
++export function moveBigWordPrev(textarea: TextareaRenderable) {
++  const text = textarea.plainText
++  textarea.cursorOffset = prevWordStart(text, textarea.cursorOffset, true)
++}
++
++export function moveBigWordEnd(textarea: TextareaRenderable) {
++  const text = textarea.plainText
++  textarea.cursorOffset = wordEnd(text, textarea.cursorOffset, true)
++}
++
++function firstNonWhitespace(text: string, offset: number) {
++  const start = lineStart(text, offset)
++  const end = lineEnd(text, offset)
++  let pos = start
++  while (pos < end && /\s/.test(text[pos])) pos++
++  return pos
++}
++
++export function appendAfterCursor(textarea: TextareaRenderable) {
++  const text = textarea.plainText
++  const end = lineEnd(text, textarea.cursorOffset)
++  textarea.cursorOffset = Math.min(textarea.cursorOffset + 1, end)
++}
++
++export function appendLineEnd(textarea: TextareaRenderable) {
++  const text = textarea.plainText
++  textarea.cursorOffset = lineEnd(text, textarea.cursorOffset)
++}
++
++export function insertLineStart(textarea: TextareaRenderable) {
++  const text = textarea.plainText
++  textarea.cursorOffset = firstNonWhitespace(text, textarea.cursorOffset)
++}
++
++export function openLineBelow(textarea: TextareaRenderable) {
++  const text = textarea.plainText
++  const end = lineEnd(text, textarea.cursorOffset)
++  textarea.cursorOffset = end
++  textarea.insertText("\n")
++}
++
++export function openLineAbove(textarea: TextareaRenderable) {
++  const text = textarea.plainText
++  const start = lineStart(text, textarea.cursorOffset)
++  textarea.cursorOffset = start
++  textarea.insertText("\n")
++  textarea.cursorOffset = start
++}
++
++export function deleteUnderCursor(textarea: TextareaRenderable) {
++  const text = textarea.plainText
++  const startOffset = textarea.cursorOffset
++  const end = lineEnd(text, startOffset)
++  if (startOffset >= end) return
++  deleteOffsets(textarea, startOffset, startOffset + 1)
++}
++
++export function deleteWord(textarea: TextareaRenderable) {
++  const text = textarea.plainText
++  const startOffset = textarea.cursorOffset
++  const endOffset = nextWordStart(text, startOffset, false)
++  deleteOffsets(textarea, startOffset, endOffset)
++}
++
++export function deleteLine(textarea: TextareaRenderable) {
++  const text = textarea.plainText
++  if (!text.length) return
++
++  const offset = textarea.cursorOffset
++  const start = lineStart(text, offset)
++  const end = lineEnd(text, offset)
++
++  if (end < text.length) {
++    deleteOffsets(textarea, start, end + 1)
++    return
++  }
++
++  if (start > 0) {
++    deleteOffsets(textarea, start - 1, end)
++    textarea.cursorOffset = lineStart(textarea.plainText, textarea.cursorOffset)
++    return
++  }
++
++  deleteOffsets(textarea, start, end)
++}
++
++export function substituteLine(textarea: TextareaRenderable) {
++  const text = textarea.plainText
++  const start = lineStart(text, textarea.cursorOffset)
++  const end = lineEnd(text, textarea.cursorOffset)
++  deleteOffsets(textarea, start, end)
++}
+diff --git a/packages/opencode/src/cli/cmd/tui/component/vim/vim-scroll.ts b/packages/opencode/src/cli/cmd/tui/component/vim/vim-scroll.ts
+new file mode 100644
+index 00000000000..e886584c985
+--- /dev/null
++++ b/packages/opencode/src/cli/cmd/tui/component/vim/vim-scroll.ts
+@@ -0,0 +1,15 @@
++import type { VimEvent } from "./vim-handler"
++
++export type VimScroll = "line-down" | "line-up" | "half-down" | "half-up" | "page-down" | "page-up"
++
++export function vimScroll(event: VimEvent): VimScroll | undefined {
++  if (!event.ctrl || event.meta || event.super) return
++  const key = event.name ?? ""
++  if (key === "e") return "line-down"
++  if (key === "y") return "line-up"
++  if (key === "d") return "half-down"
++  if (key === "u") return "half-up"
++  if (key === "f") return "page-down"
++  if (key === "b") return "page-up"
++  return undefined
++}
+diff --git a/packages/opencode/src/cli/cmd/tui/component/vim/vim-state.ts b/packages/opencode/src/cli/cmd/tui/component/vim/vim-state.ts
+new file mode 100644
+index 00000000000..d3f8ca5faae
+--- /dev/null
++++ b/packages/opencode/src/cli/cmd/tui/component/vim/vim-state.ts
+@@ -0,0 +1,41 @@
++import { createEffect, createMemo, createSignal, type Accessor } from "solid-js"
++
++export type VimMode = "normal" | "insert"
++export type VimPending = "" | "c" | "d" | "g"
++
++export function createVimState(input: { enabled: Accessor<boolean>; initial?: Accessor<VimMode | undefined> }) {
++  const [mode, setMode] = createSignal<VimMode>(input.initial?.() ?? "insert")
++  const [pending, setPending] = createSignal<VimPending>("")
++
++  function clearPending() {
++    if (pending()) setPending("")
++  }
++
++  function changeMode(next: VimMode) {
++    clearPending()
++    setMode(next)
++  }
++
++  createEffect(() => {
++    const enabled = input.enabled()
++
++    if (!enabled) {
++      if (mode() !== "insert") setMode("insert")
++      clearPending()
++      return
++    }
++  })
++
++  return {
++    mode,
++    setMode: changeMode,
++    pending,
++    setPending,
++    clearPending,
++    reset() {
++      clearPending()
++      setMode("insert")
++    },
++    isInsert: createMemo(() => mode() === "insert"),
++  }
++}
+diff --git a/packages/opencode/src/config/tui-schema.ts b/packages/opencode/src/config/tui-schema.ts
+index f9068e3f01d..300c9d31d84 100644
+--- a/packages/opencode/src/config/tui-schema.ts
++++ b/packages/opencode/src/config/tui-schema.ts
+@@ -22,6 +22,7 @@ export const TuiOptions = z.object({
+     .enum(["auto", "stacked"])
+     .optional()
+     .describe("Control diff rendering style: 'auto' adapts to terminal width, 'stacked' always shows single column"),
++  vim: z.boolean().optional().describe("Enable vim-style input for the prompt"),
+ })
+ 
+ export const TuiInfo = z
+diff --git a/packages/opencode/test/cli/tui/vim-motions.test.ts b/packages/opencode/test/cli/tui/vim-motions.test.ts
+new file mode 100644
+index 00000000000..4565b09ba7f
+--- /dev/null
++++ b/packages/opencode/test/cli/tui/vim-motions.test.ts
+@@ -0,0 +1,776 @@
++import { describe, expect, test } from "bun:test"
++import type { TextareaRenderable } from "@opentui/core"
++import { createSignal } from "solid-js"
++import { createVimHandler } from "../../../src/cli/cmd/tui/component/vim/vim-handler"
++import { createVimState } from "../../../src/cli/cmd/tui/component/vim/vim-state"
++import type { VimScroll } from "../../../src/cli/cmd/tui/component/vim/vim-scroll"
++import { vimScroll } from "../../../src/cli/cmd/tui/component/vim/vim-scroll"
++import type { VimJump } from "../../../src/cli/cmd/tui/component/vim/vim-motion-jump"
++
++function rowColToOffset(text: string, row: number, col: number) {
++  let index = 0
++  let current = 0
++  while (current < row) {
++    const next = text.indexOf("\n", index)
++    if (next === -1) return text.length
++    index = next + 1
++    current++
++  }
++  return Math.min(index + col, text.length)
++}
++
++function offsetToRowCol(text: string, offset: number) {
++  let row = 0
++  let col = 0
++  let index = 0
++  while (index < offset && index < text.length) {
++    if (text[index] === "\n") {
++      row++
++      col = 0
++      index++
++      continue
++    }
++    col++
++    index++
++  }
++  return { row, col }
++}
++
++function createTextarea(text: string) {
++  const textarea = {
++    plainText: text,
++    cursorOffset: 0,
++    get logicalCursor() {
++      return offsetToRowCol(textarea.plainText, textarea.cursorOffset)
++    },
++    insertText(value: string) {
++      const head = textarea.plainText.slice(0, textarea.cursorOffset)
++      const tail = textarea.plainText.slice(textarea.cursorOffset)
++      textarea.plainText = head + value + tail
++      textarea.cursorOffset += value.length
++    },
++    deleteRange(startRow: number, startCol: number, endRow: number, endCol: number) {
++      const start = rowColToOffset(textarea.plainText, startRow, startCol)
++      const end = rowColToOffset(textarea.plainText, endRow, endCol)
++      textarea.plainText = textarea.plainText.slice(0, start) + textarea.plainText.slice(end)
++      textarea.cursorOffset = start
++    },
++  }
++  return textarea as unknown as TextareaRenderable
++}
++
++function createEvent(name: string, options?: { shift?: boolean; ctrl?: boolean; meta?: boolean; super?: boolean }) {
++  let prevented = false
++  return {
++    event: {
++      name,
++      shift: options?.shift,
++      ctrl: options?.ctrl,
++      meta: options?.meta,
++      super: options?.super,
++      preventDefault() {
++        prevented = true
++      },
++    },
++    prevented: () => prevented,
++  }
++}
++
++function createHandler(
++  text: string,
++  options?: {
++    enabled?: boolean
++    mode?: "normal" | "insert"
++    submit?: () => void
++    autocomplete?: () => false | "@" | "/"
++  },
++) {
++  const textarea = createTextarea(text)
++  const [enabled] = createSignal(options?.enabled ?? true)
++  const [mode, setMode] = createSignal<"normal" | "insert">(options?.mode ?? "normal")
++  const [pending, setPending] = createSignal<"" | "c" | "d" | "g">("")
++  const scrollCalls: VimScroll[] = []
++  const jumpCalls: VimJump[] = []
++
++  function clearPending() {
++    setPending("")
++  }
++
++  function changeMode(next: "normal" | "insert") {
++    clearPending()
++    setMode(next)
++  }
++
++  const state: Pick<
++    ReturnType<typeof createVimState>,
++    "mode" | "setMode" | "reset" | "isInsert" | "pending" | "setPending" | "clearPending"
++  > = {
++    mode,
++    setMode: changeMode,
++    pending,
++    setPending,
++    clearPending,
++    reset() {
++      clearPending()
++      setMode("insert")
++    },
++    isInsert: () => mode() === "insert",
++  }
++  const handler = createVimHandler({
++    enabled,
++    state,
++    textarea: () => textarea,
++    submit: options?.submit ?? (() => {}),
++    scroll(action) {
++      scrollCalls.push(action)
++    },
++    jump(action) {
++      jumpCalls.push(action)
++    },
++    autocomplete: options?.autocomplete,
++  })
++
++  return { textarea, handler, state, scrollCalls, jumpCalls }
++}
++
++describe("vim motion handler", () => {
++  test("moves with h j k l and clamps to line", () => {
++    const ctx = createHandler("abc\nxy")
++
++    ctx.handler.handleKey(createEvent("l").event)
++    ctx.handler.handleKey(createEvent("l").event)
++    expect(ctx.textarea.cursorOffset).toBe(2)
++
++    ctx.handler.handleKey(createEvent("j").event)
++    expect(ctx.textarea.cursorOffset).toBe(5)
++
++    ctx.handler.handleKey(createEvent("h").event)
++    expect(ctx.textarea.cursorOffset).toBe(4)
++
++    ctx.handler.handleKey(createEvent("k").event)
++    expect(ctx.textarea.cursorOffset).toBe(0)
++  })
++
++  test("j/k move across leading empty first line", () => {
++    const text = "\nline1\nline2\nline3\n"
++    const ctx = createHandler(text)
++    ctx.textarea.cursorOffset = rowColToOffset(text, 1, 0)
++
++    ctx.handler.handleKey(createEvent("k").event)
++    expect(ctx.textarea.cursorOffset).toBe(rowColToOffset(text, 0, 0))
++
++    ctx.handler.handleKey(createEvent("j").event)
++    expect(ctx.textarea.cursorOffset).toBe(rowColToOffset(text, 1, 0))
++  })
++
++  test("j/k move across trailing empty last line", () => {
++    const text = "\nline1\nline2\nline3\n"
++    const ctx = createHandler(text)
++    ctx.textarea.cursorOffset = rowColToOffset(text, 3, 0)
++
++    ctx.handler.handleKey(createEvent("j").event)
++    expect(ctx.textarea.cursorOffset).toBe(rowColToOffset(text, 4, 0))
++
++    ctx.handler.handleKey(createEvent("k").event)
++    expect(ctx.textarea.cursorOffset).toBe(rowColToOffset(text, 3, 0))
++  })
++
++  test("supports word and big-word key shapes", () => {
++    const ctx = createHandler("foo,bar baz")
++
++    const w = createEvent("w")
++    expect(ctx.handler.handleKey(w.event)).toBe(true)
++    expect(w.prevented()).toBe(true)
++    expect(ctx.textarea.cursorOffset).toBe(4)
++
++    const upperW = createEvent("W")
++    expect(ctx.handler.handleKey(upperW.event)).toBe(true)
++    expect(upperW.prevented()).toBe(true)
++    expect(ctx.textarea.cursorOffset).toBe(8)
++
++    ctx.textarea.cursorOffset = 0
++    const shiftW = createEvent("w", { shift: true })
++    expect(ctx.handler.handleKey(shiftW.event)).toBe(true)
++    expect(shiftW.prevented()).toBe(true)
++    expect(ctx.textarea.cursorOffset).toBe(8)
++
++    const upperE = createEvent("E")
++    expect(ctx.handler.handleKey(upperE.event)).toBe(true)
++    expect(upperE.prevented()).toBe(true)
++    expect(ctx.textarea.cursorOffset).toBe(10)
++
++    const upperB = createEvent("B")
++    expect(ctx.handler.handleKey(upperB.event)).toBe(true)
++    expect(upperB.prevented()).toBe(true)
++    expect(ctx.textarea.cursorOffset).toBe(8)
++  })
++
++  test("e stays on single-char word", () => {
++    const ctx = createHandler("a")
++    ctx.textarea.cursorOffset = 0
++    ctx.handler.handleKey(createEvent("e").event)
++    expect(ctx.textarea.cursorOffset).toBe(0)
++  })
++
++  test("e from end of word moves to next word end", () => {
++    const ctx = createHandler("a b")
++    ctx.textarea.cursorOffset = 0
++    ctx.handler.handleKey(createEvent("e").event)
++    expect(ctx.textarea.cursorOffset).toBe(2)
++  })
++
++  test("e from word end moves to next word end", () => {
++    const ctx = createHandler("ab cd")
++    ctx.textarea.cursorOffset = 1
++    ctx.handler.handleKey(createEvent("e").event)
++    expect(ctx.textarea.cursorOffset).toBe(4)
++  })
++
++  test("e from whitespace moves to next word end", () => {
++    const ctx = createHandler("ab  cd")
++    ctx.textarea.cursorOffset = 2
++    ctx.handler.handleKey(createEvent("e").event)
++    expect(ctx.textarea.cursorOffset).toBe(5)
++  })
++
++  test("0 moves to line beginning", () => {
++    const ctx = createHandler("  hello")
++    ctx.textarea.cursorOffset = 4
++    ctx.handler.handleKey(createEvent("0").event)
++    expect(ctx.textarea.cursorOffset).toBe(0)
++  })
++
++  test("0 on multiline moves to current line start", () => {
++    const ctx = createHandler("abc\n  def")
++    ctx.textarea.cursorOffset = 7
++    ctx.handler.handleKey(createEvent("0").event)
++    expect(ctx.textarea.cursorOffset).toBe(4)
++  })
++
++  test("^ moves to first non-whitespace", () => {
++    const ctx = createHandler("  hello")
++    ctx.textarea.cursorOffset = 5
++    ctx.handler.handleKey(createEvent("^").event)
++    expect(ctx.textarea.cursorOffset).toBe(2)
++  })
++
++  test("^ on line with no leading whitespace goes to column 0", () => {
++    const ctx = createHandler("hello")
++    ctx.textarea.cursorOffset = 3
++    ctx.handler.handleKey(createEvent("^").event)
++    expect(ctx.textarea.cursorOffset).toBe(0)
++  })
++
++  test("$ moves to last char of line", () => {
++    const ctx = createHandler("hello")
++    ctx.textarea.cursorOffset = 0
++    ctx.handler.handleKey(createEvent("$").event)
++    expect(ctx.textarea.cursorOffset).toBe(4)
++  })
++
++  test("$ on multiline moves to last char of current line", () => {
++    const ctx = createHandler("abc\ndef")
++    ctx.textarea.cursorOffset = 0
++    ctx.handler.handleKey(createEvent("$").event)
++    expect(ctx.textarea.cursorOffset).toBe(2)
++  })
++
++  test("$ on single char stays put", () => {
++    const ctx = createHandler("a")
++    ctx.textarea.cursorOffset = 0
++    ctx.handler.handleKey(createEvent("$").event)
++    expect(ctx.textarea.cursorOffset).toBe(0)
++  })
++
++  test("supports insert transitions for A I O", () => {
++    const i0 = createHandler("abc")
++    i0.textarea.cursorOffset = 1
++    expect(i0.handler.handleKey(createEvent("i").event)).toBe(true)
++    expect(i0.state.mode()).toBe("insert")
++    expect(i0.textarea.cursorOffset).toBe(1)
++
++    const i = createHandler("  abc")
++    i.textarea.cursorOffset = 1
++    expect(i.handler.handleKey(createEvent("I").event)).toBe(true)
++    expect(i.state.mode()).toBe("insert")
++    expect(i.textarea.cursorOffset).toBe(2)
++
++    const a = createHandler("  abc")
++    a.textarea.cursorOffset = 1
++    expect(a.handler.handleKey(createEvent("A").event)).toBe(true)
++    expect(a.state.mode()).toBe("insert")
++    expect(a.textarea.cursorOffset).toBe(5)
++
++    const o = createHandler("abc")
++    o.textarea.cursorOffset = 1
++    expect(o.handler.handleKey(createEvent("o", { shift: true }).event)).toBe(true)
++    expect(o.state.mode()).toBe("insert")
++    expect(o.textarea.plainText).toBe("\nabc")
++  })
++
++  test("x deletes under cursor and no-ops at end", () => {
++    const a = createHandler("abc")
++    a.textarea.cursorOffset = 1
++    const x = createEvent("x")
++    expect(a.handler.handleKey(x.event)).toBe(true)
++    expect(x.prevented()).toBe(true)
++    expect(a.textarea.plainText).toBe("ac")
++
++    const b = createHandler("ab\ncd")
++    b.textarea.cursorOffset = 2
++    expect(b.handler.handleKey(createEvent("x").event)).toBe(true)
++    expect(b.textarea.plainText).toBe("ab\ncd")
++  })
++
++  test("S clears current line and enters insert", () => {
++    const ctx = createHandler("one\ntwo\nthree")
++    ctx.textarea.cursorOffset = 5
++    const s = createEvent("S")
++
++    expect(ctx.handler.handleKey(s.event)).toBe(true)
++    expect(s.prevented()).toBe(true)
++    expect(ctx.state.mode()).toBe("insert")
++    expect(ctx.textarea.plainText).toBe("one\n\nthree")
++    expect(ctx.textarea.cursorOffset).toBe(4)
++  })
++
++  test("S clears single line", () => {
++    const ctx = createHandler("abc")
++    const s = createEvent("S")
++
++    expect(ctx.handler.handleKey(s.event)).toBe(true)
++    expect(s.prevented()).toBe(true)
++    expect(ctx.state.mode()).toBe("insert")
++    expect(ctx.textarea.plainText).toBe("")
++    expect(ctx.textarea.cursorOffset).toBe(0)
++  })
++
++  test("S keeps empty buffer", () => {
++    const ctx = createHandler("")
++    const s = createEvent("S")
++
++    expect(ctx.handler.handleKey(s.event)).toBe(true)
++    expect(s.prevented()).toBe(true)
++    expect(ctx.state.mode()).toBe("insert")
++    expect(ctx.textarea.plainText).toBe("")
++    expect(ctx.textarea.cursorOffset).toBe(0)
++  })
++
++  test("cc clears current line and enters insert", () => {
++    const ctx = createHandler("one\ntwo\nthree")
++    ctx.textarea.cursorOffset = 5
++
++    const c1 = createEvent("c")
++    expect(ctx.handler.handleKey(c1.event)).toBe(true)
++    expect(c1.prevented()).toBe(true)
++    expect(ctx.state.pending()).toBe("c")
++
++    const c2 = createEvent("c")
++    expect(ctx.handler.handleKey(c2.event)).toBe(true)
++    expect(c2.prevented()).toBe(true)
++    expect(ctx.state.mode()).toBe("insert")
++    expect(ctx.textarea.plainText).toBe("one\n\nthree")
++    expect(ctx.textarea.cursorOffset).toBe(4)
++    expect(ctx.state.pending()).toBe("")
++  })
++
++  test("cw deletes to next word and enters insert", () => {
++    const ctx = createHandler("hello world test")
++    ctx.textarea.cursorOffset = 0
++
++    const c = createEvent("c")
++    expect(ctx.handler.handleKey(c.event)).toBe(true)
++    expect(ctx.state.pending()).toBe("c")
++
++    const w = createEvent("w")
++    expect(ctx.handler.handleKey(w.event)).toBe(true)
++    expect(w.prevented()).toBe(true)
++    expect(ctx.textarea.plainText).toBe("world test")
++    expect(ctx.textarea.cursorOffset).toBe(0)
++    expect(ctx.state.mode()).toBe("insert")
++    expect(ctx.state.pending()).toBe("")
++  })
++
++  test("pending c clears on escape", () => {
++    const ctx = createHandler("hello world")
++
++    expect(ctx.handler.handleKey(createEvent("c").event)).toBe(true)
++    expect(ctx.state.pending()).toBe("c")
++
++    const esc = createEvent("escape")
++    expect(ctx.handler.handleKey(esc.event)).toBe(true)
++    expect(esc.prevented()).toBe(true)
++    expect(ctx.state.pending()).toBe("")
++    expect(ctx.textarea.plainText).toBe("hello world")
++  })
++
++  test("pending c clears on modifier key", () => {
++    const ctx = createHandler("abc")
++
++    expect(ctx.handler.handleKey(createEvent("c").event)).toBe(true)
++    expect(ctx.state.pending()).toBe("c")
++
++    const mod = createEvent("j", { ctrl: true })
++    expect(ctx.handler.handleKey(mod.event)).toBe(false)
++    expect(mod.prevented()).toBe(false)
++    expect(ctx.state.pending()).toBe("")
++  })
++
++  test("insert mode only handles escape", () => {
++    const ctx = createHandler("abc", { mode: "insert" })
++
++    const w = createEvent("w")
++    expect(ctx.handler.handleKey(w.event)).toBe(false)
++    expect(w.prevented()).toBe(false)
++
++    const esc = createEvent("escape")
++    expect(ctx.handler.handleKey(esc.event)).toBe(true)
++    expect(esc.prevented()).toBe(true)
++    expect(ctx.state.mode()).toBe("normal")
++  })
++
++  test("/ and @ stay in normal mode without autocomplete", () => {
++    const ctx = createHandler("abc", { mode: "normal" })
++
++    const slash = createEvent("/")
++    expect(ctx.handler.handleKey(slash.event)).toBe(true)
++    expect(slash.prevented()).toBe(true)
++    expect(ctx.state.mode()).toBe("normal")
++
++    const at = createEvent("@")
++    expect(ctx.handler.handleKey(at.event)).toBe(true)
++    expect(at.prevented()).toBe(true)
++    expect(ctx.state.mode()).toBe("normal")
++  })
++
++  test("/ enters insert on empty input with autocomplete visible", () => {
++    const ctx = createHandler("", {
++      mode: "normal",
++      autocomplete: () => "/",
++    })
++    const slash = createEvent("/")
++
++    expect(ctx.handler.handleKey(slash.event)).toBe(false)
++    expect(slash.prevented()).toBe(false)
++    expect(ctx.state.mode()).toBe("insert")
++  })
++
++  test("/ stays normal on non-empty input with autocomplete visible", () => {
++    const ctx = createHandler("abc", {
++      mode: "normal",
++      autocomplete: () => "/",
++    })
++    const slash = createEvent("/")
++
++    expect(ctx.handler.handleKey(slash.event)).toBe(true)
++    expect(slash.prevented()).toBe(true)
++    expect(ctx.state.mode()).toBe("normal")
++  })
++
++  test("submit from normal keeps mode and clears pending", () => {
++    let calls = 0
++    const ctx = createHandler("", {
++      mode: "normal",
++      submit() {
++        calls++
++      },
++    })
++    ctx.state.setPending("d")
++
++    ctx.handler.handleKey(createEvent("return").event)
++
++    expect(calls).toBe(1)
++    expect(ctx.state.mode()).toBe("normal")
++    expect(ctx.state.pending()).toBe("")
++  })
++
++  test("vim disabled does not intercept keys", () => {
++    const ctx = createHandler("abc", { enabled: false })
++    const keys = [
++      createEvent("h"),
++      createEvent("x"),
++      createEvent("d"),
++      createEvent("g"),
++      createEvent("d", { ctrl: true }),
++    ]
++
++    for (const key of keys) {
++      expect(ctx.handler.handleKey(key.event)).toBe(false)
++      expect(key.prevented()).toBe(false)
++    }
++
++    expect(ctx.scrollCalls.length).toBe(0)
++    expect(ctx.jumpCalls.length).toBe(0)
++  })
++
++  test("dd deletes current line", () => {
++    const ctx = createHandler("one\ntwo\nthree")
++    ctx.textarea.cursorOffset = 5
++
++    const d1 = createEvent("d")
++    expect(ctx.handler.handleKey(d1.event)).toBe(true)
++    expect(d1.prevented()).toBe(true)
++    expect(ctx.state.pending()).toBe("d")
++
++    const d2 = createEvent("d")
++    expect(ctx.handler.handleKey(d2.event)).toBe(true)
++    expect(d2.prevented()).toBe(true)
++    expect(ctx.textarea.plainText).toBe("one\nthree")
++    expect(ctx.textarea.cursorOffset).toBe(4)
++    expect(ctx.state.pending()).toBe("")
++  })
++
++  test("dd on last line lands at resulting line start", () => {
++    const ctx = createHandler("one\ntwo")
++    ctx.textarea.cursorOffset = 5
++
++    expect(ctx.handler.handleKey(createEvent("d").event)).toBe(true)
++    expect(ctx.handler.handleKey(createEvent("d").event)).toBe(true)
++    expect(ctx.textarea.plainText).toBe("one")
++    expect(ctx.textarea.cursorOffset).toBe(0)
++  })
++
++  test("dw deletes to next word and clears pending", () => {
++    const ctx = createHandler("hello world test")
++    ctx.textarea.cursorOffset = 0
++
++    const d = createEvent("d")
++    expect(ctx.handler.handleKey(d.event)).toBe(true)
++    expect(ctx.state.pending()).toBe("d")
++
++    const w = createEvent("w")
++    expect(ctx.handler.handleKey(w.event)).toBe(true)
++    expect(w.prevented()).toBe(true)
++    expect(ctx.textarea.plainText).toBe("world test")
++    expect(ctx.textarea.cursorOffset).toBe(0)
++    expect(ctx.state.pending()).toBe("")
++  })
++
++  test("pending d clears on escape", () => {
++    const ctx = createHandler("hello world")
++
++    expect(ctx.handler.handleKey(createEvent("d").event)).toBe(true)
++    expect(ctx.state.pending()).toBe("d")
++
++    const esc = createEvent("escape")
++    expect(ctx.handler.handleKey(esc.event)).toBe(true)
++    expect(esc.prevented()).toBe(true)
++    expect(ctx.state.pending()).toBe("")
++    expect(ctx.textarea.plainText).toBe("hello world")
++  })
++
++  test("pending d clears on invalid key and key is handled normally", () => {
++    const ctx = createHandler("abc")
++
++    expect(ctx.handler.handleKey(createEvent("d").event)).toBe(true)
++    expect(ctx.state.pending()).toBe("d")
++
++    const i = createEvent("i")
++    expect(ctx.handler.handleKey(i.event)).toBe(true)
++    expect(i.prevented()).toBe(true)
++    expect(ctx.state.pending()).toBe("")
++    expect(ctx.state.mode()).toBe("insert")
++  })
++
++  test("mode switch clears pending state", () => {
++    const ctx = createHandler("abc")
++    expect(ctx.handler.handleKey(createEvent("d").event)).toBe(true)
++    expect(ctx.state.pending()).toBe("d")
++
++    expect(ctx.handler.handleKey(createEvent("i").event)).toBe(true)
++    expect(ctx.state.mode()).toBe("insert")
++    expect(ctx.state.pending()).toBe("")
++
++    expect(ctx.handler.handleKey(createEvent("escape").event)).toBe(true)
++    expect(ctx.state.mode()).toBe("normal")
++    expect(ctx.state.pending()).toBe("")
++
++    const h = createEvent("h")
++    expect(ctx.handler.handleKey(h.event)).toBe(true)
++    expect(h.prevented()).toBe(true)
++  })
++
++  test("pending d clears on modifier key and event is not consumed", () => {
++    const ctx = createHandler("abc")
++
++    expect(ctx.handler.handleKey(createEvent("d").event)).toBe(true)
++    expect(ctx.state.pending()).toBe("d")
++
++    const mod = createEvent("j", { ctrl: true })
++    expect(ctx.handler.handleKey(mod.event)).toBe(false)
++    expect(mod.prevented()).toBe(false)
++    expect(ctx.state.pending()).toBe("")
++  })
++
++  test("ctrl scroll keys trigger actions", () => {
++    const ctx = createHandler("abc")
++    const keys: Array<[string, VimScroll]> = [
++      ["e", "line-down"],
++      ["y", "line-up"],
++      ["d", "half-down"],
++      ["u", "half-up"],
++      ["f", "page-down"],
++      ["b", "page-up"],
++    ]
++
++    for (const [key, action] of keys) {
++      const evt = createEvent(key, { ctrl: true })
++      expect(ctx.handler.handleKey(evt.event)).toBe(true)
++      expect(evt.prevented()).toBe(true)
++      expect(ctx.scrollCalls.at(-1)).toBe(action)
++    }
++  })
++
++  test("ctrl scroll clears pending operator", () => {
++    const ctx = createHandler("abc")
++    expect(ctx.handler.handleKey(createEvent("d").event)).toBe(true)
++    expect(ctx.state.pending()).toBe("d")
++
++    const evt = createEvent("d", { ctrl: true })
++    expect(ctx.handler.handleKey(evt.event)).toBe(true)
++    expect(evt.prevented()).toBe(true)
++    expect(ctx.scrollCalls.at(-1)).toBe("half-down")
++    expect(ctx.state.pending()).toBe("")
++  })
++
++  test("ctrl scroll not handled in insert mode", () => {
++    const ctx = createHandler("abc", { mode: "insert" })
++    const evt = createEvent("e", { ctrl: true })
++    expect(ctx.handler.handleKey(evt.event)).toBe(false)
++    expect(evt.prevented()).toBe(false)
++    expect(ctx.scrollCalls.length).toBe(0)
++  })
++
++  test("ctrl scroll not handled when vim disabled", () => {
++    const ctx = createHandler("abc", { enabled: false })
++    const evt = createEvent("e", { ctrl: true })
++    expect(ctx.handler.handleKey(evt.event)).toBe(false)
++    expect(evt.prevented()).toBe(false)
++    expect(ctx.scrollCalls.length).toBe(0)
++  })
++
++  test("g and G jump to top or bottom", () => {
++    const ctx = createHandler("abc")
++
++    const g = createEvent("g")
++    expect(ctx.handler.handleKey(g.event)).toBe(true)
++    expect(g.prevented()).toBe(true)
++    expect(ctx.jumpCalls.length).toBe(0)
++    expect(ctx.state.pending()).toBe("g")
++
++    const g2 = createEvent("g")
++    expect(ctx.handler.handleKey(g2.event)).toBe(true)
++    expect(g2.prevented()).toBe(true)
++    expect(ctx.jumpCalls.at(-1)).toBe("top")
++    expect(ctx.state.pending()).toBe("")
++
++    const G = createEvent("G")
++    expect(ctx.handler.handleKey(G.event)).toBe(true)
++    expect(G.prevented()).toBe(true)
++    expect(ctx.jumpCalls.at(-1)).toBe("bottom")
++  })
++
++  test("pending g cancels on other keys", () => {
++    const ctx = createHandler("abc")
++    expect(ctx.handler.handleKey(createEvent("g").event)).toBe(true)
++    expect(ctx.state.pending()).toBe("g")
++
++    const w = createEvent("w")
++    expect(ctx.handler.handleKey(w.event)).toBe(true)
++    expect(w.prevented()).toBe(true)
++    expect(ctx.state.pending()).toBe("")
++  })
++
++  test("pending transition d to g", () => {
++    const ctx = createHandler("abc")
++    expect(ctx.handler.handleKey(createEvent("d").event)).toBe(true)
++    expect(ctx.state.pending()).toBe("d")
++
++    const g = createEvent("g")
++    expect(ctx.handler.handleKey(g.event)).toBe(true)
++    expect(g.prevented()).toBe(true)
++    expect(ctx.state.pending()).toBe("g")
++
++    const g2 = createEvent("g")
++    expect(ctx.handler.handleKey(g2.event)).toBe(true)
++    expect(g2.prevented()).toBe(true)
++    expect(ctx.jumpCalls.at(-1)).toBe("top")
++    expect(ctx.scrollCalls.length).toBe(0)
++    expect(ctx.state.pending()).toBe("")
++  })
++
++  test("pending d then G clears and jumps", () => {
++    const ctx = createHandler("abc")
++    expect(ctx.handler.handleKey(createEvent("d").event)).toBe(true)
++    expect(ctx.state.pending()).toBe("d")
++
++    const G = createEvent("G")
++    expect(ctx.handler.handleKey(G.event)).toBe(true)
++    expect(G.prevented()).toBe(true)
++    expect(ctx.jumpCalls.at(-1)).toBe("bottom")
++    expect(ctx.state.pending()).toBe("")
++  })
++
++  test("g not handled in insert mode", () => {
++    const ctx = createHandler("abc", { mode: "insert" })
++    const g = createEvent("g")
++    expect(ctx.handler.handleKey(g.event)).toBe(false)
++    expect(g.prevented()).toBe(false)
++    expect(ctx.jumpCalls.length).toBe(0)
++  })
++
++  test("g not handled when vim disabled", () => {
++    const ctx = createHandler("abc", { enabled: false })
++    const g = createEvent("g")
++    expect(ctx.handler.handleKey(g.event)).toBe(false)
++    expect(g.prevented()).toBe(false)
++    expect(ctx.jumpCalls.length).toBe(0)
++  })
++
++  test("repeated ctrl scroll keeps pending clear", () => {
++    const ctx = createHandler("abc")
++    expect(ctx.handler.handleKey(createEvent("d").event)).toBe(true)
++    expect(ctx.state.pending()).toBe("d")
++
++    const first = createEvent("d", { ctrl: true })
++    expect(ctx.handler.handleKey(first.event)).toBe(true)
++    expect(first.prevented()).toBe(true)
++    expect(ctx.state.pending()).toBe("")
++
++    const second = createEvent("d", { ctrl: true })
++    expect(ctx.handler.handleKey(second.event)).toBe(true)
++    expect(second.prevented()).toBe(true)
++    expect(ctx.state.pending()).toBe("")
++
++    expect(ctx.scrollCalls).toEqual(["half-down", "half-down"])
++  })
++
++  test("repeated G does not create pending", () => {
++    const ctx = createHandler("abc")
++
++    const first = createEvent("G")
++    expect(ctx.handler.handleKey(first.event)).toBe(true)
++    expect(first.prevented()).toBe(true)
++    expect(ctx.state.pending()).toBe("")
++
++    const second = createEvent("G")
++    expect(ctx.handler.handleKey(second.event)).toBe(true)
++    expect(second.prevented()).toBe(true)
++    expect(ctx.state.pending()).toBe("")
++
++    expect(ctx.jumpCalls).toEqual(["bottom", "bottom"])
++  })
++})
++
++describe("vim scroll mapping", () => {
++  test("vimScroll maps ctrl keys to actions", () => {
++    expect(vimScroll(createEvent("e", { ctrl: true }).event)).toBe("line-down")
++    expect(vimScroll(createEvent("y", { ctrl: true }).event)).toBe("line-up")
++    expect(vimScroll(createEvent("d", { ctrl: true }).event)).toBe("half-down")
++    expect(vimScroll(createEvent("u", { ctrl: true }).event)).toBe("half-up")
++    expect(vimScroll(createEvent("f", { ctrl: true }).event)).toBe("page-down")
++    expect(vimScroll(createEvent("b", { ctrl: true }).event)).toBe("page-up")
++    expect(vimScroll(createEvent("b", { ctrl: true, meta: true }).event)).toBe(undefined)
++    expect(vimScroll(createEvent("b", { ctrl: false }).event)).toBe(undefined)
++  })
++})
+index 038f253274e..e7993885164 100644
+--- a/packages/web/src/content/docs/config.mdx
++++ b/packages/web/src/content/docs/config.mdx
+@@ -176,6 +176,11 @@ Use a dedicated `tui.json` (or `tui.jsonc`) file for TUI-specific settings.
+ 
+ Use `OPENCODE_TUI_CONFIG` to point to a custom TUI config file.
+ 
++- `scroll_acceleration.enabled` - Enable macOS-style scroll acceleration. **Takes precedence over `scroll_speed`.**
++- `scroll_speed` - Custom scroll speed multiplier (default: `3`, minimum: `1`). Ignored if `scroll_acceleration.enabled` is `true`.
++- `diff_style` - Control diff rendering. `"auto"` adapts to terminal width, `"stacked"` always shows single column.
++- `vim` - Enable vim-style prompt input in the TUI
++
+ Legacy `theme`, `keybinds`, and `tui` keys in `opencode.json` are deprecated and automatically migrated when possible.
+ 
+ [Learn more about TUI configuration here](/docs/tui#configure).
+index 010e8328f41..bbf7b3117e4 100644
+--- a/packages/web/src/content/docs/tui.mdx
++++ b/packages/web/src/content/docs/tui.mdx
+@@ -392,6 +392,32 @@ You can customize various aspects of the TUI view using the command palette (`ct
+ 
+ ---
+ 
++## Vim mode
++
++Optional Vim-style prompt mode for the TUI. Disabled by default.
++Enable it from the command palette or in your config.
++
++```json title="opencode.json"
++{
++  "$schema": "https://opencode.ai/config.json",
++  "tui": {
++    "vim": true
++  }
++}
++```
++
++**Supported keys:**
++
++**Movement:** `h`, `j`, `k`, `l`, `0`, `^`, `$`; `w`, `b`, `e`, `W`, `B`, `E`
++
++**Insert / edit:** `i`, `I`, `a`, `A`, `o`, `O`; `x`; `S`, `cc`, `cw`; `dd`, `dw`
++
++**Navigation:** `gg`, `G`
++
++**Scrolling:** `Ctrl+e`, `Ctrl+y`; `Ctrl+d`, `Ctrl+u`; `Ctrl+f`, `Ctrl+b`
++
++---
++
+ #### Username display
+ 
+ Toggle whether your username appears in chat messages. Access this through:
