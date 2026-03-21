@@ -36,12 +36,16 @@ jobs:
             exit 0
           fi
 
-          # Fetch current PR diff
-          gh pr diff 12679 --repo anomalyco/opencode > /tmp/current-vim.patch 2>/dev/null || {
+          # Fetch current PR diff and filter out packages/web/ docs (we don't include those)
+          gh pr diff 12679 --repo anomalyco/opencode > /tmp/raw-vim.patch 2>/dev/null || {
             echo "Failed to fetch PR diff"
             echo "fetch_failed=true" >> $GITHUB_OUTPUT
             exit 0
           }
+
+          # Strip packages/web/ hunks to match our committed patch
+          awk 'BEGIN{skip=0} /^diff --git a\/packages\/web\//{skip=1} /^diff --git a\/packages\/[^w]/{skip=0} /^diff --git a\/[^p]/{skip=0} {if(!skip) print}' \
+            /tmp/raw-vim.patch > /tmp/current-vim.patch
 
           # Compare with committed patch (by hash)
           CURRENT_HASH=$(sha256sum /tmp/current-vim.patch | cut -d' ' -f1)
