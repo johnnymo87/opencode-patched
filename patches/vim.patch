@@ -1758,6 +1758,7 @@ index 00000000000..4565b09ba7f
 +    expect(vimScroll(createEvent("b", { ctrl: false }).event)).toBe(undefined)
 +  })
 +})
+diff --git a/packages/web/src/content/docs/config.mdx b/packages/web/src/content/docs/config.mdx
 index 038f253274e..e7993885164 100644
 --- a/packages/web/src/content/docs/config.mdx
 +++ b/packages/web/src/content/docs/config.mdx
@@ -1773,6 +1774,7 @@ index 038f253274e..e7993885164 100644
  Legacy `theme`, `keybinds`, and `tui` keys in `opencode.json` are deprecated and automatically migrated when possible.
  
  [Learn more about TUI configuration here](/docs/tui#configure).
+diff --git a/packages/web/src/content/docs/tui.mdx b/packages/web/src/content/docs/tui.mdx
 index 010e8328f41..bbf7b3117e4 100644
 --- a/packages/web/src/content/docs/tui.mdx
 +++ b/packages/web/src/content/docs/tui.mdx
