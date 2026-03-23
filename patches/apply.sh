@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
-# Apply caching + vim patches to opencode source
+# Apply caching + vim + tool-fix patches to opencode source
 # Usage: ./apply.sh <path-to-opencode-source>
 #
 # Fetches caching.patch from opencode-cached (never duplicated here),
-# then applies local vim.patch on top.
+# then applies local vim.patch and tool-fix.patch on top.
 
 set -euo pipefail
 
@@ -16,6 +16,7 @@ fi
 SOURCE_DIR="$1"
 SCRIPT_DIR="$(dirname "$0")"
 VIM_PATCH="$SCRIPT_DIR/vim.patch"
+TOOL_FIX_PATCH="$SCRIPT_DIR/tool-fix.patch"
 CACHING_PATCH_URL="https://raw.githubusercontent.com/johnnymo87/opencode-cached/main/patches/caching.patch"
 
 if [ ! -d "$SOURCE_DIR" ]; then
@@ -25,6 +26,11 @@ fi
 
 if [ ! -f "$VIM_PATCH" ]; then
   echo "Error: Vim patch not found: $VIM_PATCH"
+  exit 1
+fi
+
+if [ ! -f "$TOOL_FIX_PATCH" ]; then
+  echo "Error: Tool fix patch not found: $TOOL_FIX_PATCH"
   exit 1
 fi
 
@@ -86,10 +92,31 @@ fi
 git apply "$VIM_PATCH"
 echo "✓ Vim patch applied"
 
+# --- Patch 3: Tool use/result fix (local) ---
+
+echo "Applying tool-fix.patch..."
+if ! git apply --check "$TOOL_FIX_PATCH" 2>/dev/null; then
+  echo ""
+  echo "❌ TOOL FIX PATCH FAILED TO APPLY"
+  echo ""
+  echo "Attempting to apply for diagnostics..."
+  git apply "$TOOL_FIX_PATCH" 2>&1 || true
+  echo ""
+  echo "Failed files:"
+  find . -name "*.rej" -type f 2>/dev/null || echo "  None found"
+  echo ""
+  echo "The tool fix patch may need updating for this upstream version."
+  echo "Source PR: https://github.com/anomalyco/opencode/pull/16751"
+  exit 1
+fi
+
+git apply "$TOOL_FIX_PATCH"
+echo "✓ Tool fix patch applied"
+
 # --- Summary ---
 
 echo ""
-echo "✓ Both patches applied successfully"
+echo "✓ All patches applied successfully"
 echo ""
 echo "Files modified:"
 git status --short

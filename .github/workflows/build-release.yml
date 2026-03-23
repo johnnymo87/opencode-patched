@@ -37,7 +37,7 @@ jobs:
           echo "Cloned opencode v${{ inputs.version }}"
           git log -1 --oneline
 
-      - name: Apply patches (caching + vim)
+      - name: Apply patches (caching + vim + tool fix)
         run: |
           cd opencode-src
           ../patches/apply.sh .
@@ -103,7 +103,7 @@ jobs:
           echo "Cloned opencode v${{ inputs.version }}"
           git log -1 --oneline
 
-      - name: Apply patches (caching + vim)
+      - name: Apply patches (caching + vim + tool fix)
         run: |
           cd opencode-src
           ../patches/apply.sh .
@@ -173,14 +173,15 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           tag_name: v${{ inputs.version }}-patched
-          name: OpenCode v${{ inputs.version }} with Caching + Vim
+          name: OpenCode v${{ inputs.version }} with Caching + Vim + Tool Fix
           body: |
-            # OpenCode v${{ inputs.version }} with Caching + Vim Keybindings
+            # OpenCode v${{ inputs.version }} with Caching + Vim + Tool Fix
 
-            This release applies two patches to OpenCode v${{ inputs.version }}:
+            This release applies three patches to OpenCode v${{ inputs.version }}:
 
             1. **Prompt caching improvements** from [PR #5422](https://github.com/anomalyco/opencode/pull/5422) (via [opencode-cached](https://github.com/johnnymo87/opencode-cached))
             2. **Vim keybindings** from [PR #12679](https://github.com/anomalyco/opencode/pull/12679)
+            3. **Tool use/result mismatch fix** from [PR #16751](https://github.com/anomalyco/opencode/pull/16751)
 
             ## Caching Improvements
 
@@ -198,6 +199,10 @@ jobs:
             - Session navigation: `gg/G`
             - Scrolling: `Ctrl+e/y/d/u/f/b`
             - `Enter` in normal mode submits
+
+            ## Tool Use/Result Mismatch Fix
+
+            Fixes the widespread `tool_use ids were found without tool_result blocks` error ([#16749](https://github.com/anomalyco/opencode/issues/16749)) that corrupts sessions when stream errors cause lost step boundaries. Injects synthetic step-start boundaries at reconstruction time to prevent interleaved tool_use/text in assistant messages.
 
             ## Installation
 
@@ -230,6 +235,7 @@ jobs:
             **Upstream**: [anomalyco/opencode v${{ inputs.version }}](https://github.com/anomalyco/opencode/releases/tag/v${{ inputs.version }})
             **Caching patch**: [opencode-cached](https://github.com/johnnymo87/opencode-cached) / [PR #5422](https://github.com/anomalyco/opencode/pull/5422)
             **Vim patch**: [PR #12679](https://github.com/anomalyco/opencode/pull/12679)
+            **Tool fix patch**: [PR #16751](https://github.com/anomalyco/opencode/pull/16751)
           files: |
             artifacts/opencode-linux-arm64.tar.gz
             artifacts/opencode-linux-x64.tar.gz
@@ -255,7 +261,7 @@ jobs:
             const body = `
             ## Build Failure: v${version}
 
-            The automated build for OpenCode v${version} with caching + vim patches failed.
+            The automated build for OpenCode v${version} with caching + vim + tool fix patches failed.
 
             **Workflow Run**: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
 
@@ -263,7 +269,8 @@ jobs:
 
             1. **Caching patch conflict**: The caching patch (fetched from opencode-cached) may not apply to v${version}
             2. **Vim patch conflict**: The local vim.patch may not apply to v${version}
-            3. **Build failure**: OpenCode build process may have changed
+            3. **Tool fix patch conflict**: The local tool-fix.patch may not apply to v${version}
+            4. **Build failure**: OpenCode build process may have changed
 
             ### Action Required
 
@@ -274,7 +281,12 @@ jobs:
                gh pr diff 12679 --repo anomalyco/opencode > patches/vim.patch
                # Review changes, filter if needed, commit and push
                \`\`\`
-            4. Re-run: \`gh workflow run build-release.yml --field version=${version}\`
+            4. If tool fix patch failed, regenerate from [PR #16751](https://github.com/anomalyco/opencode/pull/16751):
+               \`\`\`bash
+               gh pr diff 16751 --repo anomalyco/opencode > patches/tool-fix.patch
+               # Review changes, commit and push
+               \`\`\`
+            5. Re-run: \`gh workflow run build-release.yml --field version=${version}\`
             `;
 
             const issues = await github.rest.issues.listForRepo({

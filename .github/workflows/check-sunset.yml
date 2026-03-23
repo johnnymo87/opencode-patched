@@ -32,66 +32,73 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
 
+      - name: Check PR #16751 (tool fix) status
+        id: check_tool_fix_pr
+        run: |
+          PR_STATE=$(gh pr view 16751 --repo anomalyco/opencode --json state --jq .state 2>/dev/null || echo "UNKNOWN")
+          echo "state=$PR_STATE" >> $GITHUB_OUTPUT
+          echo "Tool fix PR #16751: $PR_STATE"
+        env:
+          GH_TOKEN: ${{ github.token }}
+
       - name: Create sunset recommendation
-        if: steps.check_caching_pr.outputs.state == 'MERGED' || steps.check_vim_pr.outputs.state == 'MERGED'
+        if: steps.check_caching_pr.outputs.state == 'MERGED' || steps.check_vim_pr.outputs.state == 'MERGED' || steps.check_tool_fix_pr.outputs.state == 'MERGED'
         uses: actions/github-script@v7
         with:
           script: |
             const cachingState = '${{ steps.check_caching_pr.outputs.state }}';
             const vimState = '${{ steps.check_vim_pr.outputs.state }}';
-            const bothMerged = cachingState === 'MERGED' && vimState === 'MERGED';
+            const toolFixState = '${{ steps.check_tool_fix_pr.outputs.state }}';
+            const allMerged = cachingState === 'MERGED' && vimState === 'MERGED' && toolFixState === 'MERGED';
+
+            // Collect which PRs merged
+            const merged = [];
+            const remaining = [];
+            if (cachingState === 'MERGED') merged.push('Caching PR #5422');
+            else remaining.push('Caching PR #5422');
+            if (vimState === 'MERGED') merged.push('Vim PR #12679');
+            else remaining.push('Vim PR #12679');
+            if (toolFixState === 'MERGED') merged.push('Tool fix PR #16751');
+            else remaining.push('Tool fix PR #16751');
 
             let title, body;
 
-            if (bothMerged) {
-              title = 'Both upstream PRs merged - sunset this repo';
+            if (allMerged) {
+              title = 'All upstream PRs merged - sunset this repo';
               body = `
-            ## Both Patches Merged Upstream
+            ## All Patches Merged Upstream
 
             - **Caching PR #5422**: MERGED
             - **Vim PR #12679**: MERGED
+            - **Tool fix PR #16751**: MERGED
 
-            Both patches are now available in official OpenCode releases. This repo can be archived.
+            All patches are now available in official OpenCode releases. This repo can be archived.
 
             ### Recommended Actions
 
-            1. Verify the latest upstream release includes both features
+            1. Verify the latest upstream release includes all features
             2. Update [workstation](https://github.com/johnnymo87/workstation) to use upstream OpenCode directly
             3. Archive this repository
             4. Archive [opencode-cached](https://github.com/johnnymo87/opencode-cached) too
               `;
-            } else if (cachingState === 'MERGED') {
-              title = 'Caching PR #5422 merged - drop caching patch fetch';
-              body = `
-            ## Caching Patch Merged Upstream
-
-            - **Caching PR #5422**: MERGED
-            - **Vim PR #12679**: ${vimState}
-
-            The caching patch is now in official releases. Update \`apply.sh\` to stop fetching it.
-
-            ### Recommended Actions
-
-            1. Remove caching patch fetch from \`patches/apply.sh\`
-            2. Only apply \`vim.patch\` going forward
-            3. Update \`sync-cached.yml\` to check upstream releases directly (not opencode-cached)
-            4. Consider archiving [opencode-cached](https://github.com/johnnymo87/opencode-cached)
-              `;
             } else {
-              title = 'Vim PR #12679 merged - drop vim patch';
+              title = `${merged.join(', ')} merged - update patches`;
               body = `
-            ## Vim Patch Merged Upstream
+            ## Upstream PRs Merged
 
             - **Caching PR #5422**: ${cachingState}
-            - **Vim PR #12679**: MERGED
+            - **Vim PR #12679**: ${vimState}
+            - **Tool fix PR #16751**: ${toolFixState}
 
-            Vim keybindings are now in official releases.
+            Merged: ${merged.join(', ')}
+            Remaining: ${remaining.join(', ')}
 
             ### Recommended Actions
 
-            1. Remove \`patches/vim.patch\`
-            2. Switch [workstation](https://github.com/johnnymo87/workstation) back to [opencode-cached](https://github.com/johnnymo87/opencode-cached) releases
-            3. Archive this repository
+            1. Remove the merged patch(es) from \`patches/apply.sh\`
+            2. Keep applying the remaining patch(es)
+            3. If caching was merged, update \`sync-cached.yml\` to check upstream releases directly
+            4. If all remaining patches are also merged later, archive this repo
               `;
             }
 
@@ -110,7 +117,7 @@ jobs:
                 owner: context.repo.owner,
                 repo: context.repo.repo,
                 issue_number: existingIssue.number,
-                body: `Monthly check (${new Date().toISOString().split('T')[0]}): Caching PR: ${cachingState}, Vim PR: ${vimState}`
+                body: `Monthly check (${new Date().toISOString().split('T')[0]}): Caching PR: ${cachingState}, Vim PR: ${vimState}, Tool fix PR: ${toolFixState}`
               });
             } else {
               await github.rest.issues.create({
@@ -128,3 +135,4 @@ jobs:
           echo "Monthly upstream check complete"
           echo "Caching PR #5422: ${{ steps.check_caching_pr.outputs.state }}"
           echo "Vim PR #12679: ${{ steps.check_vim_pr.outputs.state }}"
+          echo "Tool fix PR #16751: ${{ steps.check_tool_fix_pr.outputs.state }}"
