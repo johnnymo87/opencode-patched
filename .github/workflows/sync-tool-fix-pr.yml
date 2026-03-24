@@ -65,24 +65,30 @@ jobs:
         uses: actions/github-script@v7
         with:
           script: |
-            const title = 'Tool fix PR #16751 has changed - review tool-fix.patch';
+            const title = 'Patch drift: tool-fix.patch no longer matches PR #16751 - review needed';
             const body = `
-            ## PR #16751 Diff Has Changed
+            ## Patch Drift Detected: tool-fix.patch vs PR #16751
 
             The upstream [PR #16751](https://github.com/anomalyco/opencode/pull/16751) has been updated.
             The committed \`patches/tool-fix.patch\` no longer matches the current PR diff.
 
+            **This is a review signal, not a build failure.** The build continues to use the
+            committed \`patches/tool-fix.patch\` as-is. Whether that patch still applies cleanly and
+            whether publication is blocked is determined by the build/release workflow, not this check.
+
             ### Action Required
 
-            1. Review the PR changes: \`gh pr diff 16751 --repo anomalyco/opencode\`
-            2. If changes are desirable, regenerate the patch:
-               \`\`\`bash
-               gh pr diff 16751 --repo anomalyco/opencode > patches/tool-fix.patch
-               git add patches/tool-fix.patch
-               git commit -m "chore: update tool-fix.patch from PR #16751"
-               git push
-               \`\`\`
-            3. Verify the updated patch still stacks with the caching and vim patches
+            1. Review what changed in the PR: \`gh pr diff 16751 --repo anomalyco/opencode\`
+            2. Decide whether to adopt the updated diff:
+               - If yes, regenerate the patch:
+                 \`\`\`bash
+                 gh pr diff 16751 --repo anomalyco/opencode > patches/tool-fix.patch
+                 git add patches/tool-fix.patch
+                 git commit -m "chore: update tool-fix.patch from PR #16751"
+                 git push
+                 \`\`\`
+               - If no, close this issue with a note explaining why
+            3. Verify the updated patch still stacks cleanly with the caching and vim patches
             4. Close this issue when done
 
             **PR**: https://github.com/anomalyco/opencode/pull/16751
@@ -103,7 +109,7 @@ jobs:
                 owner: context.repo.owner,
                 repo: context.repo.repo,
                 issue_number: existingIssue.number,
-                body: `Drift still detected (${new Date().toISOString().split('T')[0]}). PR diff continues to differ from committed tool-fix.patch.`
+                body: `Drift still present (${new Date().toISOString().split('T')[0]}): PR #16751 diff continues to differ from committed \`patches/tool-fix.patch\`. Build is unaffected until manually reviewed and updated.`
               });
             } else {
               await github.rest.issues.create({

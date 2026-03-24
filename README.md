@@ -101,31 +101,45 @@ Zero file overlap between any pair of patches.
 
 ## Maintenance
 
-### When the Caching Patch Breaks
+### When the Caching Patch Breaks (Build Failure)
 
 This is handled by [opencode-cached](https://github.com/johnnymo87/opencode-cached). If the caching patch fails on a new upstream version, opencode-cached won't release, and this repo won't attempt a build.
 
-### When the Vim Patch Breaks
+### When the Vim Patch Breaks (Build Failure)
 
-1. The build fails and creates a GitHub issue automatically
-2. Regenerate from the PR: `gh pr diff 12679 --repo anomalyco/opencode > patches/vim.patch`
-3. Review, commit, push
-4. Re-trigger: `gh workflow run build-release.yml --field version=X.Y.Z`
+The build fails and creates a GitHub issue automatically. This blocks publication.
 
-### When the Vim PR Updates
+1. Regenerate from the PR: `gh pr diff 12679 --repo anomalyco/opencode > patches/vim.patch`
+2. Review, commit, push
+3. Re-trigger: `gh workflow run build-release.yml --field version=X.Y.Z`
 
-The `sync-vim-pr.yml` workflow checks every 8 hours if PR #12679's diff has changed. If it has, it creates a GitHub issue for manual review.
+### When the Vim PR Drifts (Review Signal, Not Breakage)
 
-### When the Tool Fix Patch Breaks
+`sync-vim-pr.yml` checks every 8 hours whether PR #12679's raw diff matches `patches/vim.patch`.
+If the hashes differ, it opens a GitHub issue labeled `patch-drift`.
 
-1. The build fails and creates a GitHub issue automatically
-2. Regenerate from the PR: `gh pr diff 16751 --repo anomalyco/opencode > patches/tool-fix.patch`
-3. Review, commit, push
-4. Re-trigger: `gh workflow run build-release.yml --field version=X.Y.Z`
+**Drift does not mean the build is broken.** The build continues to use the committed
+`patches/vim.patch` as-is. The build/release workflow is the source of truth for whether
+publication is blocked. The drift issue is a prompt to review what changed upstream and
+decide whether to adopt it.
 
-### When the Tool Fix PR Updates
+### When the Tool Fix Patch Breaks (Build Failure)
 
-The `sync-tool-fix-pr.yml` workflow checks every 8 hours if PR #16751's diff has changed. If it has, it creates a GitHub issue for manual review.
+The build fails and creates a GitHub issue automatically. This blocks publication.
+
+1. Regenerate from the PR: `gh pr diff 16751 --repo anomalyco/opencode > patches/tool-fix.patch`
+2. Review, commit, push
+3. Re-trigger: `gh workflow run build-release.yml --field version=X.Y.Z`
+
+### When the Tool Fix PR Drifts (Review Signal, Not Breakage)
+
+`sync-tool-fix-pr.yml` checks every 8 hours whether PR #16751's raw diff matches `patches/tool-fix.patch`.
+If the hashes differ, it opens a GitHub issue labeled `patch-drift`.
+
+**Drift does not mean the build is broken.** The build continues to use the committed
+`patches/tool-fix.patch` as-is. The build/release workflow is the source of truth for whether
+publication is blocked. The drift issue is a prompt to review what changed upstream and
+decide whether to adopt it.
 
 ### Sunset Criteria
 
