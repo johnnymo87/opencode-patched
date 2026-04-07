@@ -1,8 +1,8 @@
 # opencode-patched
 
-**OpenCode with [prompt caching](https://github.com/anomalyco/opencode/pull/5422) + [vim keybindings](https://github.com/anomalyco/opencode/pull/12679) + [tool use/result fix](https://github.com/anomalyco/opencode/pull/16751) + [MCP auto-reconnect](https://github.com/anomalyco/opencode/issues/15247)**
+**OpenCode with [prompt caching](https://github.com/anomalyco/opencode/pull/5422) + [vim keybindings](https://github.com/anomalyco/opencode/pull/12679) + [tool use/result fix](https://github.com/anomalyco/opencode/pull/16751)**
 
-This repository combines four patches into a single OpenCode binary, built automatically for 4 platforms.
+This repository combines three unmerged upstream patches into a single OpenCode binary, built automatically for 4 platforms.
 
 ## Patches Included
 
@@ -25,12 +25,6 @@ Supported motions:
 ### 3. Tool Use/Result Mismatch Fix ([PR #16751](https://github.com/anomalyco/opencode/pull/16751))
 
 Stored locally as `patches/tool-fix.patch`. Fixes the widespread `tool_use ids were found without tool_result blocks` error ([#16749](https://github.com/anomalyco/opencode/issues/16749)) that corrupts sessions when stream errors cause lost step boundaries. Injects synthetic step-start boundaries at message reconstruction time to prevent interleaved tool_use/text in assistant messages that the Anthropic API rejects.
-
-### 4. MCP Auto-Reconnect ([Issue #15247](https://github.com/anomalyco/opencode/issues/15247))
-
-Stored locally as `patches/mcp-reconnect.patch`. Automatically reconnects remote MCP servers when the server restarts and the session becomes stale. Without this patch, `callTool` fails at the transport layer with "Session not found" / HTTP 404 errors, requiring a manual MCP toggle (ctrl+p) or full OpenCode restart.
-
-The patch wraps remote MCP tool execution with a try/catch that detects transport-level errors (stale sessions, connection refused, etc.), closes the stale client, creates a fresh transport + client, refreshes tool definitions, and retries the call once.
 
 ## Installation
 
@@ -81,7 +75,7 @@ Timing Chain (every 8 hours):
       |-> builds v{VER}-cached        -- applies caching patch, publishes
 
 :01  opencode-patched/sync-cached     -- detects new -cached release
-      |-> builds v{VER}-patched       -- applies caching + vim + tool fix + mcp reconnect patches, publishes
+      |-> builds v{VER}-patched       -- applies caching + vim + tool fix patches, publishes
 :01  opencode-patched/sync-vim-pr     -- checks PR #12679 for changes
 :01  opencode-patched/sync-tool-fix-pr -- checks PR #16751 for changes
 
@@ -92,17 +86,16 @@ Timing Chain (every 8 hours):
 
 1. Clone upstream OpenCode at the release tag
 2. Fetch `caching.patch` from [opencode-cached](https://github.com/johnnymo87/opencode-cached) (always latest from `main`)
-3. Apply `caching.patch`, then local `vim.patch`, then `tool-fix.patch`, then `mcp-reconnect.patch`
+3. Apply `caching.patch`, then local `vim.patch`, then local `tool-fix.patch`
 4. Build with Bun for 4 platforms (linux/darwin x arm64/x64)
 5. Publish release as `v{VERSION}-patched`
 
 ### Patch Independence
 
-The four patches modify completely different areas of the codebase:
+The three patches modify completely different areas of the codebase:
 - **Caching**: `provider/config.ts`, `provider/transform.ts`, `session/prompt.ts`, `config/config.ts`
 - **Vim**: `cli/cmd/tui/component/vim/*`, `cli/cmd/tui/component/prompt/index.tsx`, `cli/cmd/tui/app.tsx`
 - **Tool fix**: `session/message-v2.ts`, `test/session/message-v2.test.ts`
-- **MCP reconnect**: `mcp/index.ts`
 
 Zero file overlap between any pair of patches.
 
@@ -148,17 +141,6 @@ If the hashes differ, it opens a GitHub issue labeled `patch-drift`.
 publication is blocked. The drift issue is a prompt to review what changed upstream and
 decide whether to adopt it.
 
-### When the MCP Reconnect Patch Breaks (Build Failure)
-
-The build fails and creates a GitHub issue automatically. This blocks publication.
-
-1. Review the upstream changes to `packages/opencode/src/mcp/index.ts`
-2. Regenerate or manually update `patches/mcp-reconnect.patch`
-3. Review, commit, push
-4. Re-trigger: `gh workflow run build-release.yml --field version=X.Y.Z`
-
-**Sunset**: This patch can be dropped when [issue #15247](https://github.com/anomalyco/opencode/issues/15247) is resolved upstream. Unlike the other patches, this one has no upstream PR to track -- it is original work. If an upstream PR appears, add a sync workflow for it.
-
 ### Sunset Criteria
 
 Monthly automated check (`check-sunset.yml`) monitors all upstream PRs:
@@ -172,7 +154,6 @@ Monthly automated check (`check-sunset.yml`) monitors all upstream PRs:
 - **Caching builds**: [opencode-cached](https://github.com/johnnymo87/opencode-cached)
 - **Vim PR**: [PR #12679](https://github.com/anomalyco/opencode/pull/12679) by [@leohenon](https://github.com/leohenon)
 - **Tool fix PR**: [PR #16751](https://github.com/anomalyco/opencode/pull/16751) by [@altendky](https://github.com/altendky)
-- **MCP reconnect**: [Issue #15247](https://github.com/anomalyco/opencode/issues/15247) — original patch
 
 ## License
 

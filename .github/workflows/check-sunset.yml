@@ -41,29 +41,17 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
 
-      - name: Check issue #15247 (MCP reconnect) status
-        id: check_mcp_reconnect
-        run: |
-          # No upstream PR -- track the issue instead.  When it's closed,
-          # upstream likely shipped the feature and this patch can be dropped.
-          ISSUE_STATE=$(gh issue view 15247 --repo anomalyco/opencode --json state --jq .state 2>/dev/null || echo "UNKNOWN")
-          echo "state=$ISSUE_STATE" >> $GITHUB_OUTPUT
-          echo "MCP reconnect issue #15247: $ISSUE_STATE"
-        env:
-          GH_TOKEN: ${{ github.token }}
-
       - name: Create sunset recommendation
-        if: steps.check_caching_pr.outputs.state == 'MERGED' || steps.check_vim_pr.outputs.state == 'MERGED' || steps.check_tool_fix_pr.outputs.state == 'MERGED' || steps.check_mcp_reconnect.outputs.state == 'CLOSED'
+        if: steps.check_caching_pr.outputs.state == 'MERGED' || steps.check_vim_pr.outputs.state == 'MERGED' || steps.check_tool_fix_pr.outputs.state == 'MERGED'
         uses: actions/github-script@v7
         with:
           script: |
             const cachingState = '${{ steps.check_caching_pr.outputs.state }}';
             const vimState = '${{ steps.check_vim_pr.outputs.state }}';
             const toolFixState = '${{ steps.check_tool_fix_pr.outputs.state }}';
-            const mcpReconnectState = '${{ steps.check_mcp_reconnect.outputs.state }}';
-            const allMerged = cachingState === 'MERGED' && vimState === 'MERGED' && toolFixState === 'MERGED' && mcpReconnectState === 'CLOSED';
+            const allMerged = cachingState === 'MERGED' && vimState === 'MERGED' && toolFixState === 'MERGED';
 
-            // Collect which PRs/issues are resolved
+            // Collect which PRs merged
             const merged = [];
             const remaining = [];
             if (cachingState === 'MERGED') merged.push('Caching PR #5422');
@@ -72,8 +60,6 @@ jobs:
             else remaining.push('Vim PR #12679');
             if (toolFixState === 'MERGED') merged.push('Tool fix PR #16751');
             else remaining.push('Tool fix PR #16751');
-            if (mcpReconnectState === 'CLOSED') merged.push('MCP reconnect #15247');
-            else remaining.push('MCP reconnect #15247');
 
             let title, body;
 
@@ -85,7 +71,6 @@ jobs:
             - **Caching PR #5422**: MERGED
             - **Vim PR #12679**: MERGED
             - **Tool fix PR #16751**: MERGED
-            - **MCP reconnect #15247**: CLOSED
 
             All patches are now available in official OpenCode releases. This repo can be archived.
 
@@ -104,7 +89,6 @@ jobs:
             - **Caching PR #5422**: ${cachingState}
             - **Vim PR #12679**: ${vimState}
             - **Tool fix PR #16751**: ${toolFixState}
-            - **MCP reconnect #15247**: ${mcpReconnectState}
 
             Merged: ${merged.join(', ')}
             Remaining: ${remaining.join(', ')}
@@ -133,7 +117,7 @@ jobs:
                 owner: context.repo.owner,
                 repo: context.repo.repo,
                 issue_number: existingIssue.number,
-                body: `Monthly check (${new Date().toISOString().split('T')[0]}): Caching PR: ${cachingState}, Vim PR: ${vimState}, Tool fix PR: ${toolFixState}, MCP reconnect: ${mcpReconnectState}`
+                body: `Monthly check (${new Date().toISOString().split('T')[0]}): Caching PR: ${cachingState}, Vim PR: ${vimState}, Tool fix PR: ${toolFixState}`
               });
             } else {
               await github.rest.issues.create({
@@ -152,4 +136,3 @@ jobs:
           echo "Caching PR #5422: ${{ steps.check_caching_pr.outputs.state }}"
           echo "Vim PR #12679: ${{ steps.check_vim_pr.outputs.state }}"
           echo "Tool fix PR #16751: ${{ steps.check_tool_fix_pr.outputs.state }}"
-          echo "MCP reconnect #15247: ${{ steps.check_mcp_reconnect.outputs.state }}"

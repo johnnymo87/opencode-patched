@@ -173,16 +173,15 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           tag_name: v${{ inputs.version }}-patched
-          name: OpenCode v${{ inputs.version }} with Caching + Vim + Tool Fix + MCP Reconnect
+          name: OpenCode v${{ inputs.version }} with Caching + Vim + Tool Fix
           body: |
-            # OpenCode v${{ inputs.version }} with Caching + Vim + Tool Fix + MCP Reconnect
+            # OpenCode v${{ inputs.version }} with Caching + Vim + Tool Fix
 
-            This release applies four patches to OpenCode v${{ inputs.version }}:
+            This release applies three patches to OpenCode v${{ inputs.version }}:
 
             1. **Prompt caching improvements** from [PR #5422](https://github.com/anomalyco/opencode/pull/5422) (via [opencode-cached](https://github.com/johnnymo87/opencode-cached))
             2. **Vim keybindings** from [PR #12679](https://github.com/anomalyco/opencode/pull/12679)
             3. **Tool use/result mismatch fix** from [PR #16751](https://github.com/anomalyco/opencode/pull/16751)
-            4. **MCP auto-reconnect** from [Issue #15247](https://github.com/anomalyco/opencode/issues/15247)
 
             ## Caching Improvements
 
@@ -204,10 +203,6 @@ jobs:
             ## Tool Use/Result Mismatch Fix
 
             Fixes the widespread `tool_use ids were found without tool_result blocks` error ([#16749](https://github.com/anomalyco/opencode/issues/16749)) that corrupts sessions when stream errors cause lost step boundaries. Injects synthetic step-start boundaries at reconstruction time to prevent interleaved tool_use/text in assistant messages.
-
-            ## MCP Auto-Reconnect
-
-            Automatically reconnects remote MCP servers when the server restarts and the session becomes stale. Without this, tool calls fail with transport errors requiring a manual MCP toggle or OpenCode restart.
 
             ## Installation
 
@@ -241,7 +236,6 @@ jobs:
             **Caching patch**: [opencode-cached](https://github.com/johnnymo87/opencode-cached) / [PR #5422](https://github.com/anomalyco/opencode/pull/5422)
             **Vim patch**: [PR #12679](https://github.com/anomalyco/opencode/pull/12679)
             **Tool fix patch**: [PR #16751](https://github.com/anomalyco/opencode/pull/16751)
-            **MCP reconnect**: [Issue #15247](https://github.com/anomalyco/opencode/issues/15247)
           files: |
             artifacts/opencode-linux-arm64.tar.gz
             artifacts/opencode-linux-x64.tar.gz
@@ -267,7 +261,7 @@ jobs:
             const body = `
             ## Build Failure: v${version}
 
-            The automated build for OpenCode v${version} with caching + vim + tool fix + mcp reconnect patches failed.
+            The automated build for OpenCode v${version} with caching + vim + tool fix patches failed.
 
             **Workflow Run**: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
 
@@ -276,8 +270,7 @@ jobs:
             1. **Caching patch conflict**: The caching patch (fetched from opencode-cached) may not apply to v${version}
             2. **Vim patch conflict**: The local vim.patch may not apply to v${version}
             3. **Tool fix patch conflict**: The local tool-fix.patch may not apply to v${version}
-            4. **MCP reconnect patch conflict**: The local mcp-reconnect.patch may not apply to v${version}
-            5. **Build failure**: OpenCode build process may have changed
+            4. **Build failure**: OpenCode build process may have changed
 
             ### Action Required
 
@@ -293,8 +286,7 @@ jobs:
                gh pr diff 16751 --repo anomalyco/opencode > patches/tool-fix.patch
                # Review changes, commit and push
                \`\`\`
-            5. If MCP reconnect patch failed, review upstream changes to \`mcp/index.ts\` and update manually
-            6. Re-run: \`gh workflow run build-release.yml --field version=${version}\`
+            5. Re-run: \`gh workflow run build-release.yml --field version=${version}\`
             `;
 
             const issues = await github.rest.issues.listForRepo({
