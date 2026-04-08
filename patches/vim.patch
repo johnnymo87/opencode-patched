@@ -1,8 +1,8 @@
 diff --git a/packages/opencode/src/cli/cmd/tui/app.tsx b/packages/opencode/src/cli/cmd/tui/app.tsx
-index 3cb383be4..f10bd0b20 100644
+index 4161c02..3108f52 100644
 --- a/packages/opencode/src/cli/cmd/tui/app.tsx
 +++ b/packages/opencode/src/cli/cmd/tui/app.tsx
-@@ -59,6 +59,7 @@ import { TuiConfigProvider, useTuiConfig } from "./context/tui-config"
+@@ -60,6 +60,7 @@ import { TuiConfigProvider, useTuiConfig } from "./context/tui-config"
  import { TuiConfig } from "@/config/tui"
  import { createTuiApi, TuiPluginRuntime, type RouteMap } from "./plugin"
  import { FormatError, FormatUnknownError } from "@/cli/error"
@@ -10,7 +10,7 @@ index 3cb383be4..f10bd0b20 100644
  
  async function getTerminalBackgroundColor(): Promise<"dark" | "light"> {
    // can't set raw mode if not a TTY
-@@ -296,6 +297,7 @@ function App(props: { onSnapshot?: () => Promise<string[]> }) {
+@@ -297,6 +298,7 @@ function App(props: { onSnapshot?: () => Promise<string[]> }) {
      .finally(() => {
        setReady(true)
      })
@@ -18,7 +18,7 @@ index 3cb383be4..f10bd0b20 100644
  
    useKeyboard((evt) => {
      if (!Flag.OPENCODE_EXPERIMENTAL_DISABLE_COPY_ON_SELECT) return
-@@ -747,6 +749,15 @@ function App(props: { onSnapshot?: () => Promise<string[]> }) {
+@@ -785,6 +787,15 @@ function App(props: { onSnapshot?: () => Promise<string[]> }) {
          dialog.clear()
        },
      },
@@ -35,41 +35,38 @@ index 3cb383be4..f10bd0b20 100644
        title: kv.get("animations_enabled", true) ? "Disable animations" : "Enable animations",
        value: "app.toggle.animations",
 diff --git a/packages/opencode/src/cli/cmd/tui/component/prompt/index.tsx b/packages/opencode/src/cli/cmd/tui/component/prompt/index.tsx
-index 96563b884..9b077c1a1 100644
+index 045d730..1900214 100644
 --- a/packages/opencode/src/cli/cmd/tui/component/prompt/index.tsx
 +++ b/packages/opencode/src/cli/cmd/tui/component/prompt/index.tsx
-@@ -35,6 +35,11 @@ import { useToast } from "../../ui/toast"
- import { useKV } from "../../context/kv"
+@@ -37,6 +37,11 @@ import { useKV } from "../../context/kv"
  import { useTextareaKeybindings } from "../textarea-keybindings"
  import { DialogSkill } from "../dialog-skill"
+ import { CONSOLE_MANAGED_ICON, consoleManagedProviderLabel } from "@tui/util/provider-origin"
 +import { useVimEnabled } from "../vim"
-+import { createVimState, type VimMode } from "../vim/vim-state"
++import { createVimState } from "../vim/vim-state"
 +import { createVimHandler } from "../vim/vim-handler"
 +import { vimScroll } from "../vim/vim-scroll"
 +import { useVimIndicator } from "../vim/vim-indicator"
  
  export type PromptProps = {
    sessionID?: string
-@@ -71,6 +76,10 @@ function randomIndex(count: number) {
+@@ -73,7 +78,6 @@ function randomIndex(count: number) {
+   if (count <= 0) return 0
    return Math.floor(Math.random() * count)
  }
- 
-+const PLACEHOLDERS = ["Fix a TODO in the codebase", "What is the tech stack of this project?", "Fix broken tests"]
-+const SHELL_PLACEHOLDERS = ["ls -la", "git status", "pwd"]
-+let lastVimMode: VimMode = "insert"
-+
+-
  export function Prompt(props: PromptProps) {
    let input: TextareaRenderable
    let anchor: BoxRenderable
-@@ -92,6 +101,7 @@ export function Prompt(props: PromptProps) {
+@@ -95,6 +99,7 @@ export function Prompt(props: PromptProps) {
    const kv = useKV()
    const list = createMemo(() => props.placeholders?.normal ?? [])
    const shell = createMemo(() => props.placeholders?.shell ?? [])
 +  const vimEnabled = useVimEnabled()
- 
-   function promptModelWarning() {
-     toast.show({
-@@ -128,6 +138,19 @@ export function Prompt(props: PromptProps) {
+   const [auto, setAuto] = createSignal<AutocompleteRef>()
+   const activeOrgName = createMemo(() => sync.data.console_state.activeOrgName)
+   const canSwitchOrgs = createMemo(() => sync.data.console_state.switchableOrgCount > 1)
+@@ -141,6 +146,19 @@ export function Prompt(props: PromptProps) {
      if (!props.disabled) input.cursorColor = theme.text
    })
  
@@ -89,16 +86,12 @@ index 96563b884..9b077c1a1 100644
    const lastUserMessage = createMemo(() => {
      if (!props.sessionID) return undefined
      const messages = sync.data.message[props.sessionID]
-@@ -170,6 +193,37 @@ export function Prompt(props: PromptProps) {
+@@ -183,6 +201,33 @@ export function Prompt(props: PromptProps) {
      extmarkToPartIndex: new Map(),
      interrupt: 0,
    })
 +  const vimState = createVimState({
 +    enabled: vimEnabled,
-+    initial: () => lastVimMode,
-+  })
-+  onCleanup(() => {
-+    if (vimEnabled()) lastVimMode = vimState.mode()
 +  })
 +  const vimIndicator = useVimIndicator({
 +    enabled: vimEnabled,
@@ -127,7 +120,7 @@ index 96563b884..9b077c1a1 100644
  
    createEffect(
      on(
-@@ -218,7 +272,6 @@ export function Prompt(props: PromptProps) {
+@@ -233,7 +278,6 @@ export function Prompt(props: PromptProps) {
        {
          title: "Submit prompt",
          value: "prompt.submit",
@@ -135,7 +128,7 @@ index 96563b884..9b077c1a1 100644
          category: "Prompt",
          hidden: true,
          onSelect: (dialog) => {
-@@ -254,9 +307,16 @@ export function Prompt(props: PromptProps) {
+@@ -269,9 +313,16 @@ export function Prompt(props: PromptProps) {
          onSelect: (dialog) => {
            if (autocomplete.visible) return
            if (!input.focused) return
@@ -152,17 +145,27 @@ index 96563b884..9b077c1a1 100644
              return
            }
            if (!props.sessionID) return
-@@ -437,9 +497,24 @@ export function Prompt(props: PromptProps) {
+@@ -444,6 +495,7 @@ export function Prompt(props: PromptProps) {
+     if (!input || input.isDestroyed) return
+     if (props.visible === false || dialog.stack.length > 0) {
+       input.blur()
++      if (props.visible === false) vimState.clearPending()
+       return
+     }
  
-   createEffect(() => {
-     if (props.visible !== false) input?.focus()
--    if (props.visible === false) input?.blur()
-+    if (props.visible === false) {
-+      input?.blur()
-+      vimState.clearPending()
-+    }
-   })
- 
+@@ -716,6 +768,7 @@ export function Prompt(props: PromptProps) {
+         })
+         .catch(() => {})
+     }
++    vimState.clearPending()
+     history.append({
+       ...store.prompt,
+       mode: currentMode,
+@@ -738,6 +791,19 @@ export function Prompt(props: PromptProps) {
+       }, 50)
+     input.clear()
+   }
++
 +  function submitFromTextarea() {
 +    if (store.mode !== "normal") {
 +      submit()
@@ -175,18 +178,10 @@ index 96563b884..9b077c1a1 100644
 +    submit()
 +  }
 +
-   function restoreExtmarksFromParts(parts: PromptInfo["parts"]) {
-     input.extmarks.clear()
-     setStore("extmarkToPartIndex", new Map())
-@@ -695,6 +770,7 @@ export function Prompt(props: PromptProps) {
-         })
-         .catch(() => {})
-     }
-+    vimState.clearPending()
-     history.append({
-       ...store.prompt,
-       mode: currentMode,
-@@ -924,10 +1000,11 @@ export function Prompt(props: PromptProps) {
+   const exit = useExit()
+ 
+   function pasteText(text: string, virtualText: string) {
+@@ -953,10 +1019,11 @@ export function Prompt(props: PromptProps) {
                    setStore("extmarkToPartIndex", new Map())
                    return
                  }
@@ -200,7 +195,7 @@ index 96563b884..9b077c1a1 100644
                      e.preventDefault()
                      return
                    }
-@@ -941,11 +1018,14 @@ export function Prompt(props: PromptProps) {
+@@ -970,11 +1037,14 @@ export function Prompt(props: PromptProps) {
                  if (store.mode === "shell") {
                    if ((e.name === "backspace" && input.visualCursor.offset === 0) || e.name === "escape") {
                      setStore("mode", "normal")
@@ -215,7 +210,7 @@ index 96563b884..9b077c1a1 100644
                  if (!autocomplete.visible) {
                    if (
                      (keybind.match("history_previous", e) && input.cursorOffset === 0) ||
-@@ -971,7 +1051,7 @@ export function Prompt(props: PromptProps) {
+@@ -1000,7 +1070,7 @@ export function Prompt(props: PromptProps) {
                      input.cursorOffset = input.plainText.length
                  }
                }}
@@ -224,7 +219,7 @@ index 96563b884..9b077c1a1 100644
                onPaste={async (event: PasteEvent) => {
                  if (props.disabled) {
                    event.preventDefault()
-@@ -1108,6 +1188,9 @@ export function Prompt(props: PromptProps) {
+@@ -1163,6 +1233,9 @@ export function Prompt(props: PromptProps) {
            />
          </box>
          <box flexDirection="row" justifyContent="space-between">
@@ -236,7 +231,7 @@ index 96563b884..9b077c1a1 100644
                flexDirection="row"
 diff --git a/packages/opencode/src/cli/cmd/tui/component/vim/index.ts b/packages/opencode/src/cli/cmd/tui/component/vim/index.ts
 new file mode 100644
-index 000000000..453b03fa6
+index 0000000..453b03f
 --- /dev/null
 +++ b/packages/opencode/src/cli/cmd/tui/component/vim/index.ts
 @@ -0,0 +1,14 @@
@@ -256,7 +251,7 @@ index 000000000..453b03fa6
 +}
 diff --git a/packages/opencode/src/cli/cmd/tui/component/vim/vim-handler.ts b/packages/opencode/src/cli/cmd/tui/component/vim/vim-handler.ts
 new file mode 100644
-index 000000000..f4c594451
+index 0000000..f4c5944
 --- /dev/null
 +++ b/packages/opencode/src/cli/cmd/tui/component/vim/vim-handler.ts
 @@ -0,0 +1,321 @@
@@ -583,7 +578,7 @@ index 000000000..f4c594451
 +}
 diff --git a/packages/opencode/src/cli/cmd/tui/component/vim/vim-indicator.ts b/packages/opencode/src/cli/cmd/tui/component/vim/vim-indicator.ts
 new file mode 100644
-index 000000000..7e6ec7601
+index 0000000..7e6ec76
 --- /dev/null
 +++ b/packages/opencode/src/cli/cmd/tui/component/vim/vim-indicator.ts
 @@ -0,0 +1,14 @@
@@ -603,7 +598,7 @@ index 000000000..7e6ec7601
 +}
 diff --git a/packages/opencode/src/cli/cmd/tui/component/vim/vim-motion-jump.ts b/packages/opencode/src/cli/cmd/tui/component/vim/vim-motion-jump.ts
 new file mode 100644
-index 000000000..279fe9a6f
+index 0000000..279fe9a
 --- /dev/null
 +++ b/packages/opencode/src/cli/cmd/tui/component/vim/vim-motion-jump.ts
 @@ -0,0 +1,32 @@
@@ -641,7 +636,7 @@ index 000000000..279fe9a6f
 +}
 diff --git a/packages/opencode/src/cli/cmd/tui/component/vim/vim-motions.ts b/packages/opencode/src/cli/cmd/tui/component/vim/vim-motions.ts
 new file mode 100644
-index 000000000..c86a62bc2
+index 0000000..c86a62b
 --- /dev/null
 +++ b/packages/opencode/src/cli/cmd/tui/component/vim/vim-motions.ts
 @@ -0,0 +1,254 @@
@@ -901,7 +896,7 @@ index 000000000..c86a62bc2
 +}
 diff --git a/packages/opencode/src/cli/cmd/tui/component/vim/vim-scroll.ts b/packages/opencode/src/cli/cmd/tui/component/vim/vim-scroll.ts
 new file mode 100644
-index 000000000..e886584c9
+index 0000000..e886584
 --- /dev/null
 +++ b/packages/opencode/src/cli/cmd/tui/component/vim/vim-scroll.ts
 @@ -0,0 +1,15 @@
@@ -922,17 +917,17 @@ index 000000000..e886584c9
 +}
 diff --git a/packages/opencode/src/cli/cmd/tui/component/vim/vim-state.ts b/packages/opencode/src/cli/cmd/tui/component/vim/vim-state.ts
 new file mode 100644
-index 000000000..d3f8ca5fa
+index 0000000..d38ba21
 --- /dev/null
 +++ b/packages/opencode/src/cli/cmd/tui/component/vim/vim-state.ts
 @@ -0,0 +1,41 @@
-+import { createEffect, createMemo, createSignal, type Accessor } from "solid-js"
++import { createEffect, createMemo, createSignal, untrack, type Accessor } from "solid-js"
 +
 +export type VimMode = "normal" | "insert"
 +export type VimPending = "" | "c" | "d" | "g"
 +
-+export function createVimState(input: { enabled: Accessor<boolean>; initial?: Accessor<VimMode | undefined> }) {
-+  const [mode, setMode] = createSignal<VimMode>(input.initial?.() ?? "insert")
++export function createVimState(input: { enabled: Accessor<boolean> }) {
++  const [mode, setMode] = createSignal<VimMode>("insert")
 +  const [pending, setPending] = createSignal<VimPending>("")
 +
 +  function clearPending() {
@@ -948,7 +943,7 @@ index 000000000..d3f8ca5fa
 +    const enabled = input.enabled()
 +
 +    if (!enabled) {
-+      if (mode() !== "insert") setMode("insert")
++      if (untrack(mode) !== "insert") setMode("insert")
 +      clearPending()
 +      return
 +    }
@@ -968,20 +963,20 @@ index 000000000..d3f8ca5fa
 +  }
 +}
 diff --git a/packages/opencode/src/config/tui-schema.ts b/packages/opencode/src/config/tui-schema.ts
-index b126d3c96..0e453f330 100644
+index a373b4d..a8a6e9e 100644
 --- a/packages/opencode/src/config/tui-schema.ts
 +++ b/packages/opencode/src/config/tui-schema.ts
-@@ -22,6 +22,7 @@ export const TuiOptions = z.object({
-     .enum(["auto", "stacked"])
+@@ -23,6 +23,7 @@ export const TuiOptions = z.object({
      .optional()
      .describe("Control diff rendering style: 'auto' adapts to terminal width, 'stacked' always shows single column"),
+   mouse: z.boolean().optional().describe("Enable or disable mouse capture (default: true)"),
 +  vim: z.boolean().optional().describe("Enable vim-style input for the prompt"),
  })
  
  export const TuiInfo = z
 diff --git a/packages/opencode/test/cli/tui/vim-motions.test.ts b/packages/opencode/test/cli/tui/vim-motions.test.ts
 new file mode 100644
-index 000000000..4565b09ba
+index 0000000..4565b09
 --- /dev/null
 +++ b/packages/opencode/test/cli/tui/vim-motions.test.ts
 @@ -0,0 +1,776 @@
@@ -1762,10 +1757,10 @@ index 000000000..4565b09ba
 +  })
 +})
 diff --git a/packages/web/src/content/docs/config.mdx b/packages/web/src/content/docs/config.mdx
-index a9c39bd59..9a04c9456 100644
+index 52ee1da..a508536 100644
 --- a/packages/web/src/content/docs/config.mdx
 +++ b/packages/web/src/content/docs/config.mdx
-@@ -176,6 +176,11 @@ Use a dedicated `tui.json` (or `tui.jsonc`) file for TUI-specific settings.
+@@ -279,6 +279,11 @@ Use a dedicated `tui.json` (or `tui.jsonc`) file for TUI-specific settings.
  
  Use `OPENCODE_TUI_CONFIG` to point to a custom TUI config file.
  
@@ -1776,12 +1771,12 @@ index a9c39bd59..9a04c9456 100644
 +
  Legacy `theme`, `keybinds`, and `tui` keys in `opencode.json` are deprecated and automatically migrated when possible.
  
- [Learn more about TUI configuration here](/docs/tui#configure).
+ ---
 diff --git a/packages/web/src/content/docs/tui.mdx b/packages/web/src/content/docs/tui.mdx
-index 010e8328f..bbf7b3117 100644
+index e89fb4a..946eefa 100644
 --- a/packages/web/src/content/docs/tui.mdx
 +++ b/packages/web/src/content/docs/tui.mdx
-@@ -392,6 +392,32 @@ You can customize various aspects of the TUI view using the command palette (`ct
+@@ -388,6 +388,32 @@ Use `OPENCODE_TUI_CONFIG` to load a custom TUI config path.
  
  ---
  
@@ -1811,6 +1806,6 @@ index 010e8328f..bbf7b3117 100644
 +
 +---
 +
- #### Username display
+ ## Customization
  
- Toggle whether your username appears in chat messages. Access this through:
+ You can customize various aspects of the TUI view using the command palette (`ctrl+x h` or `/help`). These settings persist across restarts.

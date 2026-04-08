@@ -1,8 +1,8 @@
 diff --git a/packages/opencode/src/session/message-v2.ts b/packages/opencode/src/session/message-v2.ts
-index f1335f6f21a..0b2d661b38a 100644
+index e8aab62d8423..6fc8f8329514 100644
 --- a/packages/opencode/src/session/message-v2.ts
 +++ b/packages/opencode/src/session/message-v2.ts
-@@ -683,17 +683,32 @@ export namespace MessageV2 {
+@@ -701,17 +701,32 @@ export namespace MessageV2 {
            role: "assistant",
            parts: [],
          }
@@ -36,7 +36,7 @@ index f1335f6f21a..0b2d661b38a 100644
            if (part.type === "tool") {
              toolNames.add(part.tool)
              if (part.state.status === "completed") {
-@@ -746,6 +761,7 @@ export namespace MessageV2 {
+@@ -764,6 +779,7 @@ export namespace MessageV2 {
                  errorText: "[Tool execution was interrupted]",
                  ...(differentModel ? {} : { callProviderMetadata: part.metadata }),
                })
@@ -45,7 +45,7 @@ index f1335f6f21a..0b2d661b38a 100644
            if (part.type === "reasoning") {
              assistantMessage.parts.push({
 diff --git a/packages/opencode/test/session/message-v2.test.ts b/packages/opencode/test/session/message-v2.test.ts
-index 0d5b89730a9..beb466d9208 100644
+index 3634d6fb7ec8..6b9cb846f5af 100644
 --- a/packages/opencode/test/session/message-v2.test.ts
 +++ b/packages/opencode/test/session/message-v2.test.ts
 @@ -788,6 +788,104 @@ describe("session.message-v2.toModelMessage", () => {
@@ -53,7 +53,7 @@ index 0d5b89730a9..beb466d9208 100644
      ])
    })
 +
-+  test("does not produce interleaved tool-call and text/reasoning in a single assistant block when step boundaries are missing", () => {
++  test("does not produce interleaved tool-call and text/reasoning in a single assistant block when step boundaries are missing", async () => {
 +    // When the finish-step handler in processor.ts throws during a retryable error,
 +    // step-finish for step 1 and step-start for step 2 are never saved. Both steps'
 +    // content merges into one DB message without boundaries. On replay,
@@ -130,7 +130,7 @@ index 0d5b89730a9..beb466d9208 100644
 +      },
 +    ]
 +
-+    const result = MessageV2.toModelMessages(input, model)
++    const result = await MessageV2.toModelMessages(input, model)
 +
 +    // Structural invariant: in every assistant ModelMessage, no text or reasoning
 +    // part should appear AFTER a tool-call part. If it does, the Anthropic API

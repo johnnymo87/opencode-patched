@@ -99,19 +99,37 @@ The three patches modify completely different areas of the codebase:
 
 Zero file overlap between any pair of patches.
 
+## Patch Ownership
+
+Each patch is owned by a specific repo. Do not edit a patch in the wrong repo.
+
+| Patch | Owned by | Upstream PR guide |
+|-------|----------|-------------------|
+| `caching.patch` | [opencode-cached](https://github.com/johnnymo87/opencode-cached) (`patches/caching.patch`) | PR #5422 |
+| `vim.patch` | **this repo** (`patches/vim.patch`) | PR #12679 |
+| `tool-fix.patch` | **this repo** (`patches/tool-fix.patch`) | PR #16751 |
+
+When an upstream PR is merged, the corresponding patch can be dropped. `caching.patch` is
+managed in the sibling repo `~/projects/opencode-cached`; edits belong there, not here.
+
 ## Maintenance
 
 ### When the Caching Patch Breaks (Build Failure)
 
 This is handled by [opencode-cached](https://github.com/johnnymo87/opencode-cached). If the caching patch fails on a new upstream version, opencode-cached won't release, and this repo won't attempt a build.
 
+To refresh: edit `~/projects/opencode-cached/patches/caching.patch` (not this repo).
+
 ### When the Vim Patch Breaks (Build Failure)
 
 The build fails and creates a GitHub issue automatically. This blocks publication.
 
-1. Regenerate from the PR: `gh pr diff 12679 --repo anomalyco/opencode > patches/vim.patch`
-2. Review, commit, push
-3. Re-trigger: `gh workflow run build-release.yml --field version=X.Y.Z`
+Use PR [#12679](https://github.com/anomalyco/opencode/pull/12679) as the behavioral guide when rebasing: the PR defines the intended vim motions and config surface. Port only behavior still missing upstream; drop anything already present.
+
+1. Fetch the PR as a behavioral reference: `gh pr diff 12679 --repo anomalyco/opencode > /tmp/vim-pr-12679.patch`
+2. Rebase `patches/vim.patch` onto the new upstream, using the PR diff as the source of truth for intended behavior
+3. Review, commit, push
+4. Re-trigger: `gh workflow run build-release.yml --field version=X.Y.Z`
 
 ### When the Vim PR Drifts (Review Signal, Not Breakage)
 
@@ -127,9 +145,13 @@ decide whether to adopt it.
 
 The build fails and creates a GitHub issue automatically. This blocks publication.
 
-1. Regenerate from the PR: `gh pr diff 16751 --repo anomalyco/opencode > patches/tool-fix.patch`
-2. Review, commit, push
-3. Re-trigger: `gh workflow run build-release.yml --field version=X.Y.Z`
+Use PR [#16751](https://github.com/anomalyco/opencode/pull/16751) as the behavioral guide when refreshing. If the upstream release already includes the fix (verify by running the regression test), **drop `patches/tool-fix.patch` entirely** rather than refreshing it.
+
+1. Check whether upstream already has the fix: run the regression test from PR #16751 against a plain upstream checkout
+2. If fix is present upstream: remove `patches/tool-fix.patch` and update `patches/apply.sh`
+3. If fix is absent: regenerate from the PR: `gh pr diff 16751 --repo anomalyco/opencode > patches/tool-fix.patch`
+4. Review, commit, push
+5. Re-trigger: `gh workflow run build-release.yml --field version=X.Y.Z`
 
 ### When the Tool Fix PR Drifts (Review Signal, Not Breakage)
 
