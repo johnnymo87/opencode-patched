@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
-# Apply caching + vim + tool-fix patches to opencode source
+# Apply caching + vim + tool-fix + mcp-reconnect patches to opencode source
 # Usage: ./apply.sh <path-to-opencode-source>
 #
 # Fetches caching.patch from opencode-cached (never duplicated here),
-# then applies local vim.patch and tool-fix.patch on top.
+# then applies local vim.patch, tool-fix.patch, and mcp-reconnect.patch on top.
 
 set -euo pipefail
 
@@ -17,6 +17,7 @@ SOURCE_DIR="$1"
 SCRIPT_DIR="$(dirname "$0")"
 VIM_PATCH="$SCRIPT_DIR/vim.patch"
 TOOL_FIX_PATCH="$SCRIPT_DIR/tool-fix.patch"
+MCP_RECONNECT_PATCH="$SCRIPT_DIR/mcp-reconnect.patch"
 CACHING_PATCH_URL="https://raw.githubusercontent.com/johnnymo87/opencode-cached/main/patches/caching.patch"
 
 if [ ! -d "$SOURCE_DIR" ]; then
@@ -31,6 +32,11 @@ fi
 
 if [ ! -f "$TOOL_FIX_PATCH" ]; then
   echo "Error: Tool fix patch not found: $TOOL_FIX_PATCH"
+  exit 1
+fi
+
+if [ ! -f "$MCP_RECONNECT_PATCH" ]; then
+  echo "Error: MCP reconnect patch not found: $MCP_RECONNECT_PATCH"
   exit 1
 fi
 
@@ -112,6 +118,27 @@ fi
 
 git apply "$TOOL_FIX_PATCH"
 echo "✓ Tool fix patch applied"
+
+# --- Patch 4: MCP auto-reconnect (local) ---
+
+echo "Applying mcp-reconnect.patch..."
+if ! git apply --check "$MCP_RECONNECT_PATCH" 2>/dev/null; then
+  echo ""
+  echo "❌ MCP RECONNECT PATCH FAILED TO APPLY"
+  echo ""
+  echo "Attempting to apply for diagnostics..."
+  git apply "$MCP_RECONNECT_PATCH" 2>&1 || true
+  echo ""
+  echo "Failed files:"
+  find . -name "*.rej" -type f 2>/dev/null || echo "  None found"
+  echo ""
+  echo "The MCP reconnect patch may need updating for this upstream version."
+  echo "Issue: https://github.com/anomalyco/opencode/issues/15247"
+  exit 1
+fi
+
+git apply "$MCP_RECONNECT_PATCH"
+echo "✓ MCP reconnect patch applied"
 
 # --- Summary ---
 

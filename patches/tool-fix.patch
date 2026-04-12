@@ -1,8 +1,8 @@
 diff --git a/packages/opencode/src/session/message-v2.ts b/packages/opencode/src/session/message-v2.ts
-index e8aab62d8423..6fc8f8329514 100644
+index 61c1596..a01d898 100644
 --- a/packages/opencode/src/session/message-v2.ts
 +++ b/packages/opencode/src/session/message-v2.ts
-@@ -701,17 +701,32 @@ export namespace MessageV2 {
+@@ -707,17 +707,32 @@ export namespace MessageV2 {
            role: "assistant",
            parts: [],
          }
@@ -36,35 +36,24 @@ index e8aab62d8423..6fc8f8329514 100644
            if (part.type === "tool") {
              toolNames.add(part.tool)
              if (part.state.status === "completed") {
-@@ -764,6 +779,7 @@ export namespace MessageV2 {
-                 errorText: "[Tool execution was interrupted]",
-                 ...(differentModel ? {} : { callProviderMetadata: part.metadata }),
+@@ -787,6 +802,7 @@ export namespace MessageV2 {
+                 ...(part.metadata?.providerExecuted ? { providerExecuted: true } : {}),
+                 ...(differentModel ? {} : { callProviderMetadata: providerMeta(part.metadata) }),
                })
 +            sawTool = true
            }
            if (part.type === "reasoning") {
              assistantMessage.parts.push({
 diff --git a/packages/opencode/test/session/message-v2.test.ts b/packages/opencode/test/session/message-v2.test.ts
-index 3634d6fb7ec8..6b9cb846f5af 100644
+index 64a5d3e..293fb04 100644
 --- a/packages/opencode/test/session/message-v2.test.ts
 +++ b/packages/opencode/test/session/message-v2.test.ts
-@@ -788,6 +788,104 @@ describe("session.message-v2.toModelMessage", () => {
+@@ -863,6 +863,86 @@ describe("session.message-v2.toModelMessage", () => {
        },
      ])
    })
 +
 +  test("does not produce interleaved tool-call and text/reasoning in a single assistant block when step boundaries are missing", async () => {
-+    // When the finish-step handler in processor.ts throws during a retryable error,
-+    // step-finish for step 1 and step-start for step 2 are never saved. Both steps'
-+    // content merges into one DB message without boundaries. On replay,
-+    // convertToModelMessages() produces a single assistant block with interleaved
-+    // tool_use/reasoning/text, which the Anthropic API rejects with:
-+    //   "tool_use ids were found without tool_result blocks immediately after"
-+    //   or "Expected thinking or redacted_thinking, but found tool_use"
-+    //
-+    // Real-world DB evidence from session ses_32fb35486ffeeJAHmplKU1gB2t:
-+    //   step-start → text → tool(write, error, input={}) → [96s gap] → text → tool(write, completed) → step-finish
-+    //   The error tool had "Tool execution aborted" and empty input — no step boundary between the two steps.
 +    const userID = "m-user"
 +    const assistantID = "m-assistant"
 +
@@ -92,7 +81,6 @@ index 3634d6fb7ec8..6b9cb846f5af 100644
 +            text: "Now let me write the implementation.",
 +          },
 +          {
-+            // Step 1's tool — errored with empty input (aborted before tool-call event)
 +            ...basePart(assistantID, "tool1"),
 +            type: "tool",
 +            callID: "call-1",
@@ -104,14 +92,12 @@ index 3634d6fb7ec8..6b9cb846f5af 100644
 +              time: { start: 0, end: 1 },
 +            },
 +          },
-+          // NO step-finish or step-start here — the boundary was lost
 +          {
 +            ...basePart(assistantID, "t2"),
 +            type: "text",
 +            text: "Now let me write the implementation.",
 +          },
 +          {
-+            // Step 2's tool — completed successfully on retry
 +            ...basePart(assistantID, "tool2"),
 +            type: "tool",
 +            callID: "call-2",
@@ -125,16 +111,12 @@ index 3634d6fb7ec8..6b9cb846f5af 100644
 +              time: { start: 2, end: 3 },
 +            },
 +          },
-+          // step-finish only exists for the final step
 +        ] as MessageV2.Part[],
 +      },
 +    ]
 +
 +    const result = await MessageV2.toModelMessages(input, model)
 +
-+    // Structural invariant: in every assistant ModelMessage, no text or reasoning
-+    // part should appear AFTER a tool-call part. If it does, the Anthropic API
-+    // will reject the message because it expects tool_result immediately after tool_use.
 +    for (const msg of result) {
 +      if (msg.role !== "assistant" || !Array.isArray(msg.content)) continue
 +      let sawToolCall = false
