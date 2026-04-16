@@ -123,10 +123,22 @@ jobs:
           ls -lh dist/
         env:
           OPENCODE_VERSION: ${{ inputs.version }}
+          # Bun 1.3.12 has a regression (oven-sh/bun#29120, fixed in #29272)
+          # where its built-in Mach-O codesigner writes an LC_CODE_SIGNATURE
+          # with datasize smaller than the SuperBlob it actually stamps. macOS
+          # kernels (Sequoia 15.4+) SIGKILL the resulting binary on launch,
+          # and subsequent `codesign --sign -` calls fail with "invalid or
+          # unsupported format for signature".
+          #
+          # Disable Bun's internal signer so the output has no LC_CODE_SIGNATURE
+          # slot at all, then ad-hoc sign it ourselves below. Remove this env
+          # var once Bun >1.3.12 ships.
+          BUN_NO_CODESIGN_MACHO_BINARY: "1"
 
-      # Bun's `bun build --compile` does not codesign its output. Unsigned
-      # Mach-O binaries are SIGKILL'd by the kernel on Apple Silicon. Apply
-      # an ad-hoc signature so the binaries are runnable on end-user macs.
+      # Ad-hoc sign the freshly-built Mach-O binaries. Without a valid
+      # signature, macOS (Apple Silicon, Sequoia 15.4+) SIGKILLs the binary
+      # on launch with exit 9. We do this ourselves because Bun's internal
+      # signer is disabled via BUN_NO_CODESIGN_MACHO_BINARY above.
       - name: Ad-hoc codesign macOS binaries
         run: |
           for arch in arm64 x64; do
