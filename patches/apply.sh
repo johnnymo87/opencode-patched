@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
-# Apply caching + vim + tool-fix + mcp-reconnect patches to opencode source
+# Apply caching + vim + tool-fix + mcp-reconnect + opus-4-7 patches to opencode source
 # Usage: ./apply.sh <path-to-opencode-source>
 #
 # Fetches caching.patch from opencode-cached (never duplicated here),
-# then applies local vim.patch, tool-fix.patch, and mcp-reconnect.patch on top.
+# then applies local vim.patch, tool-fix.patch, mcp-reconnect.patch, and opus-4-7.patch on top.
 
 set -euo pipefail
 
@@ -18,6 +18,7 @@ SCRIPT_DIR="$(dirname "$0")"
 VIM_PATCH="$SCRIPT_DIR/vim.patch"
 TOOL_FIX_PATCH="$SCRIPT_DIR/tool-fix.patch"
 MCP_RECONNECT_PATCH="$SCRIPT_DIR/mcp-reconnect.patch"
+OPUS_47_PATCH="$SCRIPT_DIR/opus-4-7.patch"
 CACHING_PATCH_URL="https://raw.githubusercontent.com/johnnymo87/opencode-cached/main/patches/caching.patch"
 
 if [ ! -d "$SOURCE_DIR" ]; then
@@ -37,6 +38,11 @@ fi
 
 if [ ! -f "$MCP_RECONNECT_PATCH" ]; then
   echo "Error: MCP reconnect patch not found: $MCP_RECONNECT_PATCH"
+  exit 1
+fi
+
+if [ ! -f "$OPUS_47_PATCH" ]; then
+  echo "Error: Opus 4.7 patch not found: $OPUS_47_PATCH"
   exit 1
 fi
 
@@ -139,6 +145,27 @@ fi
 
 git apply "$MCP_RECONNECT_PATCH"
 echo "✓ MCP reconnect patch applied"
+
+# --- Patch 5: Opus 4.7 adaptive reasoning + xhigh effort (local) ---
+
+echo "Applying opus-4-7.patch..."
+if ! git apply --check "$OPUS_47_PATCH" 2>/dev/null; then
+  echo ""
+  echo "❌ OPUS 4.7 PATCH FAILED TO APPLY"
+  echo ""
+  echo "Attempting to apply for diagnostics..."
+  git apply "$OPUS_47_PATCH" 2>&1 || true
+  echo ""
+  echo "Failed files:"
+  find . -name "*.rej" -type f 2>/dev/null || echo "  None found"
+  echo ""
+  echo "The Opus 4.7 patch may no longer be needed -- check if upstream has added opus-4-7 support."
+  echo "If upstream added it, drop this patch from apply.sh."
+  exit 1
+fi
+
+git apply "$OPUS_47_PATCH"
+echo "✓ Opus 4.7 patch applied"
 
 # --- Summary ---
 

@@ -52,8 +52,20 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
 
+      - name: Check opus-4-7 support upstream
+        id: check_opus47
+        run: |
+          # No upstream PR -- check if upstream source already includes opus-4-7 in isAnthropicAdaptive
+          if curl -sfL "https://raw.githubusercontent.com/anomalyco/opencode/dev/packages/opencode/src/provider/transform.ts" | grep -q 'opus-4-7'; then
+            echo "state=MERGED" >> $GITHUB_OUTPUT
+            echo "Opus 4.7 support: present upstream"
+          else
+            echo "state=OPEN" >> $GITHUB_OUTPUT
+            echo "Opus 4.7 support: not yet upstream"
+          fi
+
       - name: Create sunset recommendation
-        if: steps.check_caching_pr.outputs.state == 'MERGED' || steps.check_vim_pr.outputs.state == 'MERGED' || steps.check_tool_fix_pr.outputs.state == 'MERGED' || steps.check_mcp_reconnect.outputs.state == 'CLOSED'
+        if: steps.check_caching_pr.outputs.state == 'MERGED' || steps.check_vim_pr.outputs.state == 'MERGED' || steps.check_tool_fix_pr.outputs.state == 'MERGED' || steps.check_mcp_reconnect.outputs.state == 'CLOSED' || steps.check_opus47.outputs.state == 'MERGED'
         uses: actions/github-script@v7
         with:
           script: |
@@ -61,7 +73,8 @@ jobs:
             const vimState = '${{ steps.check_vim_pr.outputs.state }}';
             const toolFixState = '${{ steps.check_tool_fix_pr.outputs.state }}';
             const mcpReconnectState = '${{ steps.check_mcp_reconnect.outputs.state }}';
-            const allMerged = cachingState === 'MERGED' && vimState === 'MERGED' && toolFixState === 'MERGED' && mcpReconnectState === 'CLOSED';
+            const opus47State = '${{ steps.check_opus47.outputs.state }}';
+            const allMerged = cachingState === 'MERGED' && vimState === 'MERGED' && toolFixState === 'MERGED' && mcpReconnectState === 'CLOSED' && opus47State === 'MERGED';
 
             // Collect which PRs/issues are resolved
             const merged = [];
@@ -74,6 +87,8 @@ jobs:
             else remaining.push('Tool fix PR #16751');
             if (mcpReconnectState === 'CLOSED') merged.push('MCP reconnect #15247');
             else remaining.push('MCP reconnect #15247');
+            if (opus47State === 'MERGED') merged.push('Opus 4.7 support');
+            else remaining.push('Opus 4.7 support');
 
             let title, body;
 
@@ -86,6 +101,7 @@ jobs:
             - **Vim PR #12679**: MERGED
             - **Tool fix PR #16751**: MERGED
             - **MCP reconnect #15247**: CLOSED
+            - **Opus 4.7 support**: MERGED
 
             All patches are now available in official OpenCode releases. This repo can be archived.
 
@@ -105,6 +121,7 @@ jobs:
             - **Vim PR #12679**: ${vimState}
             - **Tool fix PR #16751**: ${toolFixState}
             - **MCP reconnect #15247**: ${mcpReconnectState}
+            - **Opus 4.7 support**: ${opus47State}
 
             Merged: ${merged.join(', ')}
             Remaining: ${remaining.join(', ')}
@@ -133,7 +150,7 @@ jobs:
                 owner: context.repo.owner,
                 repo: context.repo.repo,
                 issue_number: existingIssue.number,
-                body: `Monthly check (${new Date().toISOString().split('T')[0]}): Caching PR: ${cachingState}, Vim PR: ${vimState}, Tool fix PR: ${toolFixState}, MCP reconnect: ${mcpReconnectState}`
+                body: `Monthly check (${new Date().toISOString().split('T')[0]}): Caching PR: ${cachingState}, Vim PR: ${vimState}, Tool fix PR: ${toolFixState}, MCP reconnect: ${mcpReconnectState}, Opus 4.7: ${opus47State}`
               });
             } else {
               await github.rest.issues.create({
@@ -153,3 +170,4 @@ jobs:
           echo "Vim PR #12679: ${{ steps.check_vim_pr.outputs.state }}"
           echo "Tool fix PR #16751: ${{ steps.check_tool_fix_pr.outputs.state }}"
           echo "MCP reconnect #15247: ${{ steps.check_mcp_reconnect.outputs.state }}"
+          echo "Opus 4.7 support: ${{ steps.check_opus47.outputs.state }}"
