@@ -124,6 +124,23 @@ jobs:
         env:
           OPENCODE_VERSION: ${{ inputs.version }}
 
+      # Bun's `bun build --compile` does not codesign its output. Unsigned
+      # Mach-O binaries are SIGKILL'd by the kernel on Apple Silicon. Apply
+      # an ad-hoc signature so the binaries are runnable on end-user macs.
+      - name: Ad-hoc codesign macOS binaries
+        run: |
+          for arch in arm64 x64; do
+            bin="opencode-src/packages/opencode/dist/opencode-darwin-${arch}/bin/opencode"
+            echo "Signing ${bin}"
+            codesign --force --sign - "${bin}"
+            codesign -dv "${bin}" 2>&1 | grep -E "^(Executable|Signature|Format|CodeDirectory)"
+          done
+
+      - name: Smoke test signed arm64 binary
+        run: |
+          bin="opencode-src/packages/opencode/dist/opencode-darwin-arm64/bin/opencode"
+          "${bin}" --version
+
       - name: Extract macOS arm64 binary
         run: |
           cd opencode-src/packages/opencode/dist/opencode-darwin-arm64
