@@ -1,8 +1,8 @@
 # opencode-patched
 
-**OpenCode with [prompt caching](https://github.com/anomalyco/opencode/pull/5422) + [vim keybindings](https://github.com/anomalyco/opencode/pull/12679) + [tool use/result fix](https://github.com/anomalyco/opencode/pull/16751) + [MCP auto-reconnect](https://github.com/anomalyco/opencode/issues/15247) + [Opus 4.7 support](https://www.anthropic.com/news/claude-opus-4-7)**
+**OpenCode with [prompt caching](https://github.com/anomalyco/opencode/pull/5422) + [vim keybindings](https://github.com/anomalyco/opencode/pull/12679) + [tool use/result fix](https://github.com/anomalyco/opencode/pull/16751) + [MCP auto-reconnect](https://github.com/anomalyco/opencode/issues/15247)**
 
-This repository combines five patches into a single OpenCode binary, built automatically for 4 platforms.
+This repository combines four patches into a single OpenCode binary, built automatically for 4 platforms.
 
 ## Patches Included
 
@@ -31,17 +31,6 @@ Stored locally as `patches/tool-fix.patch`. Fixes the widespread `tool_use ids w
 Stored locally as `patches/mcp-reconnect.patch`. Automatically reconnects remote MCP servers when the server restarts and the session becomes stale. Without this patch, `callTool` fails at the transport layer with "Session not found" / HTTP 404 errors, requiring a manual MCP toggle (ctrl+p) or full OpenCode restart.
 
 The patch wraps remote MCP tool execution with a try/catch that detects transport-level errors (stale sessions, connection refused, etc.), closes the stale client, creates a fresh transport + client, refreshes tool definitions, and retries the call once.
-
-### 5. Claude Opus 4.7 Adaptive Reasoning + xhigh Effort
-
-Stored locally as `patches/opus-4-7.patch`. Adds day-zero support for Claude Opus 4.7 (`claude-opus-4-7`). Without this patch, OpenCode falls back to the legacy `budget_tokens` thinking mode which Opus 4.7 **rejects** (it only supports adaptive thinking). The patch:
-
-- Adds `opus-4-7` to the `isAnthropicAdaptive` model list in `provider/transform.ts`
-- Enables the new `xhigh` effort level introduced with Opus 4.7 (effort levels: low/medium/high/xhigh/max)
-
-Anthropic recommends starting with `xhigh` for coding and agentic use cases with Opus 4.7.
-
-**Sunset**: Drop this patch when upstream opencode adds opus-4-7 to the `isAnthropicAdaptive` array.
 
 ## Installation
 
@@ -92,7 +81,7 @@ Timing Chain (every 8 hours):
       |-> builds v{VER}-cached        -- applies caching patch, publishes
 
 :01  opencode-patched/sync-cached     -- detects new -cached release
-      |-> builds v{VER}-patched       -- applies caching + vim + tool fix + mcp reconnect + opus 4.7 patches, publishes
+      |-> builds v{VER}-patched       -- applies caching + vim + tool fix + mcp reconnect patches, publishes
 :01  opencode-patched/sync-vim-pr     -- checks PR #12679 for changes
 :01  opencode-patched/sync-tool-fix-pr -- checks PR #16751 for changes
 
@@ -103,20 +92,19 @@ Timing Chain (every 8 hours):
 
 1. Clone upstream OpenCode at the release tag
 2. Fetch `caching.patch` from [opencode-cached](https://github.com/johnnymo87/opencode-cached) (always latest from `main`)
-3. Apply `caching.patch`, then local `vim.patch`, then `tool-fix.patch`, then `mcp-reconnect.patch`, then `opus-4-7.patch`
+3. Apply `caching.patch`, then local `vim.patch`, then `tool-fix.patch`, then `mcp-reconnect.patch`
 4. Build with Bun for 4 platforms (linux/darwin x arm64/x64)
 5. Publish release as `v{VERSION}-patched`
 
 ### Patch Independence
 
-The five patches modify completely different areas of the codebase:
-- **Caching**: `provider/config.ts`, `provider/transform.ts` (cache config functions), `session/prompt.ts`, `config/config.ts`
-- **Vim**: `cli/cmd/tui/component/vim/*`, `cli/cmd/tui/component/prompt/index.tsx`, `cli/cmd/tui/app.tsx`
+The four patches modify completely different areas of the codebase:
+- **Caching**: `config/agent.ts`, `config/provider.ts`, `provider/config.ts`, `provider/transform.ts`, `session/prompt.ts`
+- **Vim**: `cli/cmd/tui/component/vim/*`, `cli/cmd/tui/component/prompt/index.tsx`, `cli/cmd/tui/app.tsx`, `cli/cmd/tui/config/tui-schema.ts`
 - **Tool fix**: `session/message-v2.ts`, `test/session/message-v2.test.ts`
 - **MCP reconnect**: `mcp/index.ts`
-- **Opus 4.7**: `provider/transform.ts` (`variants()` function -- different hunk from caching)
 
-Zero file overlap between any pair of patches. Note: caching and opus-4-7 both touch `transform.ts` but modify different functions in different hunks.
+Zero file overlap between any pair of patches.
 
 ## Patch Ownership
 
@@ -128,7 +116,6 @@ Each patch is owned by a specific repo. Do not edit a patch in the wrong repo.
 | `vim.patch` | **this repo** (`patches/vim.patch`) | PR #12679 |
 | `tool-fix.patch` | **this repo** (`patches/tool-fix.patch`) | PR #16751 |
 | `mcp-reconnect.patch` | **this repo** (`patches/mcp-reconnect.patch`) | Issue #15247 |
-| `opus-4-7.patch` | **this repo** (`patches/opus-4-7.patch`) | No upstream PR (day-zero support) |
 
 When an upstream PR is merged, the corresponding patch can be dropped. `caching.patch` is
 managed in the sibling repo `~/projects/opencode-cached`; edits belong there, not here.
@@ -195,25 +182,10 @@ The build fails and creates a GitHub issue automatically. This blocks publicatio
 
 **Sunset**: This patch can be dropped when [issue #15247](https://github.com/anomalyco/opencode/issues/15247) is resolved upstream. Unlike the other patches, this one has no upstream PR to track -- it is original work. If an upstream PR appears, add a sync workflow for it.
 
-### When the Opus 4.7 Patch Breaks (Build Failure)
-
-The build fails and creates a GitHub issue automatically. This blocks publication.
-
-This patch will most likely break because **upstream added opus-4-7 support**, which is the desired outcome. If the `isAnthropicAdaptive` array already includes `opus-4-7`, simply drop the patch.
-
-1. Check if upstream already has opus-4-7: `curl -sfL "https://raw.githubusercontent.com/anomalyco/opencode/dev/packages/opencode/src/provider/transform.ts" | grep 'opus-4-7'`
-2. If present upstream: remove `patches/opus-4-7.patch` and update `patches/apply.sh`
-3. If absent but patch context shifted: regenerate against the new upstream version
-4. Review, commit, push
-5. Re-trigger: `gh workflow run build-release.yml --field version=X.Y.Z`
-
-**Sunset**: Drop this patch as soon as upstream adds `opus-4-7` to the `isAnthropicAdaptive` array. The `check-sunset.yml` workflow monitors this automatically.
-
 ### Sunset Criteria
 
 Monthly automated check (`check-sunset.yml`) monitors all upstream PRs:
 - **Any PR merged**: Drop the corresponding patch from `apply.sh`
-- **Opus 4.7 supported upstream**: Drop `opus-4-7.patch` from `apply.sh`
 - **All merged**: Switch workstation to upstream OpenCode, archive this repo and opencode-cached
 
 ## Credits
@@ -224,7 +196,6 @@ Monthly automated check (`check-sunset.yml`) monitors all upstream PRs:
 - **Vim PR**: [PR #12679](https://github.com/anomalyco/opencode/pull/12679) by [@leohenon](https://github.com/leohenon)
 - **Tool fix PR**: [PR #16751](https://github.com/anomalyco/opencode/pull/16751) by [@altendky](https://github.com/altendky)
 - **MCP reconnect**: [Issue #15247](https://github.com/anomalyco/opencode/issues/15247) -- original patch
-- **Opus 4.7 patch**: Day-zero adaptive reasoning + xhigh effort support
 
 ## License
 

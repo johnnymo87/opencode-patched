@@ -1,15 +1,16 @@
-diff -ruN --no-dereference a/packages/opencode/src/cli/cmd/tui/app.tsx b/packages/opencode/src/cli/cmd/tui/app.tsx
---- a/packages/opencode/src/cli/cmd/tui/app.tsx	2026-04-12 08:19:25.411236529 -0400
-+++ b/packages/opencode/src/cli/cmd/tui/app.tsx	2026-04-12 08:22:33.056136102 -0400
-@@ -60,6 +60,7 @@
- import { TuiConfig } from "@/config/tui"
+diff --git a/packages/opencode/src/cli/cmd/tui/app.tsx b/packages/opencode/src/cli/cmd/tui/app.tsx
+index a58ff05..26900a3 100644
+--- a/packages/opencode/src/cli/cmd/tui/app.tsx
++++ b/packages/opencode/src/cli/cmd/tui/app.tsx
+@@ -60,6 +60,7 @@ import { TuiConfigProvider, useTuiConfig } from "./context/tui-config"
+ import { TuiConfig } from "@/cli/cmd/tui/config/tui"
  import { createTuiApi, TuiPluginRuntime, type RouteMap } from "./plugin"
  import { FormatError, FormatUnknownError } from "@/cli/error"
 +import { useVimEnabled } from "./component/vim"
  
- async function getTerminalBackgroundColor(): Promise<"dark" | "light"> {
-   // can't set raw mode if not a TTY
-@@ -297,6 +298,7 @@
+ import type { EventSource } from "./context/sdk"
+ import { DialogVariant } from "./component/dialog-variant"
+@@ -254,6 +255,7 @@ function App(props: { onSnapshot?: () => Promise<string[]> }) {
      .finally(() => {
        setReady(true)
      })
@@ -17,7 +18,7 @@ diff -ruN --no-dereference a/packages/opencode/src/cli/cmd/tui/app.tsx b/package
  
    useKeyboard((evt) => {
      if (!Flag.OPENCODE_EXPERIMENTAL_DISABLE_COPY_ON_SELECT) return
-@@ -785,6 +787,15 @@
+@@ -718,6 +720,15 @@ function App(props: { onSnapshot?: () => Promise<string[]> }) {
          dialog.clear()
        },
      },
@@ -33,13 +34,14 @@ diff -ruN --no-dereference a/packages/opencode/src/cli/cmd/tui/app.tsx b/package
      {
        title: kv.get("animations_enabled", true) ? "Disable animations" : "Enable animations",
        value: "app.toggle.animations",
-diff -ruN --no-dereference a/packages/opencode/src/cli/cmd/tui/component/prompt/index.tsx b/packages/opencode/src/cli/cmd/tui/component/prompt/index.tsx
---- a/packages/opencode/src/cli/cmd/tui/component/prompt/index.tsx	2026-04-12 08:19:25.411236529 -0400
-+++ b/packages/opencode/src/cli/cmd/tui/component/prompt/index.tsx	2026-04-12 08:23:28.353580080 -0400
-@@ -36,6 +36,11 @@
- import { useKV } from "../../context/kv"
- import { useTextareaKeybindings } from "../textarea-keybindings"
- import { DialogSkill } from "../dialog-skill"
+diff --git a/packages/opencode/src/cli/cmd/tui/component/prompt/index.tsx b/packages/opencode/src/cli/cmd/tui/component/prompt/index.tsx
+index 2e08e66..8e06705 100644
+--- a/packages/opencode/src/cli/cmd/tui/component/prompt/index.tsx
++++ b/packages/opencode/src/cli/cmd/tui/component/prompt/index.tsx
+@@ -42,6 +42,11 @@ import { DialogSkill } from "../dialog-skill"
+ import { DialogWorkspaceCreate, restoreWorkspaceSession } from "../dialog-workspace-create"
+ import { DialogWorkspaceUnavailable } from "../dialog-workspace-unavailable"
+ import { useArgs } from "@tui/context/args"
 +import { useVimEnabled } from "../vim"
 +import { createVimState } from "../vim/vim-state"
 +import { createVimHandler } from "../vim/vim-handler"
@@ -48,23 +50,15 @@ diff -ruN --no-dereference a/packages/opencode/src/cli/cmd/tui/component/prompt/
  
  export type PromptProps = {
    sessionID?: string
-@@ -72,7 +77,6 @@
-   if (count <= 0) return 0
-   return Math.floor(Math.random() * count)
- }
--
- export function Prompt(props: PromptProps) {
-   let input: TextareaRenderable
-   let anchor: BoxRenderable
-@@ -94,6 +98,7 @@
-   const kv = useKV()
+@@ -109,6 +114,7 @@ export function Prompt(props: PromptProps) {
+   const animationsEnabled = createMemo(() => kv.get("animations_enabled", true))
    const list = createMemo(() => props.placeholders?.normal ?? [])
    const shell = createMemo(() => props.placeholders?.shell ?? [])
 +  const vimEnabled = useVimEnabled()
    const [auto, setAuto] = createSignal<AutocompleteRef>()
    const currentProviderLabel = createMemo(() => local.model.parsed().provider)
    const hasRightContent = createMemo(() => Boolean(props.right))
-@@ -133,6 +138,19 @@
+@@ -149,6 +155,19 @@ export function Prompt(props: PromptProps) {
      if (!props.disabled) input.cursorColor = theme.text
    })
  
@@ -84,7 +78,7 @@ diff -ruN --no-dereference a/packages/opencode/src/cli/cmd/tui/component/prompt/
    const lastUserMessage = createMemo(() => {
      if (!props.sessionID) return undefined
      const messages = sync.data.message[props.sessionID]
-@@ -175,6 +193,33 @@
+@@ -191,6 +210,33 @@ export function Prompt(props: PromptProps) {
      extmarkToPartIndex: new Map(),
      interrupt: 0,
    })
@@ -118,15 +112,15 @@ diff -ruN --no-dereference a/packages/opencode/src/cli/cmd/tui/component/prompt/
  
    createEffect(
      on(
-@@ -225,7 +270,6 @@
+@@ -242,7 +288,6 @@ export function Prompt(props: PromptProps) {
        {
          title: "Submit prompt",
          value: "prompt.submit",
 -        keybind: "input_submit",
          category: "Prompt",
          hidden: true,
-         onSelect: (dialog) => {
-@@ -261,9 +305,16 @@
+         onSelect: async (dialog) => {
+@@ -280,9 +325,16 @@ export function Prompt(props: PromptProps) {
          onSelect: (dialog) => {
            if (autocomplete.visible) return
            if (!input.focused) return
@@ -143,15 +137,15 @@ diff -ruN --no-dereference a/packages/opencode/src/cli/cmd/tui/component/prompt/
              return
            }
            if (!props.sessionID) return
-@@ -436,6 +487,7 @@
+@@ -470,6 +522,7 @@ export function Prompt(props: PromptProps) {
      if (!input || input.isDestroyed) return
      if (props.visible === false || dialog.stack.length > 0) {
-       input.blur()
+       if (input.focused) input.blur()
 +      if (props.visible === false) vimState.clearPending()
        return
      }
  
-@@ -708,6 +760,7 @@
+@@ -783,6 +836,7 @@ export function Prompt(props: PromptProps) {
          })
          .catch(() => {})
      }
@@ -159,9 +153,9 @@ diff -ruN --no-dereference a/packages/opencode/src/cli/cmd/tui/component/prompt/
      history.append({
        ...store.prompt,
        mode: currentMode,
-@@ -730,6 +783,19 @@
-       }, 50)
+@@ -806,6 +860,19 @@ export function Prompt(props: PromptProps) {
      input.clear()
+     return true
    }
 +
 +  function submitFromTextarea() {
@@ -179,7 +173,7 @@ diff -ruN --no-dereference a/packages/opencode/src/cli/cmd/tui/component/prompt/
    const exit = useExit()
  
    function pasteText(text: string, virtualText: string) {
-@@ -945,10 +1011,11 @@
+@@ -1032,10 +1099,11 @@ export function Prompt(props: PromptProps) {
                    setStore("extmarkToPartIndex", new Map())
                    return
                  }
@@ -193,7 +187,7 @@ diff -ruN --no-dereference a/packages/opencode/src/cli/cmd/tui/component/prompt/
                      e.preventDefault()
                      return
                    }
-@@ -962,11 +1029,14 @@
+@@ -1049,11 +1117,14 @@ export function Prompt(props: PromptProps) {
                  if (store.mode === "shell") {
                    if ((e.name === "backspace" && input.visualCursor.offset === 0) || e.name === "escape") {
                      setStore("mode", "normal")
@@ -208,28 +202,30 @@ diff -ruN --no-dereference a/packages/opencode/src/cli/cmd/tui/component/prompt/
                  if (!autocomplete.visible) {
                    if (
                      (keybind.match("history_previous", e) && input.cursorOffset === 0) ||
-@@ -992,7 +1062,7 @@
-                     input.cursorOffset = input.plainText.length
-                 }
+@@ -1082,7 +1153,7 @@ export function Prompt(props: PromptProps) {
+               onSubmit={() => {
+                 // IME: double-defer so the last composed character (e.g. Korean
+                 // hangul) is flushed to plainText before we read it for submission.
+-                setTimeout(() => setTimeout(() => submit(), 0), 0)
++                setTimeout(() => setTimeout(() => submitFromTextarea(), 0), 0)
                }}
--              onSubmit={submit}
-+              onSubmit={submitFromTextarea}
                onPaste={async (event: PasteEvent) => {
                  if (props.disabled) {
-                   event.preventDefault()
-@@ -1144,6 +1214,9 @@
+@@ -1250,6 +1321,9 @@ export function Prompt(props: PromptProps) {
            />
          </box>
          <box width="100%" flexDirection="row" justifyContent="space-between">
 +          <Show when={vimIndicator()}>
-+            {(indicator) => <text fg={local.agent.color(local.agent.current().name)}>-- {indicator()} --</text>}
++            {(indicator) => <text fg={local.agent.current() ? local.agent.color(local.agent.current()!.name) : undefined}>-- {indicator()} --</text>}
 +          </Show>
            <Show when={status().type !== "idle"} fallback={props.hint ?? <text />}>
              <box
                flexDirection="row"
-diff -ruN --no-dereference a/packages/opencode/src/cli/cmd/tui/component/vim/index.ts b/packages/opencode/src/cli/cmd/tui/component/vim/index.ts
---- a/packages/opencode/src/cli/cmd/tui/component/vim/index.ts	1969-12-31 19:00:00.000000000 -0500
-+++ b/packages/opencode/src/cli/cmd/tui/component/vim/index.ts	2026-04-12 08:22:33.056136102 -0400
+diff --git a/packages/opencode/src/cli/cmd/tui/component/vim/index.ts b/packages/opencode/src/cli/cmd/tui/component/vim/index.ts
+new file mode 100644
+index 0000000..453b03f
+--- /dev/null
++++ b/packages/opencode/src/cli/cmd/tui/component/vim/index.ts
 @@ -0,0 +1,14 @@
 +import { createMemo } from "solid-js"
 +import { useKV } from "../../context/kv"
@@ -245,9 +241,11 @@ diff -ruN --no-dereference a/packages/opencode/src/cli/cmd/tui/component/vim/ind
 +    return config.vim ?? false
 +  })
 +}
-diff -ruN --no-dereference a/packages/opencode/src/cli/cmd/tui/component/vim/vim-handler.ts b/packages/opencode/src/cli/cmd/tui/component/vim/vim-handler.ts
---- a/packages/opencode/src/cli/cmd/tui/component/vim/vim-handler.ts	1969-12-31 19:00:00.000000000 -0500
-+++ b/packages/opencode/src/cli/cmd/tui/component/vim/vim-handler.ts	2026-04-12 08:22:33.056136102 -0400
+diff --git a/packages/opencode/src/cli/cmd/tui/component/vim/vim-handler.ts b/packages/opencode/src/cli/cmd/tui/component/vim/vim-handler.ts
+new file mode 100644
+index 0000000..f4c5944
+--- /dev/null
++++ b/packages/opencode/src/cli/cmd/tui/component/vim/vim-handler.ts
 @@ -0,0 +1,321 @@
 +import type { Accessor } from "solid-js"
 +import type { createVimState } from "./vim-state"
@@ -570,9 +568,11 @@ diff -ruN --no-dereference a/packages/opencode/src/cli/cmd/tui/component/vim/vim
 +    },
 +  }
 +}
-diff -ruN --no-dereference a/packages/opencode/src/cli/cmd/tui/component/vim/vim-indicator.ts b/packages/opencode/src/cli/cmd/tui/component/vim/vim-indicator.ts
---- a/packages/opencode/src/cli/cmd/tui/component/vim/vim-indicator.ts	1969-12-31 19:00:00.000000000 -0500
-+++ b/packages/opencode/src/cli/cmd/tui/component/vim/vim-indicator.ts	2026-04-12 08:22:33.056136102 -0400
+diff --git a/packages/opencode/src/cli/cmd/tui/component/vim/vim-indicator.ts b/packages/opencode/src/cli/cmd/tui/component/vim/vim-indicator.ts
+new file mode 100644
+index 0000000..7e6ec76
+--- /dev/null
++++ b/packages/opencode/src/cli/cmd/tui/component/vim/vim-indicator.ts
 @@ -0,0 +1,14 @@
 +import { createMemo, type Accessor } from "solid-js"
 +import type { createVimState } from "./vim-state"
@@ -588,9 +588,11 @@ diff -ruN --no-dereference a/packages/opencode/src/cli/cmd/tui/component/vim/vim
 +    return undefined
 +  })
 +}
-diff -ruN --no-dereference a/packages/opencode/src/cli/cmd/tui/component/vim/vim-motion-jump.ts b/packages/opencode/src/cli/cmd/tui/component/vim/vim-motion-jump.ts
---- a/packages/opencode/src/cli/cmd/tui/component/vim/vim-motion-jump.ts	1969-12-31 19:00:00.000000000 -0500
-+++ b/packages/opencode/src/cli/cmd/tui/component/vim/vim-motion-jump.ts	2026-04-12 08:22:33.056136102 -0400
+diff --git a/packages/opencode/src/cli/cmd/tui/component/vim/vim-motion-jump.ts b/packages/opencode/src/cli/cmd/tui/component/vim/vim-motion-jump.ts
+new file mode 100644
+index 0000000..279fe9a
+--- /dev/null
++++ b/packages/opencode/src/cli/cmd/tui/component/vim/vim-motion-jump.ts
 @@ -0,0 +1,32 @@
 +import type { VimEvent } from "./vim-handler"
 +import type { createVimState } from "./vim-state"
@@ -624,9 +626,11 @@ diff -ruN --no-dereference a/packages/opencode/src/cli/cmd/tui/component/vim/vim
 +  state.setPending("g")
 +  return { handled: true }
 +}
-diff -ruN --no-dereference a/packages/opencode/src/cli/cmd/tui/component/vim/vim-motions.ts b/packages/opencode/src/cli/cmd/tui/component/vim/vim-motions.ts
---- a/packages/opencode/src/cli/cmd/tui/component/vim/vim-motions.ts	1969-12-31 19:00:00.000000000 -0500
-+++ b/packages/opencode/src/cli/cmd/tui/component/vim/vim-motions.ts	2026-04-12 08:22:33.056136102 -0400
+diff --git a/packages/opencode/src/cli/cmd/tui/component/vim/vim-motions.ts b/packages/opencode/src/cli/cmd/tui/component/vim/vim-motions.ts
+new file mode 100644
+index 0000000..c86a62b
+--- /dev/null
++++ b/packages/opencode/src/cli/cmd/tui/component/vim/vim-motions.ts
 @@ -0,0 +1,254 @@
 +import type { TextareaRenderable } from "@opentui/core"
 +
@@ -882,9 +886,11 @@ diff -ruN --no-dereference a/packages/opencode/src/cli/cmd/tui/component/vim/vim
 +  const end = lineEnd(text, textarea.cursorOffset)
 +  deleteOffsets(textarea, start, end)
 +}
-diff -ruN --no-dereference a/packages/opencode/src/cli/cmd/tui/component/vim/vim-scroll.ts b/packages/opencode/src/cli/cmd/tui/component/vim/vim-scroll.ts
---- a/packages/opencode/src/cli/cmd/tui/component/vim/vim-scroll.ts	1969-12-31 19:00:00.000000000 -0500
-+++ b/packages/opencode/src/cli/cmd/tui/component/vim/vim-scroll.ts	2026-04-12 08:22:33.056136102 -0400
+diff --git a/packages/opencode/src/cli/cmd/tui/component/vim/vim-scroll.ts b/packages/opencode/src/cli/cmd/tui/component/vim/vim-scroll.ts
+new file mode 100644
+index 0000000..e886584
+--- /dev/null
++++ b/packages/opencode/src/cli/cmd/tui/component/vim/vim-scroll.ts
 @@ -0,0 +1,15 @@
 +import type { VimEvent } from "./vim-handler"
 +
@@ -901,9 +907,11 @@ diff -ruN --no-dereference a/packages/opencode/src/cli/cmd/tui/component/vim/vim
 +  if (key === "b") return "page-up"
 +  return undefined
 +}
-diff -ruN --no-dereference a/packages/opencode/src/cli/cmd/tui/component/vim/vim-state.ts b/packages/opencode/src/cli/cmd/tui/component/vim/vim-state.ts
---- a/packages/opencode/src/cli/cmd/tui/component/vim/vim-state.ts	1969-12-31 19:00:00.000000000 -0500
-+++ b/packages/opencode/src/cli/cmd/tui/component/vim/vim-state.ts	2026-04-12 08:22:33.056136102 -0400
+diff --git a/packages/opencode/src/cli/cmd/tui/component/vim/vim-state.ts b/packages/opencode/src/cli/cmd/tui/component/vim/vim-state.ts
+new file mode 100644
+index 0000000..d38ba21
+--- /dev/null
++++ b/packages/opencode/src/cli/cmd/tui/component/vim/vim-state.ts
 @@ -0,0 +1,41 @@
 +import { createEffect, createMemo, createSignal, untrack, type Accessor } from "solid-js"
 +
@@ -946,10 +954,11 @@ diff -ruN --no-dereference a/packages/opencode/src/cli/cmd/tui/component/vim/vim
 +    isInsert: createMemo(() => mode() === "insert"),
 +  }
 +}
-diff -ruN --no-dereference a/packages/opencode/src/config/tui-schema.ts b/packages/opencode/src/config/tui-schema.ts
---- a/packages/opencode/src/config/tui-schema.ts	2026-04-12 08:19:25.415236633 -0400
-+++ b/packages/opencode/src/config/tui-schema.ts	2026-04-12 08:22:33.056136102 -0400
-@@ -23,6 +23,7 @@
+diff --git a/packages/opencode/src/cli/cmd/tui/config/tui-schema.ts b/packages/opencode/src/cli/cmd/tui/config/tui-schema.ts
+index ed79e8e..2c2c634 100644
+--- a/packages/opencode/src/cli/cmd/tui/config/tui-schema.ts
++++ b/packages/opencode/src/cli/cmd/tui/config/tui-schema.ts
+@@ -24,6 +24,7 @@ export const TuiOptions = z.object({
      .optional()
      .describe("Control diff rendering style: 'auto' adapts to terminal width, 'stacked' always shows single column"),
    mouse: z.boolean().optional().describe("Enable or disable mouse capture (default: true)"),
@@ -957,9 +966,11 @@ diff -ruN --no-dereference a/packages/opencode/src/config/tui-schema.ts b/packag
  })
  
  export const TuiInfo = z
-diff -ruN --no-dereference a/packages/opencode/test/cli/tui/vim-motions.test.ts b/packages/opencode/test/cli/tui/vim-motions.test.ts
---- a/packages/opencode/test/cli/tui/vim-motions.test.ts	1969-12-31 19:00:00.000000000 -0500
-+++ b/packages/opencode/test/cli/tui/vim-motions.test.ts	2026-04-12 08:22:33.056136102 -0400
+diff --git a/packages/opencode/test/cli/tui/vim-motions.test.ts b/packages/opencode/test/cli/tui/vim-motions.test.ts
+new file mode 100644
+index 0000000..4565b09
+--- /dev/null
++++ b/packages/opencode/test/cli/tui/vim-motions.test.ts
 @@ -0,0 +1,776 @@
 +import { describe, expect, test } from "bun:test"
 +import type { TextareaRenderable } from "@opentui/core"
@@ -1737,54 +1748,3 @@ diff -ruN --no-dereference a/packages/opencode/test/cli/tui/vim-motions.test.ts 
 +    expect(vimScroll(createEvent("b", { ctrl: false }).event)).toBe(undefined)
 +  })
 +})
-diff -ruN --no-dereference a/packages/web/src/content/docs/config.mdx b/packages/web/src/content/docs/config.mdx
---- a/packages/web/src/content/docs/config.mdx	2026-04-12 08:19:25.531239662 -0400
-+++ b/packages/web/src/content/docs/config.mdx	2026-04-12 08:22:33.056136102 -0400
-@@ -279,6 +279,11 @@
- 
- Use `OPENCODE_TUI_CONFIG` to point to a custom TUI config file.
- 
-+- `scroll_acceleration.enabled` - Enable macOS-style scroll acceleration. **Takes precedence over `scroll_speed`.**
-+- `scroll_speed` - Custom scroll speed multiplier (default: `3`, minimum: `1`). Ignored if `scroll_acceleration.enabled` is `true`.
-+- `diff_style` - Control diff rendering. `"auto"` adapts to terminal width, `"stacked"` always shows single column.
-+- `vim` - Enable vim-style prompt input in the TUI
-+
- Legacy `theme`, `keybinds`, and `tui` keys in `opencode.json` are deprecated and automatically migrated when possible.
- 
- ---
-diff -ruN --no-dereference a/packages/web/src/content/docs/tui.mdx b/packages/web/src/content/docs/tui.mdx
---- a/packages/web/src/content/docs/tui.mdx	2026-04-12 08:19:25.559240393 -0400
-+++ b/packages/web/src/content/docs/tui.mdx	2026-04-12 08:22:33.056136102 -0400
-@@ -388,6 +388,32 @@
- 
- ---
- 
-+## Vim mode
-+
-+Optional Vim-style prompt mode for the TUI. Disabled by default.
-+Enable it from the command palette or in your config.
-+
-+```json title="opencode.json"
-+{
-+  "$schema": "https://opencode.ai/config.json",
-+  "tui": {
-+    "vim": true
-+  }
-+}
-+```
-+
-+**Supported keys:**
-+
-+**Movement:** `h`, `j`, `k`, `l`, `0`, `^`, `$`; `w`, `b`, `e`, `W`, `B`, `E`
-+
-+**Insert / edit:** `i`, `I`, `a`, `A`, `o`, `O`; `x`; `S`, `cc`, `cw`; `dd`, `dw`
-+
-+**Navigation:** `gg`, `G`
-+
-+**Scrolling:** `Ctrl+e`, `Ctrl+y`; `Ctrl+d`, `Ctrl+u`; `Ctrl+f`, `Ctrl+b`
-+
-+---
-+
- ## Customization
- 
- You can customize various aspects of the TUI view using the command palette (`ctrl+x h` or `/help`). These settings persist across restarts.
