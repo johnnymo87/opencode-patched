@@ -64,8 +64,24 @@ jobs:
             echo "Opus 4.7 support: not yet upstream"
           fi
 
+      - name: Check eager_input_streaming workaround upstream
+        id: check_eager_input_streaming
+        run: |
+          # The upstream PRs (#23766, #23542) that proposed a generalized fix were
+          # rejected. Sunset signal: upstream's options() function in transform.ts
+          # defaults toolStreaming = false for @ai-sdk/anthropic outside the
+          # github-copilot-gated path. Heuristic: look for "toolStreaming" inside
+          # transform.ts (currently only set inside copilot.ts via plugin hook).
+          if curl -sfL "https://raw.githubusercontent.com/anomalyco/opencode/dev/packages/opencode/src/provider/transform.ts" | grep -q 'toolStreaming'; then
+            echo "state=MERGED" >> $GITHUB_OUTPUT
+            echo "eager_input_streaming workaround: present upstream (transform.ts now references toolStreaming -- review whether our patch is still needed)"
+          else
+            echo "state=OPEN" >> $GITHUB_OUTPUT
+            echo "eager_input_streaming workaround: not yet upstream"
+          fi
+
       - name: Create sunset recommendation
-        if: steps.check_caching_pr.outputs.state == 'MERGED' || steps.check_vim_pr.outputs.state == 'MERGED' || steps.check_tool_fix_pr.outputs.state == 'MERGED' || steps.check_mcp_reconnect.outputs.state == 'CLOSED' || steps.check_opus47.outputs.state == 'MERGED'
+        if: steps.check_caching_pr.outputs.state == 'MERGED' || steps.check_vim_pr.outputs.state == 'MERGED' || steps.check_tool_fix_pr.outputs.state == 'MERGED' || steps.check_mcp_reconnect.outputs.state == 'CLOSED' || steps.check_opus47.outputs.state == 'MERGED' || steps.check_eager_input_streaming.outputs.state == 'MERGED'
         uses: actions/github-script@v7
         with:
           script: |
@@ -74,7 +90,8 @@ jobs:
             const toolFixState = '${{ steps.check_tool_fix_pr.outputs.state }}';
             const mcpReconnectState = '${{ steps.check_mcp_reconnect.outputs.state }}';
             const opus47State = '${{ steps.check_opus47.outputs.state }}';
-            const allMerged = cachingState === 'MERGED' && vimState === 'MERGED' && toolFixState === 'MERGED' && mcpReconnectState === 'CLOSED' && opus47State === 'MERGED';
+            const eagerInputStreamingState = '${{ steps.check_eager_input_streaming.outputs.state }}';
+            const allMerged = cachingState === 'MERGED' && vimState === 'MERGED' && toolFixState === 'MERGED' && mcpReconnectState === 'CLOSED' && opus47State === 'MERGED' && eagerInputStreamingState === 'MERGED';
 
             // Collect which PRs/issues are resolved
             const merged = [];
@@ -89,6 +106,8 @@ jobs:
             else remaining.push('MCP reconnect #15247');
             if (opus47State === 'MERGED') merged.push('Opus 4.7 support');
             else remaining.push('Opus 4.7 support');
+            if (eagerInputStreamingState === 'MERGED') merged.push('Eager input streaming workaround');
+            else remaining.push('Eager input streaming workaround');
 
             let title, body;
 
@@ -102,6 +121,7 @@ jobs:
             - **Tool fix PR #16751**: MERGED
             - **MCP reconnect #15247**: CLOSED
             - **Opus 4.7 support**: MERGED
+            - **Eager input streaming workaround**: MERGED
 
             All patches are now available in official OpenCode releases. This repo can be archived.
 
@@ -122,6 +142,7 @@ jobs:
             - **Tool fix PR #16751**: ${toolFixState}
             - **MCP reconnect #15247**: ${mcpReconnectState}
             - **Opus 4.7 support**: ${opus47State}
+            - **Eager input streaming workaround**: ${eagerInputStreamingState}
 
             Merged: ${merged.join(', ')}
             Remaining: ${remaining.join(', ')}
@@ -150,7 +171,7 @@ jobs:
                 owner: context.repo.owner,
                 repo: context.repo.repo,
                 issue_number: existingIssue.number,
-                body: `Monthly check (${new Date().toISOString().split('T')[0]}): Caching PR: ${cachingState}, Vim PR: ${vimState}, Tool fix PR: ${toolFixState}, MCP reconnect: ${mcpReconnectState}, Opus 4.7: ${opus47State}`
+                body: `Monthly check (${new Date().toISOString().split('T')[0]}): Caching PR: ${cachingState}, Vim PR: ${vimState}, Tool fix PR: ${toolFixState}, MCP reconnect: ${mcpReconnectState}, Opus 4.7: ${opus47State}, Eager input streaming: ${eagerInputStreamingState}`
               });
             } else {
               await github.rest.issues.create({
@@ -171,3 +192,4 @@ jobs:
           echo "Tool fix PR #16751: ${{ steps.check_tool_fix_pr.outputs.state }}"
           echo "MCP reconnect #15247: ${{ steps.check_mcp_reconnect.outputs.state }}"
           echo "Opus 4.7 support: ${{ steps.check_opus47.outputs.state }}"
+          echo "Eager input streaming workaround: ${{ steps.check_eager_input_streaming.outputs.state }}"

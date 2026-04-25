@@ -1,0 +1,31 @@
+diff --git a/packages/opencode/src/provider/transform.ts b/packages/opencode/src/provider/transform.ts
+index 4ed43ce99..512989894 100644
+--- a/packages/opencode/src/provider/transform.ts
++++ b/packages/opencode/src/provider/transform.ts
+@@ -923,6 +923,26 @@ export function options(input: {
+     }
+   }
+ 
++  // Disable fine-grained tool streaming for all @ai-sdk/anthropic-backed providers.
++  // Since @ai-sdk/anthropic >= 3.0.58, the `fine-grained-tool-streaming-2025-05-14`
++  // beta header (hardcoded in provider.ts) causes the SDK to inject
++  // `eager_input_streaming: true` into every tool definition. Anthropic-shape
++  // endpoints with strict schema validation (Google Vertex Anthropic, AWS Bedrock
++  // proxies, GitHub Copilot's /v1/messages shim, corporate gateways) reject the
++  // unknown field with HTTP 400:
++  //   tools.0.custom.eager_input_streaming: Extra inputs are not permitted
++  // Upstream only fixes this for github-copilot via the chat.params plugin hook
++  // (gated on providerID), leaving Vertex/Bedrock/etc. broken. We disable it
++  // for the entire @ai-sdk/anthropic family here. Users can opt back in by
++  // setting `toolStreaming: true` in their model/agent options.
++  // Refs: anomalyco/opencode#23257, #23541, #23767
++  if (
++    input.model.api.npm === "@ai-sdk/anthropic" ||
++    input.model.api.npm === "@ai-sdk/google-vertex/anthropic"
++  ) {
++    result["toolStreaming"] = false
++  }
++
+   return result
+ }
+ 

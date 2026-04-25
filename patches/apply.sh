@@ -1,9 +1,11 @@
 #!/usr/bin/env bash
-# Apply caching + vim + tool-fix + mcp-reconnect patches to opencode source
+# Apply caching + vim + tool-fix + mcp-reconnect + eager-input-streaming
+# patches to opencode source.
 # Usage: ./apply.sh <path-to-opencode-source>
 #
 # Fetches caching.patch from opencode-cached (never duplicated here),
-# then applies local vim.patch, tool-fix.patch, and mcp-reconnect.patch on top.
+# then applies local vim.patch, tool-fix.patch, mcp-reconnect.patch, and
+# eager-input-streaming.patch on top.
 
 set -euo pipefail
 
@@ -18,6 +20,7 @@ SCRIPT_DIR="$(dirname "$0")"
 VIM_PATCH="$SCRIPT_DIR/vim.patch"
 TOOL_FIX_PATCH="$SCRIPT_DIR/tool-fix.patch"
 MCP_RECONNECT_PATCH="$SCRIPT_DIR/mcp-reconnect.patch"
+EAGER_INPUT_STREAMING_PATCH="$SCRIPT_DIR/eager-input-streaming.patch"
 CACHING_PATCH_URL="https://raw.githubusercontent.com/johnnymo87/opencode-cached/main/patches/caching.patch"
 
 if [ ! -d "$SOURCE_DIR" ]; then
@@ -37,6 +40,11 @@ fi
 
 if [ ! -f "$MCP_RECONNECT_PATCH" ]; then
   echo "Error: MCP reconnect patch not found: $MCP_RECONNECT_PATCH"
+  exit 1
+fi
+
+if [ ! -f "$EAGER_INPUT_STREAMING_PATCH" ]; then
+  echo "Error: Eager input streaming patch not found: $EAGER_INPUT_STREAMING_PATCH"
   exit 1
 fi
 
@@ -139,6 +147,27 @@ fi
 
 git apply "$MCP_RECONNECT_PATCH"
 echo "✓ MCP reconnect patch applied"
+
+# --- Patch 5: Eager input streaming workaround (local) ---
+
+echo "Applying eager-input-streaming.patch..."
+if ! git apply --check "$EAGER_INPUT_STREAMING_PATCH" 2>/dev/null; then
+  echo ""
+  echo "❌ EAGER INPUT STREAMING PATCH FAILED TO APPLY"
+  echo ""
+  echo "Attempting to apply for diagnostics..."
+  git apply "$EAGER_INPUT_STREAMING_PATCH" 2>&1 || true
+  echo ""
+  echo "Failed files:"
+  find . -name "*.rej" -type f 2>/dev/null || echo "  None found"
+  echo ""
+  echo "The eager input streaming patch may need updating for this upstream version."
+  echo "Refs: anomalyco/opencode#23257, #23541, #23767"
+  exit 1
+fi
+
+git apply "$EAGER_INPUT_STREAMING_PATCH"
+echo "✓ Eager input streaming patch applied"
 
 # --- Summary ---
 

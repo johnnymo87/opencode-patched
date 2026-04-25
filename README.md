@@ -1,8 +1,8 @@
 # opencode-patched
 
-**OpenCode with [prompt caching](https://github.com/anomalyco/opencode/pull/5422) + [vim keybindings](https://github.com/anomalyco/opencode/pull/12679) + [tool use/result fix](https://github.com/anomalyco/opencode/pull/16751) + [MCP auto-reconnect](https://github.com/anomalyco/opencode/issues/15247)**
+**OpenCode with [prompt caching](https://github.com/anomalyco/opencode/pull/5422) + [vim keybindings](https://github.com/anomalyco/opencode/pull/12679) + [tool use/result fix](https://github.com/anomalyco/opencode/pull/16751) + [MCP auto-reconnect](https://github.com/anomalyco/opencode/issues/15247) + [eager_input_streaming workaround](https://github.com/anomalyco/opencode/issues/23541)**
 
-This repository combines four patches into a single OpenCode binary, built automatically for 4 platforms.
+This repository combines five patches into a single OpenCode binary, built automatically for 4 platforms.
 
 ## Patches Included
 
@@ -31,6 +31,18 @@ Stored locally as `patches/tool-fix.patch`. Fixes the widespread `tool_use ids w
 Stored locally as `patches/mcp-reconnect.patch`. Automatically reconnects remote MCP servers when the server restarts and the session becomes stale. Without this patch, `callTool` fails at the transport layer with "Session not found" / HTTP 404 errors, requiring a manual MCP toggle (ctrl+p) or full OpenCode restart.
 
 The patch wraps remote MCP tool execution with a try/catch that detects transport-level errors (stale sessions, connection refused, etc.), closes the stale client, creates a fresh transport + client, refreshes tool definitions, and retries the call once.
+
+### 5. Eager Input Streaming Workaround ([Issue #23541](https://github.com/anomalyco/opencode/issues/23541), [#23257](https://github.com/anomalyco/opencode/issues/23257), [#23767](https://github.com/anomalyco/opencode/issues/23767))
+
+Stored locally as `patches/eager-input-streaming.patch`. Disables `toolStreaming` for all `@ai-sdk/anthropic`-backed providers (including `@ai-sdk/google-vertex/anthropic`).
+
+Since `@ai-sdk/anthropic >= 3.0.58`, the `fine-grained-tool-streaming-2025-05-14` beta header (hardcoded in `provider.ts`) causes the SDK to inject `eager_input_streaming: true` into every tool definition. Anthropic-shape endpoints with strict schema validation (Google Vertex Anthropic, AWS Bedrock proxies, GitHub Copilot's `/v1/messages` shim, corporate gateways) reject the unknown field with HTTP 400:
+
+```
+tools.0.custom.eager_input_streaming: Extra inputs are not permitted
+```
+
+Upstream only fixes this for github-copilot via the `chat.params` plugin hook (gated on `providerID`), leaving Vertex/Bedrock/etc. broken. PRs that proposed a generalized fix ([#23766](https://github.com/anomalyco/opencode/pull/23766), [#23542](https://github.com/anomalyco/opencode/pull/23542)) were rejected by upstream maintainers. This patch defaults `toolStreaming = false` in `ProviderTransform.options()` whenever the model uses `@ai-sdk/anthropic` or `@ai-sdk/google-vertex/anthropic`. Users can opt back in by setting `toolStreaming: true` in their model or agent options.
 
 ## Installation
 
@@ -81,7 +93,7 @@ Timing Chain (every 8 hours):
       |-> builds v{VER}-cached        -- applies caching patch, publishes
 
 :01  opencode-patched/sync-cached     -- detects new -cached release
-      |-> builds v{VER}-patched       -- applies caching + vim + tool fix + mcp reconnect patches, publishes
+       |-> builds v{VER}-patched       -- applies caching + vim + tool fix + mcp reconnect + eager-input-streaming patches, publishes
 :01  opencode-patched/sync-vim-pr     -- checks PR #12679 for changes
 :01  opencode-patched/sync-tool-fix-pr -- checks PR #16751 for changes
 
@@ -92,19 +104,20 @@ Timing Chain (every 8 hours):
 
 1. Clone upstream OpenCode at the release tag
 2. Fetch `caching.patch` from [opencode-cached](https://github.com/johnnymo87/opencode-cached) (always latest from `main`)
-3. Apply `caching.patch`, then local `vim.patch`, then `tool-fix.patch`, then `mcp-reconnect.patch`
+3. Apply `caching.patch`, then local `vim.patch`, then `tool-fix.patch`, then `mcp-reconnect.patch`, then `eager-input-streaming.patch`
 4. Build with Bun for 4 platforms (linux/darwin x arm64/x64)
 5. Publish release as `v{VERSION}-patched`
 
 ### Patch Independence
 
-The four patches modify completely different areas of the codebase:
+The five patches modify mostly different areas of the codebase:
 - **Caching**: `config/agent.ts`, `config/provider.ts`, `provider/config.ts`, `provider/transform.ts`, `session/prompt.ts`
 - **Vim**: `cli/cmd/tui/component/vim/*`, `cli/cmd/tui/component/prompt/index.tsx`, `cli/cmd/tui/app.tsx`, `cli/cmd/tui/config/tui-schema.ts`
 - **Tool fix**: `session/message-v2.ts`, `test/session/message-v2.test.ts`
 - **MCP reconnect**: `mcp/index.ts`
+- **Eager input streaming**: `provider/transform.ts` (different region from caching -- inserts a single `toolStreaming = false` block at the end of `options()`)
 
-Zero file overlap between any pair of patches.
+The only file touched by more than one patch is `provider/transform.ts` (caching + eager-input-streaming). The two patches modify disjoint regions and apply cleanly in either order.
 
 ## Patch Ownership
 
@@ -116,6 +129,7 @@ Each patch is owned by a specific repo. Do not edit a patch in the wrong repo.
 | `vim.patch` | **this repo** (`patches/vim.patch`) | PR #12679 |
 | `tool-fix.patch` | **this repo** (`patches/tool-fix.patch`) | PR #16751 |
 | `mcp-reconnect.patch` | **this repo** (`patches/mcp-reconnect.patch`) | Issue #15247 |
+| `eager-input-streaming.patch` | **this repo** (`patches/eager-input-streaming.patch`) | Issue #23541 / PR #23766 (rejected upstream) |
 
 When an upstream PR is merged, the corresponding patch can be dropped. `caching.patch` is
 managed in the sibling repo `~/projects/opencode-cached`; edits belong there, not here.
@@ -182,6 +196,17 @@ The build fails and creates a GitHub issue automatically. This blocks publicatio
 
 **Sunset**: This patch can be dropped when [issue #15247](https://github.com/anomalyco/opencode/issues/15247) is resolved upstream. Unlike the other patches, this one has no upstream PR to track -- it is original work. If an upstream PR appears, add a sync workflow for it.
 
+### When the Eager Input Streaming Patch Breaks (Build Failure)
+
+The build fails and creates a GitHub issue automatically. This blocks publication.
+
+1. Review the upstream changes to `packages/opencode/src/provider/transform.ts`. The patch inserts a small `toolStreaming = false` block at the end of `ProviderTransform.options()` -- look for where the function returns `result` and re-add the block before it.
+2. Regenerate or manually update `patches/eager-input-streaming.patch`
+3. Review, commit, push
+4. Re-trigger: `gh workflow run build-release.yml --field version=X.Y.Z`
+
+**Sunset**: This patch can be dropped if upstream merges a generalized fix that defaults `toolStreaming = false` for all `@ai-sdk/anthropic`-backed providers (not just `github-copilot`). Track [issue #23541](https://github.com/anomalyco/opencode/issues/23541), [#23257](https://github.com/anomalyco/opencode/issues/23257), and [#23767](https://github.com/anomalyco/opencode/issues/23767). Note: the obvious upstream fixes ([PR #23766](https://github.com/anomalyco/opencode/pull/23766), [#23542](https://github.com/anomalyco/opencode/pull/23542)) were rejected by maintainers, so this patch may need to live indefinitely.
+
 ### Sunset Criteria
 
 Monthly automated check (`check-sunset.yml`) monitors all upstream PRs:
@@ -196,6 +221,7 @@ Monthly automated check (`check-sunset.yml`) monitors all upstream PRs:
 - **Vim PR**: [PR #12679](https://github.com/anomalyco/opencode/pull/12679) by [@leohenon](https://github.com/leohenon)
 - **Tool fix PR**: [PR #16751](https://github.com/anomalyco/opencode/pull/16751) by [@altendky](https://github.com/altendky)
 - **MCP reconnect**: [Issue #15247](https://github.com/anomalyco/opencode/issues/15247) -- original patch
+- **Eager input streaming workaround**: [Issue #23541](https://github.com/anomalyco/opencode/issues/23541) -- original patch (upstream fixes rejected)
 
 ## License
 

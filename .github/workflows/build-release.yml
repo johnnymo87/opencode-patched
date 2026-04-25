@@ -37,7 +37,7 @@ jobs:
           echo "Cloned opencode v${{ inputs.version }}"
           git log -1 --oneline
 
-      - name: Apply patches (caching + vim + tool fix + mcp reconnect)
+      - name: Apply patches (caching + vim + tool fix + mcp reconnect + eager-input-streaming)
         run: |
           cd opencode-src
           ../patches/apply.sh .
@@ -103,7 +103,7 @@ jobs:
           echo "Cloned opencode v${{ inputs.version }}"
           git log -1 --oneline
 
-      - name: Apply patches (caching + vim + tool fix + mcp reconnect)
+      - name: Apply patches (caching + vim + tool fix + mcp reconnect + eager-input-streaming)
         run: |
           cd opencode-src
           ../patches/apply.sh .
@@ -202,16 +202,17 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           tag_name: v${{ inputs.version }}-patched
-          name: OpenCode v${{ inputs.version }} with Caching + Vim + Tool Fix + MCP Reconnect
+          name: OpenCode v${{ inputs.version }} with Caching + Vim + Tool Fix + MCP Reconnect + Eager Input Streaming
           body: |
-            # OpenCode v${{ inputs.version }} with Caching + Vim + Tool Fix + MCP Reconnect
+            # OpenCode v${{ inputs.version }} with Caching + Vim + Tool Fix + MCP Reconnect + Eager Input Streaming
 
-            This release applies four patches to OpenCode v${{ inputs.version }}:
+            This release applies five patches to OpenCode v${{ inputs.version }}:
 
             1. **Prompt caching improvements** from [PR #5422](https://github.com/anomalyco/opencode/pull/5422) (via [opencode-cached](https://github.com/johnnymo87/opencode-cached))
             2. **Vim keybindings** from [PR #12679](https://github.com/anomalyco/opencode/pull/12679)
             3. **Tool use/result mismatch fix** from [PR #16751](https://github.com/anomalyco/opencode/pull/16751)
             4. **MCP auto-reconnect** from [Issue #15247](https://github.com/anomalyco/opencode/issues/15247)
+            5. **Eager input streaming workaround** for [Issue #23541](https://github.com/anomalyco/opencode/issues/23541) -- defaults `toolStreaming = false` for all `@ai-sdk/anthropic`-backed providers (Vertex Anthropic, Bedrock proxies, etc.)
 
             ## Caching Improvements
 
@@ -237,6 +238,10 @@ jobs:
             ## MCP Auto-Reconnect
 
             Automatically reconnects remote MCP servers when the server restarts and the session becomes stale. Without this, tool calls fail with transport errors requiring a manual MCP toggle or OpenCode restart.
+
+            ## Eager Input Streaming Workaround
+
+            Disables `toolStreaming` for all `@ai-sdk/anthropic`-backed providers (including `@ai-sdk/google-vertex/anthropic`). Since `@ai-sdk/anthropic >= 3.0.58`, the SDK injects `eager_input_streaming: true` into every tool definition, which Anthropic-shape proxies (Google Vertex, AWS Bedrock, GitHub Copilot, corporate gateways) reject with `tools.0.custom.eager_input_streaming: Extra inputs are not permitted`. Upstream only fixes this for `github-copilot`; this patch generalizes the workaround.
 
             ## Installation
 
@@ -271,6 +276,7 @@ jobs:
             **Vim patch**: [PR #12679](https://github.com/anomalyco/opencode/pull/12679)
             **Tool fix patch**: [PR #16751](https://github.com/anomalyco/opencode/pull/16751)
             **MCP reconnect**: [Issue #15247](https://github.com/anomalyco/opencode/issues/15247)
+            **Eager input streaming**: [Issue #23541](https://github.com/anomalyco/opencode/issues/23541)
           files: |
             artifacts/opencode-linux-arm64.tar.gz
             artifacts/opencode-linux-x64.tar.gz
@@ -296,7 +302,7 @@ jobs:
             const body = `
             ## Build Failure: v${version}
 
-            The automated build for OpenCode v${version} with caching + vim + tool fix + mcp reconnect patches failed.
+            The automated build for OpenCode v${version} with caching + vim + tool fix + mcp reconnect + eager-input-streaming patches failed.
 
             **Workflow Run**: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
 
@@ -306,7 +312,8 @@ jobs:
             2. **Vim patch conflict**: The local vim.patch may not apply to v${version}
             3. **Tool fix patch conflict**: The local tool-fix.patch may not apply to v${version}
             4. **MCP reconnect patch conflict**: The local mcp-reconnect.patch may not apply to v${version}
-            5. **Build failure**: OpenCode build process may have changed
+            5. **Eager input streaming patch conflict**: The local eager-input-streaming.patch may not apply to v${version}
+            6. **Build failure**: OpenCode build process may have changed
 
             ### Action Required
 
