@@ -1,5 +1,5 @@
 diff --git a/packages/opencode/src/cli/cmd/tui/app.tsx b/packages/opencode/src/cli/cmd/tui/app.tsx
-index a58ff05..26900a3 100644
+index 30a597b..71c7750 100644
 --- a/packages/opencode/src/cli/cmd/tui/app.tsx
 +++ b/packages/opencode/src/cli/cmd/tui/app.tsx
 @@ -60,6 +60,7 @@ import { TuiConfigProvider, useTuiConfig } from "./context/tui-config"
@@ -10,7 +10,7 @@ index a58ff05..26900a3 100644
  
  import type { EventSource } from "./context/sdk"
  import { DialogVariant } from "./component/dialog-variant"
-@@ -254,6 +255,7 @@ function App(props: { onSnapshot?: () => Promise<string[]> }) {
+@@ -251,6 +252,7 @@ function App(props: { onSnapshot?: () => Promise<string[]> }) {
      .finally(() => {
        setReady(true)
      })
@@ -18,7 +18,7 @@ index a58ff05..26900a3 100644
  
    useKeyboard((evt) => {
      if (!Flag.OPENCODE_EXPERIMENTAL_DISABLE_COPY_ON_SELECT) return
-@@ -718,6 +720,15 @@ function App(props: { onSnapshot?: () => Promise<string[]> }) {
+@@ -715,6 +717,15 @@ function App(props: { onSnapshot?: () => Promise<string[]> }) {
          dialog.clear()
        },
      },
@@ -35,10 +35,10 @@ index a58ff05..26900a3 100644
        title: kv.get("animations_enabled", true) ? "Disable animations" : "Enable animations",
        value: "app.toggle.animations",
 diff --git a/packages/opencode/src/cli/cmd/tui/component/prompt/index.tsx b/packages/opencode/src/cli/cmd/tui/component/prompt/index.tsx
-index 2e08e66..8e06705 100644
+index 5288a81..fbcf776 100644
 --- a/packages/opencode/src/cli/cmd/tui/component/prompt/index.tsx
 +++ b/packages/opencode/src/cli/cmd/tui/component/prompt/index.tsx
-@@ -42,6 +42,11 @@ import { DialogSkill } from "../dialog-skill"
+@@ -43,6 +43,11 @@ import { DialogSkill } from "../dialog-skill"
  import { DialogWorkspaceCreate, restoreWorkspaceSession } from "../dialog-workspace-create"
  import { DialogWorkspaceUnavailable } from "../dialog-workspace-unavailable"
  import { useArgs } from "@tui/context/args"
@@ -50,15 +50,15 @@ index 2e08e66..8e06705 100644
  
  export type PromptProps = {
    sessionID?: string
-@@ -109,6 +114,7 @@ export function Prompt(props: PromptProps) {
-   const animationsEnabled = createMemo(() => kv.get("animations_enabled", true))
-   const list = createMemo(() => props.placeholders?.normal ?? [])
-   const shell = createMemo(() => props.placeholders?.shell ?? [])
+@@ -134,6 +139,7 @@ export function Prompt(props: PromptProps) {
+     if (!file) return
+     return Locale.truncateMiddle(file, Math.max(12, Math.min(48, Math.floor(dimensions().width / 3))))
+   })
 +  const vimEnabled = useVimEnabled()
    const [auto, setAuto] = createSignal<AutocompleteRef>()
    const currentProviderLabel = createMemo(() => local.model.parsed().provider)
    const hasRightContent = createMemo(() => Boolean(props.right))
-@@ -149,6 +155,19 @@ export function Prompt(props: PromptProps) {
+@@ -174,6 +180,19 @@ export function Prompt(props: PromptProps) {
      if (!props.disabled) input.cursorColor = theme.text
    })
  
@@ -78,7 +78,7 @@ index 2e08e66..8e06705 100644
    const lastUserMessage = createMemo(() => {
      if (!props.sessionID) return undefined
      const messages = sync.data.message[props.sessionID]
-@@ -191,6 +210,33 @@ export function Prompt(props: PromptProps) {
+@@ -216,6 +235,33 @@ export function Prompt(props: PromptProps) {
      extmarkToPartIndex: new Map(),
      interrupt: 0,
    })
@@ -112,7 +112,7 @@ index 2e08e66..8e06705 100644
  
    createEffect(
      on(
-@@ -242,7 +288,6 @@ export function Prompt(props: PromptProps) {
+@@ -267,7 +313,6 @@ export function Prompt(props: PromptProps) {
        {
          title: "Submit prompt",
          value: "prompt.submit",
@@ -120,7 +120,7 @@ index 2e08e66..8e06705 100644
          category: "Prompt",
          hidden: true,
          onSelect: async (dialog) => {
-@@ -280,9 +325,16 @@ export function Prompt(props: PromptProps) {
+@@ -305,9 +350,16 @@ export function Prompt(props: PromptProps) {
          onSelect: (dialog) => {
            if (autocomplete.visible) return
            if (!input.focused) return
@@ -137,7 +137,7 @@ index 2e08e66..8e06705 100644
              return
            }
            if (!props.sessionID) return
-@@ -470,6 +522,7 @@ export function Prompt(props: PromptProps) {
+@@ -495,6 +547,7 @@ export function Prompt(props: PromptProps) {
      if (!input || input.isDestroyed) return
      if (props.visible === false || dialog.stack.length > 0) {
        if (input.focused) input.blur()
@@ -145,7 +145,7 @@ index 2e08e66..8e06705 100644
        return
      }
  
-@@ -783,6 +836,7 @@ export function Prompt(props: PromptProps) {
+@@ -830,6 +883,7 @@ export function Prompt(props: PromptProps) {
          })
          .catch(() => {})
      }
@@ -153,7 +153,7 @@ index 2e08e66..8e06705 100644
      history.append({
        ...store.prompt,
        mode: currentMode,
-@@ -806,6 +860,19 @@ export function Prompt(props: PromptProps) {
+@@ -853,6 +907,19 @@ export function Prompt(props: PromptProps) {
      input.clear()
      return true
    }
@@ -173,7 +173,7 @@ index 2e08e66..8e06705 100644
    const exit = useExit()
  
    function pasteText(text: string, virtualText: string) {
-@@ -1032,10 +1099,11 @@ export function Prompt(props: PromptProps) {
+@@ -1079,10 +1146,11 @@ export function Prompt(props: PromptProps) {
                    setStore("extmarkToPartIndex", new Map())
                    return
                  }
@@ -187,7 +187,7 @@ index 2e08e66..8e06705 100644
                      e.preventDefault()
                      return
                    }
-@@ -1049,11 +1117,14 @@ export function Prompt(props: PromptProps) {
+@@ -1096,11 +1164,14 @@ export function Prompt(props: PromptProps) {
                  if (store.mode === "shell") {
                    if ((e.name === "backspace" && input.visualCursor.offset === 0) || e.name === "escape") {
                      setStore("mode", "normal")
@@ -202,7 +202,7 @@ index 2e08e66..8e06705 100644
                  if (!autocomplete.visible) {
                    if (
                      (keybind.match("history_previous", e) && input.cursorOffset === 0) ||
-@@ -1082,7 +1153,7 @@ export function Prompt(props: PromptProps) {
+@@ -1129,7 +1200,7 @@ export function Prompt(props: PromptProps) {
                onSubmit={() => {
                  // IME: double-defer so the last composed character (e.g. Korean
                  // hangul) is flushed to plainText before we read it for submission.
@@ -211,7 +211,7 @@ index 2e08e66..8e06705 100644
                }}
                onPaste={async (event: PasteEvent) => {
                  if (props.disabled) {
-@@ -1250,6 +1321,9 @@ export function Prompt(props: PromptProps) {
+@@ -1297,6 +1368,9 @@ export function Prompt(props: PromptProps) {
            />
          </box>
          <box width="100%" flexDirection="row" justifyContent="space-between">
