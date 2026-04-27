@@ -1,0 +1,489 @@
+diff --git a/packages/opencode/src/server/routes/instance/session.ts b/packages/opencode/src/server/routes/instance/session.ts
+index 4f4f8ed86..b5d896182 100644
+--- a/packages/opencode/src/server/routes/instance/session.ts
++++ b/packages/opencode/src/server/routes/instance/session.ts
+@@ -27,6 +27,25 @@ import { zodObject } from "@/util/effect-zod"
+ import { Bus } from "@/bus"
+ import { NamedError } from "@opencode-ai/shared/util/error"
+ import { jsonRequest, runRequest } from "./trace"
++import { Instance } from "@/project/instance"
++import { InstanceBootstrap } from "@/project/bootstrap"
++import { AppRuntime } from "@/effect/app-runtime"
++
++async function withSessionInstance<R>(sessionID: string, fn: () => Promise<R>): Promise<R> {
++  const directory = await AppRuntime.runPromise(
++    Effect.gen(function* () {
++      const session = yield* Session.Service
++      const info = yield* session.get(sessionID as SessionID)
++      return info.directory
++    })
++  )
++  return Instance.provide({
++    directory,
++    init: () => AppRuntime.runPromise(InstanceBootstrap),
++    fn
++  })
++}
++
+ 
+ const log = Log.create({ service: "server" })
+ 
+@@ -127,11 +146,15 @@ export const SessionRoutes = lazy(() =>
+         }),
+       ),
+       async (c) => {
++        const sessionID = (c.req.valid("param") as any).sessionID as string
++        return withSessionInstance(sessionID, async () => {
+         const sessionID = c.req.valid("param").sessionID
+         return jsonRequest("SessionRoutes.get", c, function* () {
+           const session = yield* Session.Service
+           return yield* session.get(sessionID)
+         })
++      
++        })
+       },
+     )
+     .get(
+@@ -160,11 +183,15 @@ export const SessionRoutes = lazy(() =>
+         }),
+       ),
+       async (c) => {
++        const sessionID = (c.req.valid("param") as any).sessionID as string
++        return withSessionInstance(sessionID, async () => {
+         const sessionID = c.req.valid("param").sessionID
+         return jsonRequest("SessionRoutes.children", c, function* () {
+           const session = yield* Session.Service
+           return yield* session.children(sessionID)
+         })
++      
++        })
+       },
+     )
+     .get(
+@@ -192,11 +219,15 @@ export const SessionRoutes = lazy(() =>
+         }),
+       ),
+       async (c) => {
++        const sessionID = (c.req.valid("param") as any).sessionID as string
++        return withSessionInstance(sessionID, async () => {
+         const sessionID = c.req.valid("param").sessionID
+         return jsonRequest("SessionRoutes.todo", c, function* () {
+           const todo = yield* Todo.Service
+           return yield* todo.get(sessionID)
+         })
++      
++        })
+       },
+     )
+     .post(
+@@ -249,13 +280,15 @@ export const SessionRoutes = lazy(() =>
+           sessionID: Session.RemoveInput.zod,
+         }),
+       ),
+-      async (c) =>
+-        jsonRequest("SessionRoutes.delete", c, function* () {
++      async (c) => {
++        const sessionID = (c.req.valid("param") as any).sessionID as string
++        return withSessionInstance(sessionID, async () => jsonRequest("SessionRoutes.delete", c, function* () {
+           const sessionID = c.req.valid("param").sessionID
+           const svc = yield* Session.Service
+           yield* svc.remove(sessionID)
+           return true
+-        }),
++        }))
++      },
+     )
+     .patch(
+       "/:sessionID",
+@@ -293,8 +326,9 @@ export const SessionRoutes = lazy(() =>
+             .optional(),
+         }),
+       ),
+-      async (c) =>
+-        jsonRequest("SessionRoutes.update", c, function* () {
++      async (c) => {
++        const sessionID = (c.req.valid("param") as any).sessionID as string
++        return withSessionInstance(sessionID, async () => jsonRequest("SessionRoutes.update", c, function* () {
+           const sessionID = c.req.valid("param").sessionID
+           const updates = c.req.valid("json")
+           const session = yield* Session.Service
+@@ -314,7 +348,8 @@ export const SessionRoutes = lazy(() =>
+           }
+ 
+           return yield* session.get(sessionID)
+-        }),
++        }))
++      },
+     )
+     // TODO(v2): remove this dedicated route and rely on the normal `/init` command flow.
+     .post(
+@@ -350,8 +385,9 @@ export const SessionRoutes = lazy(() =>
+           messageID: MessageID.zod,
+         }),
+       ),
+-      async (c) =>
+-        jsonRequest("SessionRoutes.init", c, function* () {
++      async (c) => {
++        const sessionID = (c.req.valid("param") as any).sessionID as string
++        return withSessionInstance(sessionID, async () => jsonRequest("SessionRoutes.init", c, function* () {
+           const sessionID = c.req.valid("param").sessionID
+           const body = c.req.valid("json")
+           const svc = yield* SessionPrompt.Service
+@@ -363,7 +399,8 @@ export const SessionRoutes = lazy(() =>
+             arguments: "",
+           })
+           return true
+-        }),
++        }))
++      },
+     )
+     .post(
+       "/:sessionID/fork",
+@@ -389,13 +426,15 @@ export const SessionRoutes = lazy(() =>
+         }),
+       ),
+       validator("json", zodObject(Session.ForkInput).omit({ sessionID: true })),
+-      async (c) =>
+-        jsonRequest("SessionRoutes.fork", c, function* () {
++      async (c) => {
++        const sessionID = (c.req.valid("param") as any).sessionID as string
++        return withSessionInstance(sessionID, async () => jsonRequest("SessionRoutes.fork", c, function* () {
+           const sessionID = c.req.valid("param").sessionID
+           const body = c.req.valid("json") as { messageID?: MessageID }
+           const svc = yield* Session.Service
+           return yield* svc.fork({ ...body, sessionID })
+-        }),
++        }))
++      },
+     )
+     .post(
+       "/:sessionID/abort",
+@@ -421,12 +460,14 @@ export const SessionRoutes = lazy(() =>
+           sessionID: SessionID.zod,
+         }),
+       ),
+-      async (c) =>
+-        jsonRequest("SessionRoutes.abort", c, function* () {
++      async (c) => {
++        const sessionID = (c.req.valid("param") as any).sessionID as string
++        return withSessionInstance(sessionID, async () => jsonRequest("SessionRoutes.abort", c, function* () {
+           const svc = yield* SessionPrompt.Service
+           yield* svc.cancel(c.req.valid("param").sessionID)
+           return true
+-        }),
++        }))
++      },
+     )
+     .post(
+       "/:sessionID/share",
+@@ -452,14 +493,16 @@ export const SessionRoutes = lazy(() =>
+           sessionID: SessionID.zod,
+         }),
+       ),
+-      async (c) =>
+-        jsonRequest("SessionRoutes.share", c, function* () {
++      async (c) => {
++        const sessionID = (c.req.valid("param") as any).sessionID as string
++        return withSessionInstance(sessionID, async () => jsonRequest("SessionRoutes.share", c, function* () {
+           const sessionID = c.req.valid("param").sessionID
+           const share = yield* SessionShare.Service
+           const session = yield* Session.Service
+           yield* share.share(sessionID)
+           return yield* session.get(sessionID)
+-        }),
++        }))
++      },
+     )
+     .get(
+       "/:sessionID/diff",
+@@ -485,8 +528,9 @@ export const SessionRoutes = lazy(() =>
+         }),
+       ),
+       validator("query", zodObject(SessionSummary.DiffInput).omit({ sessionID: true })),
+-      async (c) =>
+-        jsonRequest("SessionRoutes.diff", c, function* () {
++      async (c) => {
++        const sessionID = (c.req.valid("param") as any).sessionID as string
++        return withSessionInstance(sessionID, async () => jsonRequest("SessionRoutes.diff", c, function* () {
+           const query = c.req.valid("query") as Omit<SessionSummary.DiffInput, "sessionID">
+           const params = c.req.valid("param")
+           const summary = yield* SessionSummary.Service
+@@ -494,7 +538,8 @@ export const SessionRoutes = lazy(() =>
+             sessionID: params.sessionID,
+             messageID: query.messageID,
+           })
+-        }),
++        }))
++      },
+     )
+     .delete(
+       "/:sessionID/share",
+@@ -520,14 +565,16 @@ export const SessionRoutes = lazy(() =>
+           sessionID: SessionID.zod,
+         }),
+       ),
+-      async (c) =>
+-        jsonRequest("SessionRoutes.unshare", c, function* () {
++      async (c) => {
++        const sessionID = (c.req.valid("param") as any).sessionID as string
++        return withSessionInstance(sessionID, async () => jsonRequest("SessionRoutes.unshare", c, function* () {
+           const sessionID = c.req.valid("param").sessionID
+           const share = yield* SessionShare.Service
+           const session = yield* Session.Service
+           yield* share.unshare(sessionID)
+           return yield* session.get(sessionID)
+-        }),
++        }))
++      },
+     )
+     .post(
+       "/:sessionID/summarize",
+@@ -561,8 +608,9 @@ export const SessionRoutes = lazy(() =>
+           auto: z.boolean().optional().default(false),
+         }),
+       ),
+-      async (c) =>
+-        jsonRequest("SessionRoutes.summarize", c, function* () {
++      async (c) => {
++        const sessionID = (c.req.valid("param") as any).sessionID as string
++        return withSessionInstance(sessionID, async () => jsonRequest("SessionRoutes.summarize", c, function* () {
+           const sessionID = c.req.valid("param").sessionID
+           const body = c.req.valid("json")
+           const session = yield* Session.Service
+@@ -594,7 +642,8 @@ export const SessionRoutes = lazy(() =>
+           })
+           yield* prompt.loop({ sessionID })
+           return true
+-        }),
++        }))
++      },
+     )
+     .get(
+       "/:sessionID/message",
+@@ -653,6 +702,8 @@ export const SessionRoutes = lazy(() =>
+           }),
+       ),
+       async (c) => {
++        const sessionID = (c.req.valid("param") as any).sessionID as string
++        return withSessionInstance(sessionID, async () => {
+         const query = c.req.valid("query")
+         const sessionID = c.req.valid("param").sessionID
+         if (query.limit === undefined || query.limit === 0) {
+@@ -682,6 +733,8 @@ export const SessionRoutes = lazy(() =>
+           c.header("X-Next-Cursor", page.cursor)
+         }
+         return c.json(page.items)
++      
++        })
+       },
+     )
+     .get(
+@@ -715,12 +768,16 @@ export const SessionRoutes = lazy(() =>
+         }),
+       ),
+       async (c) => {
++        const sessionID = (c.req.valid("param") as any).sessionID as string
++        return withSessionInstance(sessionID, async () => {
+         const params = c.req.valid("param")
+         const message = await MessageV2.get({
+           sessionID: params.sessionID,
+           messageID: params.messageID,
+         })
+         return c.json(message)
++      
++        })
+       },
+     )
+     .delete(
+@@ -749,8 +806,9 @@ export const SessionRoutes = lazy(() =>
+           messageID: MessageID.zod,
+         }),
+       ),
+-      async (c) =>
+-        jsonRequest("SessionRoutes.deleteMessage", c, function* () {
++      async (c) => {
++        const sessionID = (c.req.valid("param") as any).sessionID as string
++        return withSessionInstance(sessionID, async () => jsonRequest("SessionRoutes.deleteMessage", c, function* () {
+           const params = c.req.valid("param")
+           const state = yield* SessionRunState.Service
+           const session = yield* Session.Service
+@@ -760,7 +818,8 @@ export const SessionRoutes = lazy(() =>
+             messageID: params.messageID,
+           })
+           return true
+-        }),
++        }))
++      },
+     )
+     .delete(
+       "/:sessionID/message/:messageID/part/:partID",
+@@ -787,8 +846,9 @@ export const SessionRoutes = lazy(() =>
+           partID: PartID.zod,
+         }),
+       ),
+-      async (c) =>
+-        jsonRequest("SessionRoutes.deletePart", c, function* () {
++      async (c) => {
++        const sessionID = (c.req.valid("param") as any).sessionID as string
++        return withSessionInstance(sessionID, async () => jsonRequest("SessionRoutes.deletePart", c, function* () {
+           const params = c.req.valid("param")
+           const svc = yield* Session.Service
+           yield* svc.removePart({
+@@ -797,7 +857,8 @@ export const SessionRoutes = lazy(() =>
+             partID: params.partID,
+           })
+           return true
+-        }),
++        }))
++      },
+     )
+     .patch(
+       "/:sessionID/message/:messageID/part/:partID",
+@@ -826,6 +887,8 @@ export const SessionRoutes = lazy(() =>
+       ),
+       validator("json", MessageV2.Part.zod),
+       async (c) => {
++        const sessionID = (c.req.valid("param") as any).sessionID as string
++        return withSessionInstance(sessionID, async () => {
+         const params = c.req.valid("param")
+         const body = c.req.valid("json")
+         if (body.id !== params.partID || body.messageID !== params.messageID || body.sessionID !== params.sessionID) {
+@@ -837,6 +900,8 @@ export const SessionRoutes = lazy(() =>
+           const svc = yield* Session.Service
+           return yield* svc.updatePart(body)
+         })
++      
++        })
+       },
+     )
+     .post(
+@@ -870,6 +935,8 @@ export const SessionRoutes = lazy(() =>
+       ),
+       validator("json", zodObject(SessionPrompt.PromptInput).omit({ sessionID: true })),
+       async (c) => {
++        const sessionID = (c.req.valid("param") as any).sessionID as string
++        return withSessionInstance(sessionID, async () => {
+         c.status(200)
+         c.header("Content-Type", "application/json")
+         return stream(c, async (stream) => {
+@@ -884,6 +951,8 @@ export const SessionRoutes = lazy(() =>
+           )
+           void stream.write(JSON.stringify(msg))
+         })
++      
++        })
+       },
+     )
+     .post(
+@@ -910,13 +979,14 @@ export const SessionRoutes = lazy(() =>
+       async (c) => {
+         const sessionID = c.req.valid("param").sessionID
+         const body = c.req.valid("json")
+-        void runRequest(
++        void withSessionInstance(sessionID, async () =>
++          runRequest(
+           "SessionRoutes.prompt_async",
+           c,
+           SessionPrompt.Service.use((svc) =>
+             svc.prompt({ ...body, sessionID } as unknown as SessionPrompt.PromptInput),
+           ),
+-        ).catch((err) => {
++        )).catch((err) => {
+           log.error("prompt_async failed", { sessionID, error: err })
+           void Bus.publish(Session.Event.Error, {
+             sessionID,
+@@ -957,13 +1027,15 @@ export const SessionRoutes = lazy(() =>
+         }),
+       ),
+       validator("json", zodObject(SessionPrompt.CommandInput).omit({ sessionID: true })),
+-      async (c) =>
+-        jsonRequest("SessionRoutes.command", c, function* () {
++      async (c) => {
++        const sessionID = (c.req.valid("param") as any).sessionID as string
++        return withSessionInstance(sessionID, async () => jsonRequest("SessionRoutes.command", c, function* () {
+           const sessionID = c.req.valid("param").sessionID
+           const body = c.req.valid("json") as Omit<SessionPrompt.CommandInput, "sessionID">
+           const svc = yield* SessionPrompt.Service
+           return yield* svc.command({ ...body, sessionID })
+-        }),
++        }))
++      },
+     )
+     .post(
+       "/:sessionID/shell",
+@@ -990,13 +1062,15 @@ export const SessionRoutes = lazy(() =>
+         }),
+       ),
+       validator("json", zodObject(SessionPrompt.ShellInput).omit({ sessionID: true })),
+-      async (c) =>
+-        jsonRequest("SessionRoutes.shell", c, function* () {
++      async (c) => {
++        const sessionID = (c.req.valid("param") as any).sessionID as string
++        return withSessionInstance(sessionID, async () => jsonRequest("SessionRoutes.shell", c, function* () {
+           const sessionID = c.req.valid("param").sessionID
+           const body = c.req.valid("json") as Omit<SessionPrompt.ShellInput, "sessionID">
+           const svc = yield* SessionPrompt.Service
+           return yield* svc.shell({ ...body, sessionID })
+-        }),
++        }))
++      },
+     )
+     .post(
+       "/:sessionID/revert",
+@@ -1024,6 +1098,8 @@ export const SessionRoutes = lazy(() =>
+       ),
+       validator("json", zodObject(SessionRevert.RevertInput).omit({ sessionID: true })),
+       async (c) => {
++        const sessionID = (c.req.valid("param") as any).sessionID as string
++        return withSessionInstance(sessionID, async () => {
+         const sessionID = c.req.valid("param").sessionID
+         const body = c.req.valid("json") as Omit<SessionRevert.RevertInput, "sessionID">
+         log.info("revert", body)
+@@ -1031,6 +1107,8 @@ export const SessionRoutes = lazy(() =>
+           const svc = yield* SessionRevert.Service
+           return yield* svc.revert({ sessionID, ...body })
+         })
++      
++        })
+       },
+     )
+     .post(
+@@ -1057,12 +1135,14 @@ export const SessionRoutes = lazy(() =>
+           sessionID: SessionID.zod,
+         }),
+       ),
+-      async (c) =>
+-        jsonRequest("SessionRoutes.unrevert", c, function* () {
++      async (c) => {
++        const sessionID = (c.req.valid("param") as any).sessionID as string
++        return withSessionInstance(sessionID, async () => jsonRequest("SessionRoutes.unrevert", c, function* () {
+           const sessionID = c.req.valid("param").sessionID
+           const svc = yield* SessionRevert.Service
+           return yield* svc.unrevert({ sessionID })
+-        }),
++        }))
++      },
+     )
+     .post(
+       "/:sessionID/permissions/:permissionID",
+@@ -1091,8 +1171,9 @@ export const SessionRoutes = lazy(() =>
+         }),
+       ),
+       validator("json", z.object({ response: Permission.Reply.zod })),
+-      async (c) =>
+-        jsonRequest("SessionRoutes.permissionRespond", c, function* () {
++      async (c) => {
++        const sessionID = (c.req.valid("param") as any).sessionID as string
++        return withSessionInstance(sessionID, async () => jsonRequest("SessionRoutes.permissionRespond", c, function* () {
+           const params = c.req.valid("param")
+           const svc = yield* Permission.Service
+           yield* svc.reply({
+@@ -1100,6 +1181,7 @@ export const SessionRoutes = lazy(() =>
+             reply: c.req.valid("json").response,
+           })
+           return true
+-        }),
++        }))
++      },
+     ),
+ )

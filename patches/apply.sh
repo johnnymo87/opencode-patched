@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
-# Apply caching + vim + tool-fix + mcp-reconnect + eager-input-streaming
+# Apply caching + vim + tool-fix + mcp-reconnect + eager-input-streaming + prefill-fix
 # patches to opencode source.
 # Usage: ./apply.sh <path-to-opencode-source>
 #
 # Fetches caching.patch from opencode-cached (never duplicated here),
-# then applies local vim.patch, tool-fix.patch, mcp-reconnect.patch, and
-# eager-input-streaming.patch on top.
+# then applies local vim.patch, tool-fix.patch, mcp-reconnect.patch,
+# eager-input-streaming.patch, and prefill-fix.patch on top.
 
 set -euo pipefail
 
@@ -21,6 +21,7 @@ VIM_PATCH="$SCRIPT_DIR/vim.patch"
 TOOL_FIX_PATCH="$SCRIPT_DIR/tool-fix.patch"
 MCP_RECONNECT_PATCH="$SCRIPT_DIR/mcp-reconnect.patch"
 EAGER_INPUT_STREAMING_PATCH="$SCRIPT_DIR/eager-input-streaming.patch"
+PREFILL_FIX_PATCH="$SCRIPT_DIR/prefill-fix.patch"
 CACHING_PATCH_URL="https://raw.githubusercontent.com/johnnymo87/opencode-cached/main/patches/caching.patch"
 
 if [ ! -d "$SOURCE_DIR" ]; then
@@ -45,6 +46,11 @@ fi
 
 if [ ! -f "$EAGER_INPUT_STREAMING_PATCH" ]; then
   echo "Error: Eager input streaming patch not found: $EAGER_INPUT_STREAMING_PATCH"
+  exit 1
+fi
+
+if [ ! -f "$PREFILL_FIX_PATCH" ]; then
+  echo "Error: Prefill fix patch not found: $PREFILL_FIX_PATCH"
   exit 1
 fi
 
@@ -168,6 +174,27 @@ fi
 
 git apply "$EAGER_INPUT_STREAMING_PATCH"
 echo "✓ Eager input streaming patch applied"
+
+# --- Patch 6: Prefill race fix (rebind session routes to session.directory) ---
+
+echo "Applying prefill-fix.patch..."
+if ! git apply --check "$PREFILL_FIX_PATCH" 2>/dev/null; then
+  echo ""
+  echo "❌ PREFILL FIX PATCH FAILED TO APPLY"
+  echo ""
+  echo "Attempting to apply for diagnostics..."
+  git apply "$PREFILL_FIX_PATCH" 2>&1 || true
+  echo ""
+  echo "Failed files:"
+  find . -name "*.rej" -type f 2>/dev/null || echo "  None found"
+  echo ""
+  echo "The prefill fix patch may need updating for this upstream version."
+  echo "Refs: workstation/docs/plans/2026-04-21-opencode-prefill-fix-design.md"
+  exit 1
+fi
+
+git apply "$PREFILL_FIX_PATCH"
+echo "✓ Prefill fix patch applied"
 
 # --- Summary ---
 
