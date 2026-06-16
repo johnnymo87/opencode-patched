@@ -74,7 +74,7 @@ index 82bed0e..f9428ae 100644
 +    const userID = "m-user"
 +    const assistantID = "m-assistant"
 +
-+    const input: MessageV2.WithParts[] = [
++    const input: SessionV1.WithParts[] = [
 +      {
 +        info: userInfo(userID),
 +        parts: [
@@ -83,7 +83,7 @@ index 82bed0e..f9428ae 100644
 +            type: "text",
 +            text: "write the file",
 +          },
-+        ] as MessageV2.Part[],
++        ] as SessionV1.Part[],
 +      },
 +      {
 +        info: assistantInfo(assistantID, userID),
@@ -132,7 +132,7 @@ index 82bed0e..f9428ae 100644
 +            },
 +          },
 +          // step-finish only exists for the final step
-+        ] as MessageV2.Part[],
++        ] as SessionV1.Part[],
 +      },
 +    ]
 +

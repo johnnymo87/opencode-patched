@@ -231,23 +231,15 @@ jobs:
           body: |
             # OpenCode v${{ inputs.version }} with Local Patches
 
-            This release applies nine patches to OpenCode v${{ inputs.version }}:
+            This release applies five patches to OpenCode v${{ inputs.version }}:
 
-            1. **Prompt-loop byte identity** from [PR #25367](https://github.com/anomalyco/opencode/pull/25367)
-            2. **Cache-aligned compaction** from [PR #25100](https://github.com/anomalyco/opencode/pull/25100)
-            3. **Gemini empty parts fix** from [PR #28669](https://github.com/anomalyco/opencode/pull/28669)
-            4. **Vim keybindings** from [PR #12679](https://github.com/anomalyco/opencode/pull/12679)
-            5. **Tool use/result mismatch fix** from [PR #16751](https://github.com/anomalyco/opencode/pull/16751)
-            6. **MCP auto-reconnect** from [Issue #15247](https://github.com/anomalyco/opencode/issues/15247)
-            7. **Eager input streaming workaround** for [Issue #23541](https://github.com/anomalyco/opencode/issues/23541) -- defaults `toolStreaming = false` for all `@ai-sdk/anthropic`-backed providers (Vertex Anthropic, Bedrock proxies, etc.)
-            8. **InstanceState partition fix** -- share `memoMap` between TCP listener and in-process webHandler so both HTTP pipelines materialize one `InstanceStore.Service` per directory. Fixes the `Question` tool hang on submit and prevents future partition-induced bugs in services using `InstanceState`. Refactors `InstanceLayer.layer` to make `InstanceBootstrap` injectable. Upstream PR target: anomalyco/opencode (to be filed after multi-machine burn-in).
-            9. **Cache thinking-skip** for [Issue #17883](https://github.com/anomalyco/opencode/issues/17883) -- when marking the conversation cache breakpoint, scan backwards to the last *cacheable* content block instead of `content[length-1]`, so `cache_control` never lands on a trailing reasoning/thinking block (which Anthropic rejects with HTTP 400).
+            1. **Gemini empty parts fix** from [PR #28669](https://github.com/anomalyco/opencode/pull/28669)
+            2. **Tool use/result mismatch fix** from [PR #16751](https://github.com/anomalyco/opencode/pull/16751)
+            3. **Cache thinking-skip** for [Issue #17883](https://github.com/anomalyco/opencode/issues/17883) -- when marking the conversation cache breakpoint, scan backwards to the last *cacheable* content block instead of `content[length-1]`, so `cache_control` never lands on a trailing reasoning/thinking block (which Anthropic rejects with HTTP 400).
+            4. **Retry cap** (local) -- caps model-stream retries at `MAX_RETRIES = 8` and adds downward-only backoff jitter to prevent thundering herd conditions.
+            5. **Vim keybindings** from [PR #12679](https://github.com/anomalyco/opencode/pull/12679)
 
             Note: As of 2026-06-02, the big **caching.patch** (formerly fetched from [opencode-cached](https://github.com/johnnymo87/opencode-cached), PR #5422) is DROPPED. Upstream `applyCaching` already implements the moving-tail conversation anchor (`non-system.slice(-2)`), making the fork patch redundant; the only behavior upstream lacked (skipping reasoning blocks at the cache breakpoint) is preserved as the small `cache-thinking-skip.patch` above. As of v1.15.10, the bus-eager-subscribe patch (PR #27959) and the bus instance-context fix (PR #28051) are DROPPED -- both are upstream-merged in v1.15.5+.
-
-            ## Prompt Cache Alignment
-
-            Prompt-loop byte identity preserves the conversation array across tool-call continuations, reducing cache misses from unchanged prompt tails. Cache-aligned compaction reuses normal prompt-loop context for compaction calls when provider/model conditions allow, so future compactions can reuse the same prefix cache.
 
             ## Gemini Empty Parts Fix
 
@@ -268,13 +260,9 @@ jobs:
 
             Fixes the widespread `tool_use ids were found without tool_result blocks` error ([#16749](https://github.com/anomalyco/opencode/issues/16749)) that corrupts sessions when stream errors cause lost step boundaries. Injects synthetic step-start boundaries at reconstruction time to prevent interleaved tool_use/text in assistant messages.
 
-            ## MCP Auto-Reconnect
+            ## Retry Cap
 
-            Automatically reconnects remote MCP servers when the server restarts and the session becomes stale. Without this, tool calls fail with transport errors requiring a manual MCP toggle or OpenCode restart.
-
-            ## Eager Input Streaming Workaround
-
-            Disables `toolStreaming` for all `@ai-sdk/anthropic`-backed providers (including `@ai-sdk/google-vertex/anthropic`). Since `@ai-sdk/anthropic >= 3.0.58`, the SDK injects `eager_input_streaming: true` into every tool definition, which Anthropic-shape proxies (Google Vertex, AWS Bedrock, GitHub Copilot, corporate gateways) reject with `tools.0.custom.eager_input_streaming: Extra inputs are not permitted`. Upstream only fixes this for `github-copilot`; this patch generalizes the workaround.
+            Caps model-stream retries at `MAX_RETRIES = 8` and adds downward-only backoff jitter.
 
             ## Installation
 
@@ -305,14 +293,11 @@ jobs:
             ---
 
             **Upstream**: [anomalyco/opencode v${{ inputs.version }}](https://github.com/anomalyco/opencode/releases/tag/v${{ inputs.version }})
-            **Prompt-loop cache patch**: [PR #25367](https://github.com/anomalyco/opencode/pull/25367)
-            **Cache-aligned compaction patch**: [PR #25100](https://github.com/anomalyco/opencode/pull/25100)
-            **Vim patch**: [PR #12679](https://github.com/anomalyco/opencode/pull/12679)
+            **Gemini empty parts patch**: [PR #28669](https://github.com/anomalyco/opencode/pull/28669)
             **Tool fix patch**: [PR #16751](https://github.com/anomalyco/opencode/pull/16751)
-            **MCP reconnect**: [Issue #15247](https://github.com/anomalyco/opencode/issues/15247)
-            **Eager input streaming**: [Issue #23541](https://github.com/anomalyco/opencode/issues/23541)
-            **InstanceState partition fix**: local patch (upstream PR target: anomalyco/opencode, pending burn-in)
             **Cache thinking-skip**: [Issue #17883](https://github.com/anomalyco/opencode/issues/17883) (local patch; caching.patch dropped, see note above)
+            **Retry cap**: local patch
+            **Vim patch**: [PR #12679](https://github.com/anomalyco/opencode/pull/12679)
           files: |
             artifacts/opencode-linux-arm64.tar.gz
             artifacts/opencode-linux-x64.tar.gz
@@ -338,50 +323,35 @@ jobs:
             const body = `
             ## Build Failure: v${version}
 
-            The automated build for OpenCode v${version} with caching + local patches failed.
+            The automated build for OpenCode v${version} with local patches failed.
 
             **Workflow Run**: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
 
             ### Possible Causes
 
-            1. **Prompt-loop cache patch conflict**: The local prompt-loop-cache.patch may not apply to v${version}
-            2. **Cache-aligned compaction patch conflict**: The local cache-aligned-compaction.patch may not apply to v${version}
-            3. **Gemini empty parts patch conflict**: The local gemini-empty-parts.patch may not apply to v${version}
-            4. **Vim patch conflict**: The local vim.patch may not apply to v${version}
-            5. **Tool fix patch conflict**: The local tool-fix.patch may not apply to v${version}
-            6. **MCP reconnect patch conflict**: The local mcp-reconnect.patch may not apply to v${version}
-            7. **Eager input streaming patch conflict**: The local eager-input-streaming.patch may not apply to v${version}
-            8. **InstanceState partition patch conflict**: The local instance-state-partition.patch may not apply to v${version}
-            9. **Cache thinking-skip patch conflict**: The local cache-thinking-skip.patch may not apply to v${version} (it targets `applyCaching` in `provider/transform.ts`; if upstream refactored that function, re-derive the backward-scan hunk)
-            10. **Build failure**: OpenCode build process may have changed
+            1. **Gemini empty parts patch conflict**: The local gemini-empty-parts.patch may not apply to v${version}
+            2. **Tool fix patch conflict**: The local tool-fix.patch may not apply to v${version}
+            3. **Cache thinking-skip patch conflict**: The local cache-thinking-skip.patch may not apply to v${version} (it targets \`applyCaching\` in \`provider/transform.ts\`; if upstream refactored that function, re-derive the backward-scan hunk)
+            4. **Retry cap patch conflict**: The local retry-cap.patch may not apply to v${version}
+            5. **Vim patch conflict**: The local vim.patch may not apply to v${version}
+            6. **Build failure**: OpenCode build process may have changed
 
             ### Action Required
 
             1. Check the workflow logs above
-            2. If the cache thinking-skip patch failed, re-derive it against upstream `applyCaching` (see [Issue #17883](https://github.com/anomalyco/opencode/issues/17883)) -- the patch just makes the breakpoint scan backwards past reasoning/thinking blocks
-            3. If prompt-loop cache patch failed, regenerate from [PR #25367](https://github.com/anomalyco/opencode/pull/25367):
-               \`\`\`bash
-               gh pr diff 25367 --repo anomalyco/opencode > patches/prompt-loop-cache.patch
-               # Review changes, commit and push
-               \`\`\`
-            4. If cache-aligned compaction patch failed, regenerate from [PR #25100](https://github.com/anomalyco/opencode/pull/25100):
-               \`\`\`bash
-               gh pr diff 25100 --repo anomalyco/opencode > patches/cache-aligned-compaction.patch
-               # Review changes, commit and push
-               \`\`\`
-            5. If vim patch failed, regenerate from [PR #12679](https://github.com/anomalyco/opencode/pull/12679):
+            2. If the cache thinking-skip patch failed, re-derive it against upstream \`applyCaching\` (see [Issue #17883](https://github.com/anomalyco/opencode/issues/17883)) -- the patch just makes the breakpoint scan backwards past reasoning/thinking blocks
+            3. If vim patch failed, regenerate from [PR #12679](https://github.com/anomalyco/opencode/pull/12679):
                \`\`\`bash
                gh pr diff 12679 --repo anomalyco/opencode > patches/vim.patch
                # Review changes, filter if needed, commit and push
                \`\`\`
-            6. If tool fix patch failed, regenerate from [PR #16751](https://github.com/anomalyco/opencode/pull/16751):
+            4. If tool fix patch failed, regenerate from [PR #16751](https://github.com/anomalyco/opencode/pull/16751):
                \`\`\`bash
                gh pr diff 16751 --repo anomalyco/opencode > patches/tool-fix.patch
                # Review changes, commit and push
                \`\`\`
-            7. If MCP reconnect patch failed, review upstream changes to \`mcp/index.ts\` and update manually
-            8. If instance-state-partition patch failed, review upstream changes to \`server.ts\` / \`instance-layer.ts\` and update manually
-            9. Re-run: \`gh workflow run build-release.yml --field version=${version}\` (or add \`--field revision=N\` to re-release the same upstream version with updated patches; the release tag becomes \`v${version}-patched.N\`)
+            5. If retry cap patch failed, review upstream changes to \`session/retry.ts\` and update manually
+            6. Re-run: \`gh workflow run build-release.yml --field version=${version}\` (or add \`--field revision=N\` to re-release the same upstream version with updated patches; the release tag becomes \`v${version}-patched.N\`)
             `;
 
             const issues = await github.rest.issues.listForRepo({
