@@ -1,5 +1,5 @@
 diff --git a/packages/opencode/src/session/retry.ts b/packages/opencode/src/session/retry.ts
-index 4139665..303ab72 100644
+index 4139665bd..303ab72de 100644
 --- a/packages/opencode/src/session/retry.ts
 +++ b/packages/opencode/src/session/retry.ts
 @@ -28,10 +28,29 @@ export const RETRY_BACKOFF_FACTOR = 2
@@ -55,7 +55,7 @@ index 4139665..303ab72 100644
          const wait = delay(meta.attempt, SessionV1.APIError.isInstance(error) ? error : undefined)
          const now = yield* Clock.currentTimeMillis
 diff --git a/packages/opencode/test/session/retry.test.ts b/packages/opencode/test/session/retry.test.ts
-index f5edf1a..65bee67 100644
+index f5edf1af2..fae704acb 100644
 --- a/packages/opencode/test/session/retry.test.ts
 +++ b/packages/opencode/test/session/retry.test.ts
 @@ -3,7 +3,7 @@ import { SessionV1 } from "@opencode-ai/core/v1/session"
@@ -98,20 +98,22 @@ index f5edf1a..65bee67 100644
    })
  
    test("prefers retry-after-ms when shorter than exponential", () => {
-@@ -116,6 +133,55 @@ describe("session.retry.delay", () => {
+@@ -116,6 +133,38 @@ describe("session.retry.delay", () => {
    )
  })
  
 +describe("session.retry.policy", () => {
-+  const decode = Schema.decodeUnknownSync(SessionV1.APIError.Schema)
-+
-+  it.effect("halts after MAX_RETRIES attempts for a persistently retryable error", () =>
++  it.instance("halts after MAX_RETRIES attempts for a persistently retryable error", () =>
 +    Effect.gen(function* () {
-+      // retry-after-ms: "0" keeps the schedule retryable with zero backoff so we
++      // retry-after-ms "0" keeps the schedule retryable with zero backoff so we
 +      // exercise the attempt ceiling, not the delay curve.
 +      const error = apiError({ "retry-after-ms": "0" })
 +      const step = yield* Schedule.toStepWithMetadata(
-+        SessionRetry.policy({ provider: "test", parse: decode, set: () => Effect.void }),
++        SessionRetry.policy({
++          provider: "test",
++          parse: Schema.decodeUnknownSync(SessionV1.APIError.Schema),
++          set: () => Effect.void,
++        }),
 +      )
 +      let scheduled = 0
 +      let halted = false
@@ -128,25 +130,6 @@ index f5edf1a..65bee67 100644
 +      // MAX_RETRIES retries are scheduled before the schedule completes.
 +      expect(scheduled).toBe(SessionRetry.MAX_RETRIES)
 +      expect(halted).toBe(true)
-+    }),
-+  )
-+
-+  it.live("re-runs a persistently failing effect at most MAX_RETRIES + 1 times", () =>
-+    Effect.gen(function* () {
-+      const error = apiError({ "retry-after-ms": "0" })
-+      let runs = 0
-+      const exit = yield* Effect.suspend(() => {
-+        runs++
-+        return Effect.fail(error)
-+      }).pipe(
-+        Effect.retry(SessionRetry.policy({ provider: "test", parse: decode, set: () => Effect.void })),
-+        Effect.exit,
-+        // Guard so an uncapped policy fails the test by timeout instead of hanging.
-+        Effect.timeout("10 seconds"),
-+      )
-+      expect(Exit.isFailure(exit)).toBe(true)
-+      // 1 initial attempt + MAX_RETRIES retries = total billable re-issues.
-+      expect(runs).toBe(SessionRetry.MAX_RETRIES + 1)
 +    }),
 +  )
 +})

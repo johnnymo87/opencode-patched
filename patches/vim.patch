@@ -1,24 +1,24 @@
-diff --git a/packages/opencode/src/cli/cmd/tui/app.tsx b/packages/opencode/src/cli/cmd/tui/app.tsx
-index 0cb5a08..db298c5 100644
---- a/packages/opencode/src/cli/cmd/tui/app.tsx
-+++ b/packages/opencode/src/cli/cmd/tui/app.tsx
-@@ -76,6 +76,7 @@ import {
-   useBindings,
-   useOpencodeKeymap,
- } from "./keymap"
+diff --git a/packages/tui/src/app.tsx b/packages/tui/src/app.tsx
+index 17a9a554c..668eebc13 100644
+--- a/packages/tui/src/app.tsx
++++ b/packages/tui/src/app.tsx
+@@ -61,6 +61,7 @@ import * as Model from "./util/model"
+ import { ArgsProvider, useArgs, type Args } from "./context/args"
+ import open from "open"
+ import { PromptRefProvider, usePromptRef } from "./context/prompt"
 +import { useVimEnabled } from "./component/vim"
- 
- import type { EventSource } from "./context/sdk"
- import { DialogVariant } from "./component/dialog-variant"
-@@ -421,6 +422,7 @@ function App(props: { onSnapshot?: () => Promise<string[]> }) {
-     .finally(() => {
-       setReady(true)
-     })
+ import { TuiConfigProvider, useTuiConfig, type TuiConfig } from "./config"
+ import { createTuiApiAdapters } from "./plugin/adapters"
+ import { createTuiApi } from "./plugin/api"
+@@ -357,6 +358,7 @@ function App(props: { onSnapshot?: () => Promise<string[]>; pluginHost: TuiPlugi
+   const dialog = useDialog()
+   const local = useLocal()
+   const kv = useKV()
 +  const vim = useVimEnabled()
- 
-   // Let selection copy/dismiss win ahead of normal bindings when the feature flag is on.
-   const offSelectionKeys = keymap.intercept(
-@@ -883,6 +885,15 @@ function App(props: { onSnapshot?: () => Promise<string[]> }) {
+   const keymap = useOpencodeKeymap()
+   const event = useEvent()
+   const sdk = useSDK()
+@@ -867,6 +869,15 @@ function App(props: { onSnapshot?: () => Promise<string[]>; pluginHost: TuiPlugi
            dialog.clear()
          },
        },
@@ -34,39 +34,39 @@ index 0cb5a08..db298c5 100644
        {
          name: "app.toggle.animations",
          title: kv.get("animations_enabled", true) ? "Disable animations" : "Enable animations",
-diff --git a/packages/opencode/src/cli/cmd/tui/component/prompt/index.tsx b/packages/opencode/src/cli/cmd/tui/component/prompt/index.tsx
-index dc363a4..c7e43e9 100644
---- a/packages/opencode/src/cli/cmd/tui/component/prompt/index.tsx
-+++ b/packages/opencode/src/cli/cmd/tui/component/prompt/index.tsx
-@@ -58,6 +58,11 @@ import { OPENCODE_BASE_MODE, useBindings, useCommandShortcut, useLeaderActive, u
- import { useTuiConfig } from "../../context/tui-config"
+diff --git a/packages/tui/src/component/prompt/index.tsx b/packages/tui/src/component/prompt/index.tsx
+index aa002080b..66342caed 100644
+--- a/packages/tui/src/component/prompt/index.tsx
++++ b/packages/tui/src/component/prompt/index.tsx
+@@ -54,6 +54,11 @@ import { useArgs } from "../../context/args"
+ import { OPENCODE_BASE_MODE, useBindings, useCommandShortcut, useLeaderActive, useOpencodeKeymap } from "../../keymap"
+ import { useTuiConfig } from "../../config"
  import { usePromptWorkspace } from "./workspace"
- import { usePromptMove } from "./move"
 +import { useVimEnabled } from "../vim"
 +import { createVimState, type VimMode } from "../vim/vim-state"
 +import { createVimHandler } from "../vim/vim-handler"
 +import { vimScroll } from "../vim/vim-scroll"
 +import { useVimIndicator } from "../vim/vim-indicator"
+ import { usePromptMove } from "./move"
+ import { readLocalAttachment } from "./local-attachment"
  
- export type PromptProps = {
-   sessionID?: string
-@@ -95,6 +100,7 @@ function randomIndex(count: number) {
-   if (count <= 0) return 0
-   return Math.floor(Math.random() * count)
+@@ -136,6 +141,7 @@ function formatEditorContext(selection: EditorSelection) {
  }
+ 
+ let stashed: { prompt: PromptInfo; cursor: number } | undefined
 +let lastVimMode: VimMode = "insert"
  
- function fadeColor(color: RGBA, alpha: number) {
-   return RGBA.fromValues(color.r, color.g, color.b, color.a * alpha)
-@@ -195,6 +201,7 @@ export function Prompt(props: PromptProps) {
-   const [cursorVersion, setCursorVersion] = createSignal(0)
-   const currentProviderLabel = createMemo(() => local.model.parsed().provider)
-   const hasRightContent = createMemo(() => Boolean(props.right))
+ export function Prompt(props: PromptProps) {
+   let input: TextareaRenderable
+@@ -154,6 +160,7 @@ export function Prompt(props: PromptProps) {
+   const project = useProject()
+   const sync = useSync()
+   const tuiConfig = useTuiConfig()
 +  const vimEnabled = useVimEnabled()
- 
-   function promptModelWarning() {
-     toast.show({
-@@ -236,6 +243,19 @@ export function Prompt(props: PromptProps) {
+   const dialog = useDialog()
+   const toast = useToast()
+   const status = createMemo(() => sync.data.session_status?.[props.sessionID ?? ""] ?? { type: "idle" })
+@@ -249,6 +256,19 @@ export function Prompt(props: PromptProps) {
      if (!props.disabled) input.cursorColor = theme.text
    })
  
@@ -86,10 +86,10 @@ index dc363a4..c7e43e9 100644
    const lastUserMessage = createMemo(() => {
      if (!props.sessionID) return undefined
      const messages = sync.data.message[props.sessionID]
-@@ -279,6 +299,37 @@ export function Prompt(props: PromptProps) {
-     extmarkToPartIndex: new Map(),
+@@ -293,6 +313,38 @@ export function Prompt(props: PromptProps) {
      interrupt: 0,
    })
+ 
 +  const vimState = createVimState({
 +    enabled: vimEnabled,
 +    initial: () => lastVimMode,
@@ -108,23 +108,24 @@ index dc363a4..c7e43e9 100644
 +    textarea: () => input,
 +    submit,
 +    scroll(action) {
-+      if (action === "line-down") command.run("session.line.down")
-+      if (action === "line-up") command.run("session.line.up")
-+      if (action === "half-down") command.run("session.half.page.down")
-+      if (action === "half-up") command.run("session.half.page.up")
-+      if (action === "page-down") command.run("session.page.down")
-+      if (action === "page-up") command.run("session.page.up")
++      if (action === "line-down") keymap.dispatchCommand("session.line.down")
++      if (action === "line-up") keymap.dispatchCommand("session.line.up")
++      if (action === "half-down") keymap.dispatchCommand("session.half.page.down")
++      if (action === "half-up") keymap.dispatchCommand("session.half.page.up")
++      if (action === "page-down") keymap.dispatchCommand("session.page.down")
++      if (action === "page-up") keymap.dispatchCommand("session.page.up")
 +    },
 +    jump(action) {
-+      if (action === "top") command.run("session.first")
-+      if (action === "bottom") command.run("session.last")
++      if (action === "top") keymap.dispatchCommand("session.first")
++      if (action === "bottom") keymap.dispatchCommand("session.last")
 +    },
 +    autocomplete: () => auto()?.visible ?? false,
 +  })
- 
++
    createEffect(
      on(
-@@ -380,9 +431,16 @@ export function Prompt(props: PromptProps) {
+       () => props.sessionID,
+@@ -393,9 +445,16 @@ export function Prompt(props: PromptProps) {
          run: () => {
            if (auto()?.visible) return
            if (!input.focused) return
@@ -141,34 +142,7 @@ index dc363a4..c7e43e9 100644
              return
            }
            if (!props.sessionID) return
-@@ -616,6 +674,7 @@ export function Prompt(props: PromptProps) {
-     if (!input || input.isDestroyed) return
-     if (props.visible === false || dialog.stack.length > 0) {
-       if (input.focused) input.blur()
-+      if (props.visible === false) vimState.clearPending()
-       return
-     }
- 
-@@ -635,6 +694,18 @@ export function Prompt(props: PromptProps) {
-     }
-   })
- 
-+  function submitFromTextarea() {
-+    if (store.mode !== "normal") {
-+      setTimeout(() => setTimeout(() => void submit(), 0), 0)
-+      return
-+    }
-+    if (vimEnabled() && vimState.isInsert()) {
-+      input.insertText("\n")
-+      return
-+    }
-+    setTimeout(() => setTimeout(() => void submit(), 0), 0)
-+  }
-+
-   function restoreExtmarksFromParts(parts: PromptInfo["parts"]) {
-     input.extmarks.clear()
-     setStore("extmarkToPartIndex", new Map())
-@@ -824,7 +895,17 @@ export function Prompt(props: PromptProps) {
+@@ -838,7 +897,17 @@ export function Prompt(props: PromptProps) {
      return {
        target: inputTarget,
        enabled: inputTarget() !== undefined && store.mode === "shell",
@@ -187,7 +161,7 @@ index dc363a4..c7e43e9 100644
      }
    })
  
-@@ -835,7 +916,17 @@ export function Prompt(props: PromptProps) {
+@@ -849,7 +918,17 @@ export function Prompt(props: PromptProps) {
          cursorVersion()
          return inputTarget() !== undefined && store.mode === "shell" && input?.visualCursor.offset === 0
        })(),
@@ -206,15 +180,34 @@ index dc363a4..c7e43e9 100644
      }
    })
  
-@@ -1109,6 +1200,7 @@ export function Prompt(props: PromptProps) {
-         .catch(() => {})
+@@ -1113,6 +1192,7 @@ export function Prompt(props: PromptProps) {
+         })
        if (editorParts.length > 0) editor.markSelectionSent()
      }
 +    vimState.clearPending()
      history.append({
        ...store.prompt,
        mode: currentMode,
-@@ -1392,17 +1484,14 @@ export function Prompt(props: PromptProps) {
+@@ -1279,6 +1359,18 @@ export function Prompt(props: PromptProps) {
+     setStore("extmarkToPartIndex", new Map())
+   }
+ 
++  function submitFromTextarea() {
++    if (store.mode !== "normal") {
++      setTimeout(() => setTimeout(() => void submit(), 0), 0)
++      return
++    }
++    if (vimEnabled() && vimState.isInsert()) {
++      input.insertText("\n")
++      return
++    }
++    setTimeout(() => setTimeout(() => void submit(), 0), 0)
++  }
++
+   const highlight = createMemo(() => {
+     if (leader()) return theme.border
+     if (store.mode === "shell") return theme.primary
+@@ -1376,17 +1468,14 @@ export function Prompt(props: PromptProps) {
                  setCursorVersion((value) => value + 1)
                }}
                onCursorChange={() => setCursorVersion((value) => value + 1)}
@@ -235,27 +228,25 @@ index dc363a4..c7e43e9 100644
                onPaste={async (event: PasteEvent) => {
                  if (props.disabled) {
                    event.preventDefault()
-@@ -1516,6 +1605,11 @@ export function Prompt(props: PromptProps) {
-           />
-         </box>
-         <box width="100%" flexDirection="row" justifyContent="space-between">
-+          <box flexDirection="row" gap={1} flexGrow={1}>
-+            <Show when={vimIndicator()}>
-+              {(indicator) => <text fg={highlight()}>-- {indicator()} --</text>}
-+            </Show>
-+          </box>
-           <Switch>
-             <Match when={status().type !== "idle"}>
-               <box
-diff --git a/packages/opencode/src/cli/cmd/tui/component/vim/index.ts b/packages/opencode/src/cli/cmd/tui/component/vim/index.ts
+@@ -1435,6 +1524,9 @@ export function Prompt(props: PromptProps) {
+             />
+             <box flexDirection="row" flexShrink={0} paddingTop={1} gap={1} justifyContent="space-between">
+               <box flexDirection="row" gap={1}>
++                <Show when={vimIndicator()}>
++                  {(indicator) => <text fg={highlight()}>-- {indicator()} -- </text>}
++                </Show>
+                 <Show when={local.agent.current()} fallback={<box height={1} />}>
+                   {(agent) => (
+                     <>
+diff --git a/packages/tui/src/component/vim/index.ts b/packages/tui/src/component/vim/index.ts
 new file mode 100644
-index 0000000..453b03f
+index 000000000..de06fd60d
 --- /dev/null
-+++ b/packages/opencode/src/cli/cmd/tui/component/vim/index.ts
++++ b/packages/tui/src/component/vim/index.ts
 @@ -0,0 +1,14 @@
 +import { createMemo } from "solid-js"
 +import { useKV } from "../../context/kv"
-+import { useTuiConfig } from "../../context/tui-config"
++import { useTuiConfig } from "../../config"
 +
 +export function useVimEnabled() {
 +  const kv = useKV()
@@ -267,11 +258,11 @@ index 0000000..453b03f
 +    return config.vim ?? false
 +  })
 +}
-diff --git a/packages/opencode/src/cli/cmd/tui/component/vim/vim-handler.ts b/packages/opencode/src/cli/cmd/tui/component/vim/vim-handler.ts
+diff --git a/packages/tui/src/component/vim/vim-handler.ts b/packages/tui/src/component/vim/vim-handler.ts
 new file mode 100644
-index 0000000..f4c5944
+index 000000000..f4c594451
 --- /dev/null
-+++ b/packages/opencode/src/cli/cmd/tui/component/vim/vim-handler.ts
++++ b/packages/tui/src/component/vim/vim-handler.ts
 @@ -0,0 +1,321 @@
 +import type { Accessor } from "solid-js"
 +import type { createVimState } from "./vim-state"
@@ -594,11 +585,11 @@ index 0000000..f4c5944
 +    },
 +  }
 +}
-diff --git a/packages/opencode/src/cli/cmd/tui/component/vim/vim-indicator.ts b/packages/opencode/src/cli/cmd/tui/component/vim/vim-indicator.ts
+diff --git a/packages/tui/src/component/vim/vim-indicator.ts b/packages/tui/src/component/vim/vim-indicator.ts
 new file mode 100644
-index 0000000..7e6ec76
+index 000000000..7e6ec7601
 --- /dev/null
-+++ b/packages/opencode/src/cli/cmd/tui/component/vim/vim-indicator.ts
++++ b/packages/tui/src/component/vim/vim-indicator.ts
 @@ -0,0 +1,14 @@
 +import { createMemo, type Accessor } from "solid-js"
 +import type { createVimState } from "./vim-state"
@@ -614,11 +605,11 @@ index 0000000..7e6ec76
 +    return undefined
 +  })
 +}
-diff --git a/packages/opencode/src/cli/cmd/tui/component/vim/vim-motion-jump.ts b/packages/opencode/src/cli/cmd/tui/component/vim/vim-motion-jump.ts
+diff --git a/packages/tui/src/component/vim/vim-motion-jump.ts b/packages/tui/src/component/vim/vim-motion-jump.ts
 new file mode 100644
-index 0000000..279fe9a
+index 000000000..279fe9a6f
 --- /dev/null
-+++ b/packages/opencode/src/cli/cmd/tui/component/vim/vim-motion-jump.ts
++++ b/packages/tui/src/component/vim/vim-motion-jump.ts
 @@ -0,0 +1,32 @@
 +import type { VimEvent } from "./vim-handler"
 +import type { createVimState } from "./vim-state"
@@ -652,11 +643,11 @@ index 0000000..279fe9a
 +  state.setPending("g")
 +  return { handled: true }
 +}
-diff --git a/packages/opencode/src/cli/cmd/tui/component/vim/vim-motions.ts b/packages/opencode/src/cli/cmd/tui/component/vim/vim-motions.ts
+diff --git a/packages/tui/src/component/vim/vim-motions.ts b/packages/tui/src/component/vim/vim-motions.ts
 new file mode 100644
-index 0000000..c86a62b
+index 000000000..c86a62bc2
 --- /dev/null
-+++ b/packages/opencode/src/cli/cmd/tui/component/vim/vim-motions.ts
++++ b/packages/tui/src/component/vim/vim-motions.ts
 @@ -0,0 +1,254 @@
 +import type { TextareaRenderable } from "@opentui/core"
 +
@@ -912,11 +903,11 @@ index 0000000..c86a62b
 +  const end = lineEnd(text, textarea.cursorOffset)
 +  deleteOffsets(textarea, start, end)
 +}
-diff --git a/packages/opencode/src/cli/cmd/tui/component/vim/vim-scroll.ts b/packages/opencode/src/cli/cmd/tui/component/vim/vim-scroll.ts
+diff --git a/packages/tui/src/component/vim/vim-scroll.ts b/packages/tui/src/component/vim/vim-scroll.ts
 new file mode 100644
-index 0000000..e886584
+index 000000000..e886584c9
 --- /dev/null
-+++ b/packages/opencode/src/cli/cmd/tui/component/vim/vim-scroll.ts
++++ b/packages/tui/src/component/vim/vim-scroll.ts
 @@ -0,0 +1,15 @@
 +import type { VimEvent } from "./vim-handler"
 +
@@ -933,11 +924,11 @@ index 0000000..e886584
 +  if (key === "b") return "page-up"
 +  return undefined
 +}
-diff --git a/packages/opencode/src/cli/cmd/tui/component/vim/vim-state.ts b/packages/opencode/src/cli/cmd/tui/component/vim/vim-state.ts
+diff --git a/packages/tui/src/component/vim/vim-state.ts b/packages/tui/src/component/vim/vim-state.ts
 new file mode 100644
-index 0000000..d3f8ca5
+index 000000000..d3f8ca5fa
 --- /dev/null
-+++ b/packages/opencode/src/cli/cmd/tui/component/vim/vim-state.ts
++++ b/packages/tui/src/component/vim/vim-state.ts
 @@ -0,0 +1,41 @@
 +import { createEffect, createMemo, createSignal, type Accessor } from "solid-js"
 +
@@ -980,30 +971,32 @@ index 0000000..d3f8ca5
 +    isInsert: createMemo(() => mode() === "insert"),
 +  }
 +}
-diff --git a/packages/opencode/src/cli/cmd/tui/config/tui-schema.ts b/packages/opencode/src/cli/cmd/tui/config/tui-schema.ts
-index da0a36a..8cd621b 100644
---- a/packages/opencode/src/cli/cmd/tui/config/tui-schema.ts
-+++ b/packages/opencode/src/cli/cmd/tui/config/tui-schema.ts
-@@ -85,4 +85,5 @@ export const TuiInfo = Schema.Struct({
+diff --git a/packages/tui/src/config/index.tsx b/packages/tui/src/config/index.tsx
+index df9239763..b5dada714 100644
+--- a/packages/tui/src/config/index.tsx
++++ b/packages/tui/src/config/index.tsx
+@@ -63,6 +63,7 @@ export const Info = Schema.Struct({
    scroll_acceleration: Schema.optional(ScrollAcceleration),
    diff_style: Schema.optional(DiffStyle),
    mouse: Schema.optional(Schema.Boolean).annotate({ description: "Enable or disable mouse capture (default: true)" }),
 +  vim: Schema.optional(Schema.Boolean).annotate({ description: "Enable vim-style input for the prompt" }),
  })
-diff --git a/packages/opencode/test/cli/tui/vim-motions.test.ts b/packages/opencode/test/cli/tui/vim-motions.test.ts
+ export type Info = Schema.Schema.Type<typeof Info>
+ 
+diff --git a/packages/tui/test/cli/tui/vim-motions.test.ts b/packages/tui/test/cli/tui/vim-motions.test.ts
 new file mode 100644
-index 0000000..4565b09
+index 000000000..6a8d8730c
 --- /dev/null
-+++ b/packages/opencode/test/cli/tui/vim-motions.test.ts
++++ b/packages/tui/test/cli/tui/vim-motions.test.ts
 @@ -0,0 +1,776 @@
 +import { describe, expect, test } from "bun:test"
 +import type { TextareaRenderable } from "@opentui/core"
 +import { createSignal } from "solid-js"
-+import { createVimHandler } from "../../../src/cli/cmd/tui/component/vim/vim-handler"
-+import { createVimState } from "../../../src/cli/cmd/tui/component/vim/vim-state"
-+import type { VimScroll } from "../../../src/cli/cmd/tui/component/vim/vim-scroll"
-+import { vimScroll } from "../../../src/cli/cmd/tui/component/vim/vim-scroll"
-+import type { VimJump } from "../../../src/cli/cmd/tui/component/vim/vim-motion-jump"
++import { createVimHandler } from "../../../src/component/vim/vim-handler"
++import { createVimState } from "../../../src/component/vim/vim-state"
++import type { VimScroll } from "../../../src/component/vim/vim-scroll"
++import { vimScroll } from "../../../src/component/vim/vim-scroll"
++import type { VimJump } from "../../../src/component/vim/vim-motion-jump"
 +
 +function rowColToOffset(text: string, row: number, col: number) {
 +  let index = 0

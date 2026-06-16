@@ -1,16 +1,16 @@
 diff --git a/packages/llm/src/protocols/gemini.ts b/packages/llm/src/protocols/gemini.ts
-index 5fe4dcc76..e08f58c64 100644
+index c8fa34b50..2f5527c77 100644
 --- a/packages/llm/src/protocols/gemini.ts
 +++ b/packages/llm/src/protocols/gemini.ts
-@@ -196,6 +196,7 @@ const lowerMessages = Effect.fn("Gemini.lowerMessages")(function* (request: LLMR
+@@ -220,6 +220,7 @@ const lowerMessages = Effect.fn("Gemini.lowerMessages")(function* (request: LLMR
            return yield* ProviderShared.unsupportedContent("Gemini", "user", ["text", "media"])
-         parts.push(lowerUserPart(part))
+         parts.push(yield* lowerUserPart(part))
        }
 +      if (parts.length === 0) parts.push({ text: "" })
        contents.push({ role: "user", parts })
        continue
      }
-@@ -218,6 +219,7 @@ const lowerMessages = Effect.fn("Gemini.lowerMessages")(function* (request: LLMR
+@@ -242,6 +243,7 @@ const lowerMessages = Effect.fn("Gemini.lowerMessages")(function* (request: LLMR
            continue
          }
        }
@@ -18,19 +18,19 @@ index 5fe4dcc76..e08f58c64 100644
        contents.push({ role: "model", parts })
        continue
      }
-@@ -236,6 +238,7 @@ const lowerMessages = Effect.fn("Gemini.lowerMessages")(function* (request: LLMR
-         },
-       })
+@@ -279,6 +281,7 @@ const lowerMessages = Effect.fn("Gemini.lowerMessages")(function* (request: LLMR
+         parts.push({ inlineData: { mimeType: media.mime, data: media.base64 } })
+       }
      }
 +    if (parts.length === 0) parts.push({ text: "" })
      contents.push({ role: "user", parts })
    }
  
 diff --git a/packages/llm/test/provider/gemini.test.ts b/packages/llm/test/provider/gemini.test.ts
-index 9e519723f..26ee12a00 100644
+index d30742c47..90be8607e 100644
 --- a/packages/llm/test/provider/gemini.test.ts
 +++ b/packages/llm/test/provider/gemini.test.ts
-@@ -111,6 +111,30 @@ describe("Gemini route", () => {
+@@ -232,6 +232,30 @@ describe("Gemini route", () => {
      }),
    )
  
@@ -62,10 +62,10 @@ index 9e519723f..26ee12a00 100644
      Effect.gen(function* () {
        const prepared = yield* LLMClient.prepare(
 diff --git a/packages/opencode/src/provider/transform.ts b/packages/opencode/src/provider/transform.ts
-index 2de3d1ca6..e66ece4aa 100644
+index cce3c7014..1b4f4b8ea 100644
 --- a/packages/opencode/src/provider/transform.ts
 +++ b/packages/opencode/src/provider/transform.ts
-@@ -185,6 +185,41 @@ function normalizeMessages(
+@@ -186,6 +186,41 @@ function normalizeMessages(
        .filter((msg): msg is ModelMessage => msg !== undefined && msg.content !== "")
    }
  
@@ -108,10 +108,10 @@ index 2de3d1ca6..e66ece4aa 100644
      const scrub = (id: string) => id.replace(/[^a-zA-Z0-9_-]/g, "_")
      msgs = msgs.map((msg) => {
 diff --git a/packages/opencode/test/provider/transform.test.ts b/packages/opencode/test/provider/transform.test.ts
-index 3815a4322..cb4e3cb1d 100644
+index c3c8cbf81..2a3cca9a7 100644
 --- a/packages/opencode/test/provider/transform.test.ts
 +++ b/packages/opencode/test/provider/transform.test.ts
-@@ -3960,3 +3960,80 @@ describe("ProviderTransform.providerOptions - ai-gateway-provider", () => {
+@@ -4118,3 +4118,80 @@ describe("ProviderTransform.providerOptions - ai-gateway-provider", () => {
      expect(result).toEqual({ openaiCompatible: { reasoningEffort: "high" } })
    })
  })
