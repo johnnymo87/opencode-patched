@@ -163,7 +163,7 @@ which watches `anomalyco/opencode` releases directly.
 ### Build Process
 
 1. Clone upstream OpenCode at the release tag
-2. Apply the local patches in order: `gemini-empty-parts.patch`, `tool-fix.patch`, `cache-thinking-skip.patch`, `retry-cap.patch`, `vim.patch` (see `patches/apply.sh`)
+2. Apply the local patches in order: `gemini-empty-parts.patch`, `tool-fix.patch`, `cache-thinking-skip.patch`, `retry-cap.patch`, `vim.patch`, `sqlite-foreign-key-wrap.patch` (see `patches/apply.sh`)
 3. Build with Bun for 4 platforms (linux/darwin x arm64/x64)
 4. Publish release as `v{VERSION}-patched`
 
@@ -189,6 +189,7 @@ Each patch is owned by a specific repo. Do not edit a patch in the wrong repo.
 | `cache-thinking-skip.patch` | **this repo** (`patches/cache-thinking-skip.patch`) | Issue #17883 |
 | `retry-cap.patch` | **this repo** (`patches/retry-cap.patch`) | local / original, no upstream PR |
 | `vim.patch` | **this repo** (`patches/vim.patch`) | PR #12679 |
+| `sqlite-foreign-key-wrap.patch` | **this repo** (`patches/sqlite-foreign-key-wrap.patch`) | local / original, no upstream PR |
 
 When an upstream PR is merged, the corresponding patch can be dropped. (The big
 `caching.patch` formerly lived in the sibling repo `opencode-cached`; it was dropped

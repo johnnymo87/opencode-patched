@@ -1,0 +1,68 @@
+diff --git a/packages/core/src/session/projector.ts b/packages/core/src/session/projector.ts
+index caf63de78..26f08b83a 100644
+--- a/packages/core/src/session/projector.ts
++++ b/packages/core/src/session/projector.ts
+@@ -24,6 +24,33 @@ const encodeMessage = Schema.encodeSync(SessionMessage.Message)
+ class PromptAlreadyProjected extends Error {}
+ export class SessionAlreadyProjected extends Error {}
+ 
++function foreign(err: unknown): boolean {
++  if (typeof err !== "object" || err === null) return false
++  if ("code" in err && err.code === "SQLITE_CONSTRAINT_FOREIGNKEY") return true
++  if ("message" in err && typeof err.message === "string" && (
++    err.message.includes("FOREIGN KEY constraint failed") ||
++    err.message.includes("SQLITE_CONSTRAINT_FOREIGNKEY")
++  )) {
++    return true
++  }
++  if ("stack" in err && typeof err.stack === "string" && (
++    err.stack.includes("FOREIGN KEY constraint failed") ||
++    err.stack.includes("SQLITE_CONSTRAINT_FOREIGNKEY")
++  )) {
++    return true
++  }
++  if ("cause" in err && err.cause) {
++    if (foreign(err.cause)) return true
++  }
++  try {
++    const str = String(err)
++    if (str.includes("FOREIGN KEY constraint failed") || str.includes("SQLITE_CONSTRAINT_FOREIGNKEY")) {
++      return true
++    }
++  } catch (_) {}
++  return false
++}
++
+ type Usage = {
+   cost: number
+   tokens: {
+@@ -272,7 +299,13 @@ export const layer = Layer.effectDiscard(
+           .values({ id, session_id: sessionID, time_created, data })
+           .onConflictDoUpdate({ target: MessageTable.id, set: { data } })
+           .run()
+-          .pipe(Effect.orDie)
++          .pipe(
++            Effect.catch((err) => {
++              if (foreign(err)) return Effect.void
++              return Effect.fail(err)
++            }),
++            Effect.orDie,
++          )
+       }),
+     )
+     yield* events.project(SessionV1.Event.MessageRemoved, (event) =>
+@@ -323,7 +356,13 @@ export const layer = Layer.effectDiscard(
+           .values({ id, message_id: messageID, session_id: sessionID, time_created: event.data.time, data })
+           .onConflictDoUpdate({ target: PartTable.id, set: { data } })
+           .run()
+-          .pipe(Effect.orDie)
++          .pipe(
++            Effect.catch((err) => {
++              if (foreign(err)) return Effect.void
++              return Effect.fail(err)
++            }),
++            Effect.orDie,
++          )
+         const previous = row && usage(row.data)
+         const next = usage(event.data.part)
+         if (previous) yield* applyUsage(db, row.session_id, previous, -1)

@@ -231,13 +231,14 @@ jobs:
           body: |
             # OpenCode v${{ inputs.version }} with Local Patches
 
-            This release applies five patches to OpenCode v${{ inputs.version }}:
+            This release applies six patches to OpenCode v${{ inputs.version }}:
 
             1. **Gemini empty parts fix** from [PR #28669](https://github.com/anomalyco/opencode/pull/28669)
             2. **Tool use/result mismatch fix** from [PR #16751](https://github.com/anomalyco/opencode/pull/16751)
             3. **Cache thinking-skip** for [Issue #17883](https://github.com/anomalyco/opencode/issues/17883) -- when marking the conversation cache breakpoint, scan backwards to the last *cacheable* content block instead of `content[length-1]`, so `cache_control` never lands on a trailing reasoning/thinking block (which Anthropic rejects with HTTP 400).
             4. **Retry cap** (local) -- caps model-stream retries at `MAX_RETRIES = 8` and adds downward-only backoff jitter to prevent thundering herd conditions.
             5. **Vim keybindings** from [PR #12679](https://github.com/anomalyco/opencode/pull/12679)
+            6. **SQLite foreign key wrapping** (local) -- recursively inspects database exceptions to correctly capture nested constraint failures on modern effect-drizzle error structures.
 
             Note: As of 2026-06-02, the big **caching.patch** (formerly fetched from [opencode-cached](https://github.com/johnnymo87/opencode-cached), PR #5422) is DROPPED. Upstream `applyCaching` already implements the moving-tail conversation anchor (`non-system.slice(-2)`), making the fork patch redundant; the only behavior upstream lacked (skipping reasoning blocks at the cache breakpoint) is preserved as the small `cache-thinking-skip.patch` above. As of v1.15.10, the bus-eager-subscribe patch (PR #27959) and the bus instance-context fix (PR #28051) are DROPPED -- both are upstream-merged in v1.15.5+.
 

@@ -18,6 +18,8 @@
 #                                               one-liner became a multi-line .catch((error) => {...});
 #                                               the vimState.clearPending() insertion point before
 #                                               history.append was otherwise intact).
+#   6. sqlite-foreign-key-wrap.patch (local)  - catch nested/wrapped foreign key constraints
+#                                               on modern effect-drizzle error wrappers
 #
 # DROPPED on the v1.17 line (see workstation docs/plans/2026-06-11-opencode-1.17-cutover-runbook.md):
 #   - prompt-loop-cache.patch (#25367) + cache-aligned-compaction.patch (#25100):
@@ -76,6 +78,7 @@ PATCHES=(
   cache-thinking-skip
   retry-cap
   vim
+  sqlite-foreign-key-wrap
 )
 
 for name in "${PATCHES[@]}"; do
