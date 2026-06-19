@@ -20,6 +20,8 @@
 #                                               history.append was otherwise intact).
 #   6. sqlite-foreign-key-wrap.patch (local)  - catch nested/wrapped foreign key constraints
 #                                               on modern effect-drizzle error wrappers
+#   7. event-session-scope.patch (local)      - optional ?session_ids=a,b,c filter on GET /event
+#                                               (pool-of-K-serves per-session SSE; bead workstation-x8wi)
 #
 # DROPPED on the v1.17 line (see workstation docs/plans/2026-06-11-opencode-1.17-cutover-runbook.md):
 #   - prompt-loop-cache.patch (#25367) + cache-aligned-compaction.patch (#25100):
@@ -79,6 +81,7 @@ PATCHES=(
   retry-cap
   vim
   sqlite-foreign-key-wrap
+  event-session-scope
 )
 
 for name in "${PATCHES[@]}"; do

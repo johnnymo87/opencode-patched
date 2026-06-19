@@ -1,0 +1,148 @@
+diff --git a/packages/opencode/src/server/routes/instance/httpapi/handlers/event.ts b/packages/opencode/src/server/routes/instance/httpapi/handlers/event.ts
+index 4f24fbb4b..7186644ce 100644
+--- a/packages/opencode/src/server/routes/instance/httpapi/handlers/event.ts
++++ b/packages/opencode/src/server/routes/instance/httpapi/handlers/event.ts
+@@ -4,7 +4,7 @@ import { GlobalBus } from "@/bus/global"
+ import { EventV2 } from "@opencode-ai/core/event"
+ import { Effect, Queue } from "effect"
+ import * as Stream from "effect/Stream"
+-import { HttpServerResponse } from "effect/unstable/http"
++import { HttpServerRequest, HttpServerResponse } from "effect/unstable/http"
+ import { HttpApiBuilder } from "effect/unstable/httpapi"
+ import * as Sse from "effect/unstable/encoding/Sse"
+ import { EventApi } from "../groups/event"
+@@ -26,6 +26,21 @@ function eventResponse(events: EventV2.Interface) {
+   return Effect.gen(function* () {
+     const instance = yield* InstanceState.context
+     const workspaceID = yield* InstanceState.workspaceID
++    // Optional per-session filter (?session_ids=a,b,c). When present, only events
++    // whose session aggregate (event.data.sessionID) is in the set are forwarded;
++    // events without a string sessionID (server.*, lifecycle) always pass.
++    const searchParams = yield* HttpServerRequest.ParsedSearchParams
++    const sessionIdsRaw = searchParams["session_ids"]
++    const sessionIds =
++      sessionIdsRaw !== undefined
++        ? new Set(
++            (Array.isArray(sessionIdsRaw) ? sessionIdsRaw.join(",") : sessionIdsRaw)
++              .split(",")
++              .map((s) => s.trim())
++              .filter((s) => s.length > 0),
++          )
++        : undefined
++
+     // Listener registration is eager, so events published after this point cannot
+     // be lost while the HTTP body fiber is starting or emitting server.connected.
+     const queue = yield* Queue.unbounded<EventV2.Payload>()
+@@ -37,6 +52,12 @@ function eventResponse(events: EventV2.Interface) {
+           event.location?.directory === instance.directory &&
+           (event.location.workspaceID === undefined || event.location.workspaceID === workspaceID),
+       ),
++      Stream.filter((event) => {
++        if (sessionIds === undefined) return true
++        const sid = (event.data as Record<string, unknown> | undefined)?.["sessionID"]
++        if (typeof sid !== "string") return true // global / non-session event: always pass
++        return sessionIds.has(sid)
++      }),
+       Stream.map((event) => ({ id: event.id, type: event.type, properties: event.data })),
+     )
+     const disposed = Stream.callback<{ id: string; type: string; properties: unknown }>((queue) => {
+diff --git a/packages/opencode/test/server/httpapi-event.test.ts b/packages/opencode/test/server/httpapi-event.test.ts
+index 2b6be2ab6..456cf72d9 100644
+--- a/packages/opencode/test/server/httpapi-event.test.ts
++++ b/packages/opencode/test/server/httpapi-event.test.ts
+@@ -5,6 +5,17 @@ import { resetDatabase } from "../fixture/db"
+ import { disposeAllInstances, TestInstance } from "../fixture/fixture"
+ import { testEffect } from "../lib/effect"
+ import { httpApiLayer, requestInDirectory } from "./httpapi-layer"
++import { HttpClient, HttpClientRequest } from "effect/unstable/http"
++
++const requestInDirectoryWithSearch = (path: string, directory: string, init: RequestInit = {}) => {
++  const url = new URL(path, "http://localhost")
++  const headers = new Headers(init.headers)
++  headers.set("x-opencode-directory", directory)
++  return HttpClientRequest.fromWeb(new Request(url, { ...init, headers })).pipe(
++    HttpClientRequest.setUrl(url.pathname + url.search),
++    HttpClient.execute,
++  )
++}
+ 
+ const EventData = Schema.Struct({
+   id: Schema.optional(Schema.String),
+@@ -91,4 +102,77 @@ describe("event HttpApi", () => {
+       }),
+     { git: true, config: { formatter: false, lsp: false } },
+   )
++
++  const openSessionScopedStream = (directory: string, sessionIds: string[]) =>
++    Effect.gen(function* () {
++      const path = `${EventPaths.event}?session_ids=${encodeURIComponent(sessionIds.join(","))}`
++      const response = yield* requestInDirectoryWithSearch(path, directory)
++      const reader = yield* Queue.unbounded<Uint8Array>()
++      yield* response.stream.pipe(
++        Stream.runForEach((v) => Queue.offer(reader, v)),
++        Effect.forkScoped,
++      )
++      return { response, reader }
++    })
++
++  it.instance(
++    "filters out events for sessions not in session_ids, but delivers watched session events",
++    () =>
++      Effect.gen(function* () {
++        const { directory } = yield* TestInstance
++        const control = yield* openEventStream(directory)
++        expect(yield* readEvent(control.reader)).toMatchObject({ type: "server.connected" })
++        const createdWatched = yield* requestInDirectory("/session", directory, { method: "POST" })
++        expect(createdWatched.status).toBe(200)
++        const watched = (yield* createdWatched.json) as { id: string }
++        expect(yield* readEvent(control.reader)).toMatchObject({ type: "session.created" })
++        const scoped = yield* openSessionScopedStream(directory, [watched.id])
++        expect(yield* readEvent(scoped.reader)).toMatchObject({ type: "server.connected" })
++        const createdOther = yield* requestInDirectory("/session", directory, { method: "POST" })
++        expect(createdOther.status).toBe(200)
++        expect(yield* readEvent(control.reader)).toMatchObject({ type: "session.created" })
++        const status = yield* Queue.take(scoped.reader).pipe(
++          Effect.as("event" as const),
++          Effect.timeoutOrElse({ duration: "250 millis", orElse: () => Effect.succeed("silent" as const) }),
++        )
++        expect(status).toBe("silent")
++
++        const deleteWatched = yield* requestInDirectory(`/session/${watched.id}`, directory, { method: "DELETE" })
++        expect(deleteWatched.status).toBe(200)
++        expect(yield* readEvent(scoped.reader)).toMatchObject({
++          type: "session.deleted",
++          properties: { sessionID: watched.id },
++        })
++      }),
++    { git: true, config: { formatter: false, lsp: false } },
++  )
++
++  it.instance(
++    "blocks all session events if session_ids is present but empty",
++    () =>
++      Effect.gen(function* () {
++        const { directory } = yield* TestInstance
++        const scoped = yield* openSessionScopedStream(directory, [])
++        expect(yield* readEvent(scoped.reader)).toMatchObject({ type: "server.connected" })
++        const created = yield* requestInDirectory("/session", directory, { method: "POST" })
++        expect(created.status).toBe(200)
++        const status = yield* Queue.take(scoped.reader).pipe(
++          Effect.as("event" as const),
++          Effect.timeoutOrElse({ duration: "250 millis", orElse: () => Effect.succeed("silent" as const) }),
++        )
++        expect(status).toBe("silent")
++      }),
++    { git: true, config: { formatter: false, lsp: false } },
++  )
++
++  it.instance(
++    "still delivers global lifecycle events to a session-scoped stream",
++    () =>
++      Effect.gen(function* () {
++        const { directory } = yield* TestInstance
++        const { reader } = yield* openSessionScopedStream(directory, ["ses_nonexistent"])
++        expect(yield* readEvent(reader)).toMatchObject({ type: "server.connected", properties: {} })
++      }),
++    { git: true, config: { formatter: false, lsp: false } },
++  )
+ })
