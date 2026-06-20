@@ -1,0 +1,1952 @@
+diff --git a/packages/core/src/flag/flag.ts b/packages/core/src/flag/flag.ts
+index a0eb78a13..01b51ea1a 100644
+--- a/packages/core/src/flag/flag.ts
++++ b/packages/core/src/flag/flag.ts
+@@ -45,6 +45,8 @@ export const Flag = {
+   OPENCODE_MODELS_URL: process.env["OPENCODE_MODELS_URL"],
+   OPENCODE_MODELS_PATH: process.env["OPENCODE_MODELS_PATH"],
+   OPENCODE_DB: process.env["OPENCODE_DB"],
++  OPENCODE_ROUTING_DB: process.env["OPENCODE_ROUTING_DB"],
++  OPENCODE_SERVE_ID: process.env["OPENCODE_SERVE_ID"],
+ 
+   OPENCODE_WORKSPACE_ID: process.env["OPENCODE_WORKSPACE_ID"],
+   OPENCODE_EXPERIMENTAL_WORKSPACES: enabledByExperimental("OPENCODE_EXPERIMENTAL_WORKSPACES"),
+diff --git a/packages/core/src/serve/routing-lease.ts b/packages/core/src/serve/routing-lease.ts
+new file mode 100644
+index 000000000..92a91af61
+--- /dev/null
++++ b/packages/core/src/serve/routing-lease.ts
+@@ -0,0 +1,478 @@
++import { isAbsolute, join } from "node:path";
++import { Flag } from "../flag/flag";
++import { Global } from "../global";
++
++export const EXPECTED_SCHEMA_VERSION = 1;
++
++/**
++ * Expected SHA256 checksum of ROUTING_DDL.
++ * This is computed from the exact ROUTING_DDL template string in pigeon:
++ * /home/dev/projects/pigeon/packages/daemon/src/routing/route-schema.ts
++ */
++export const EXPECTED_DDL_CHECKSUM = "e5c8e4094735034be618553ee3594a26f20d06004902ed0da8f66dc25eef4a68";
++
++export class SchemaMismatchError extends Error {
++  constructor(message: string) {
++    super(message);
++    this.name = "SchemaMismatchError";
++  }
++}
++
++export interface LeaseToken {
++  sessionId: string;
++  serveId: string;
++  instanceUuid: string;
++  ownerGeneration: number;
++  binaryEpoch: number;
++}
++
++export interface AcquireResult {
++  ok: boolean;
++  token?: LeaseToken;
++  assignmentExists: boolean;
++}
++
++export interface RoutingLeaseDbAdapter {
++  acquire(options: {
++    sessionId: string;
++    serveId: string;
++    instanceUuid: string;
++    ttlMs: number;
++  }): Promise<AcquireResult>;
++
++  renew(token: LeaseToken, ttlMs: number): Promise<boolean>;
++
++  release(token: LeaseToken): Promise<boolean>;
++
++  readValid(sessionId: string, token: LeaseToken): Promise<boolean>;
++
++  registerSelf(options: {
++    serveId: string;
++    instanceUuid: string;
++    endpoint: string;
++  }): Promise<void>;
++
++  heartbeat(serveId: string): Promise<boolean>;
++
++  markDead(serveId: string): Promise<boolean>;
++
++  close(): Promise<void>;
++}
++
++/**
++ * Resolves the DB path from Flag.OPENCODE_ROUTING_DB.
++ * Matches absolute-vs-relative logic as Database.path() in packages/core/src/database/database.ts
++ */
++export function getRoutingDbPath(): string {
++  const dbVar = Flag.OPENCODE_ROUTING_DB;
++  if (!dbVar) {
++    throw new Error("OPENCODE_ROUTING_DB environment variable is not configured.");
++  }
++  if (dbVar === ":memory:" || isAbsolute(dbVar)) {
++    return dbVar;
++  }
++  return join(Global.Path.data, dbVar);
++}
++
++/**
++ * Utility helper to retry database operations on SQLITE_BUSY with jitter.
++ */
++async function withRetry<T>(fn: () => T, maxAttempts = 3): Promise<T> {
++  let attempt = 0;
++  while (true) {
++    try {
++      return fn();
++    } catch (error: any) {
++      attempt++;
++      const isBusy = error && (
++        error.code === "SQLITE_BUSY" || 
++        error.message?.includes("SQLITE_BUSY")
++      );
++      if (isBusy && attempt < maxAttempts) {
++        const delay = 50 + Math.random() * 100;
++        await new Promise((resolve) => setTimeout(resolve, delay));
++        continue;
++      }
++      throw error;
++    }
++  }
++}
++
++/**
++ * Maps standard camelCase parameters to both prefixed and non-prefixed styles
++ * to support both bun:sqlite and node:sqlite drivers seamlessly.
++ */
++function mapParams(params: Record<string, any>): Record<string, any> {
++  const mapped: Record<string, any> = {};
++  for (const [key, val] of Object.entries(params)) {
++    mapped[key] = val;
++    mapped[`@${key}`] = val;
++  }
++  return mapped;
++}
++
++/**
++ * Helper to build a unified database handle for both bun:sqlite and node:sqlite.
++ * This uses runtime detection + dynamic import of bun:sqlite / node:sqlite (rather than the
++ * repository's #sqlite Effect-layer subpath map) because we require a raw, named-parameter database
++ * handle rather than the standard Drizzle or Effect SQL clients.
++ * Note that the bun branch is the main production path (as opencode serve runs natively on Bun),
++ * while the node branch acts as a fallback.
++ */
++async function loadUnifiedDb(dbPath: string) {
++  const isBun = typeof process !== "undefined" && process.versions && process.versions.bun;
++
++  if (isBun) {
++    const { Database } = await import("bun:sqlite");
++    const nativeDb = new Database(dbPath);
++
++    return {
++      exec(sql: string) {
++        nativeDb.exec(sql);
++      },
++      prepare(sql: string) {
++        const stmt = nativeDb.prepare(sql);
++        return {
++          run(params?: Record<string, any>) {
++            const res = params ? stmt.run(mapParams(params)) : stmt.run();
++            return { changes: res.changes };
++          },
++          get(params?: Record<string, any>) {
++            const row = params ? stmt.get(mapParams(params)) : stmt.get();
++            return row === null ? undefined : row;
++          },
++          all(params?: Record<string, any>) {
++            return params ? stmt.all(mapParams(params)) : stmt.all();
++          }
++        };
++      },
++      close() {
++        nativeDb.close();
++      }
++    };
++  } else {
++    const { DatabaseSync } = await import("node:sqlite");
++    const nativeDb = new DatabaseSync(dbPath);
++
++    return {
++      exec(sql: string) {
++        nativeDb.exec(sql);
++      },
++      prepare(sql: string) {
++        const stmt = nativeDb.prepare(sql);
++        return {
++          run(params?: Record<string, any>) {
++            const res = params ? stmt.run(mapParams(params)) : stmt.run();
++            return { changes: res.changes };
++          },
++          get(params?: Record<string, any>) {
++            const row = params ? stmt.get(mapParams(params)) : stmt.get();
++            return row === null ? undefined : row;
++          },
++          all(params?: Record<string, any>) {
++            return params ? stmt.all(mapParams(params)) : stmt.all();
++          }
++        };
++      },
++      close() {
++        // node:sqlite DatabaseSync close is sync
++        nativeDb.close();
++      }
++    };
++  }
++}
++
++/**
++ * Connection opener that boots the routing DB and verifies the schema.
++ */
++export async function openRoutingLeaseDb(): Promise<RoutingLeaseDbAdapter> {
++  const dbPath = getRoutingDbPath();
++  const db = await loadUnifiedDb(dbPath);
++
++  try {
++    // Configure WAL and busy timeout on open
++    db.exec("PRAGMA journal_mode=WAL;");
++    db.exec("PRAGMA busy_timeout=2000;");
++
++    // Boot-assert schema check
++    let row: any;
++    try {
++      row = db.prepare("SELECT schema_version, ddl_checksum FROM routing_meta WHERE id = 1").get();
++    } catch (e: any) {
++      throw new SchemaMismatchError(`Failed to read routing_meta: ${e.message}`);
++    }
++
++    if (!row) {
++      throw new SchemaMismatchError("routing_meta singleton row (id=1) not found in routing database.");
++    }
++
++    if (row.schema_version !== EXPECTED_SCHEMA_VERSION || row.ddl_checksum !== EXPECTED_DDL_CHECKSUM) {
++      throw new SchemaMismatchError(
++        `Schema version or DDL checksum mismatch in routing database. ` +
++        `Expected version ${EXPECTED_SCHEMA_VERSION}, checksum ${EXPECTED_DDL_CHECKSUM}. ` +
++        `Got version ${row.schema_version}, checksum ${row.ddl_checksum}.`
++      );
++    }
++
++    // Pre-prepare our statements
++    const selectMetaStmt = db.prepare("SELECT binary_epoch FROM routing_meta WHERE id = 1");
++    const selectAssignmentStmt = db.prepare(
++      "SELECT owner_generation, desired_serve_id FROM session_assignment WHERE session_id = @sid"
++    );
++
++    const registerSelfStmt = db.prepare(
++      `INSERT INTO serve_instance
++         (serve_id, instance_uuid, endpoint, binary_epoch, health_state, heartbeat_at, draining)
++       VALUES (@serveId, @instanceUuid, @endpoint, @binaryEpoch, 'healthy', @heartbeatAt, 0)
++       ON CONFLICT(serve_id) DO UPDATE SET
++         instance_uuid = excluded.instance_uuid,
++         endpoint = excluded.endpoint,
++         binary_epoch = excluded.binary_epoch,
++         health_state = excluded.health_state,
++         heartbeat_at = excluded.heartbeat_at,
++         draining = excluded.draining`
++    );
++
++    const heartbeatStmt = db.prepare(
++      "UPDATE serve_instance SET heartbeat_at = @now, health_state = 'healthy' WHERE serve_id = @serveId"
++    );
++
++    const markDeadStmt = db.prepare(
++      "UPDATE serve_instance SET draining = 1 WHERE serve_id = @serveId"
++    );
++
++    const acquireCASStmt = db.prepare(
++      `INSERT INTO session_lease (session_id, serve_id, instance_uuid, owner_generation, lease_expires_at, heartbeat_at, binary_epoch)
++       SELECT @sid, @serve, @uuid, sa.owner_generation, @now + @ttlMs, @now, rm.binary_epoch
++       FROM session_assignment sa JOIN routing_meta rm ON rm.id = 1
++       WHERE sa.session_id=@sid AND sa.desired_serve_id=@serve AND sa.owner_generation=@gen AND rm.binary_epoch=@epoch
++       ON CONFLICT(session_id) DO UPDATE SET
++         serve_id=excluded.serve_id, instance_uuid=excluded.instance_uuid, owner_generation=excluded.owner_generation,
++         lease_expires_at=excluded.lease_expires_at, heartbeat_at=excluded.heartbeat_at, binary_epoch=excluded.binary_epoch
++       -- Re-validate the assignment+epoch invariant on conflict: the proposed (excluded.*) row
++       -- must still match the source-of-truth assignment and the current binary_epoch.
++       WHERE EXISTS (SELECT 1 FROM session_assignment sa JOIN routing_meta rm ON rm.id=1
++                     WHERE sa.session_id=excluded.session_id AND sa.desired_serve_id=excluded.serve_id
++                       AND sa.owner_generation=excluded.owner_generation AND rm.binary_epoch=excluded.binary_epoch)
++         -- Take-over ladder (only one branch need hold):
++         --   A: higher binary_epoch wins immediately (cutover; safe because M6 drains/stops old serves first).
++         AND ( session_lease.binary_epoch < excluded.binary_epoch
++               --   B: same epoch, higher generation wins (crash-reassignment).
++               OR (session_lease.binary_epoch = excluded.binary_epoch AND session_lease.owner_generation < excluded.owner_generation)
++               --   C: same epoch+generation, allowed only if the held lease has expired OR it's
++               --      the same owner (serve+instance) renewing its own lease (idempotent).
++               OR (session_lease.binary_epoch = excluded.binary_epoch AND session_lease.owner_generation = excluded.owner_generation
++                   AND (session_lease.lease_expires_at <= @now
++                        OR (session_lease.serve_id = excluded.serve_id AND session_lease.instance_uuid = excluded.instance_uuid))) )`
++    );
++
++    const renewCASStmt = db.prepare(
++      `UPDATE session_lease SET lease_expires_at=@now+@ttlMs, heartbeat_at=@now
++       WHERE session_id=@sid AND serve_id=@serve AND instance_uuid=@uuid AND owner_generation=@gen AND binary_epoch=@epoch
++         AND EXISTS (SELECT 1 FROM session_assignment sa JOIN routing_meta rm ON rm.id=1
++                     WHERE sa.session_id=@sid AND sa.desired_serve_id=@serve AND sa.owner_generation=@gen AND rm.binary_epoch=@epoch)`
++    );
++
++    const releaseStmt = db.prepare(
++      `DELETE FROM session_lease
++       WHERE session_id=@sid AND serve_id=@serve AND instance_uuid=@uuid AND owner_generation=@gen AND binary_epoch=@epoch`
++    );
++
++    const readValidStmt = db.prepare(
++      `SELECT 1 FROM session_lease sl
++       JOIN session_assignment sa ON sa.session_id = sl.session_id
++       JOIN routing_meta rm ON rm.id = 1
++       WHERE sl.session_id = @sid
++         AND sl.serve_id = @serve
++         AND sl.instance_uuid = @uuid
++         AND sl.owner_generation = @gen
++         AND sl.binary_epoch = @epoch
++         AND sl.lease_expires_at > @now
++         AND sl.owner_generation = sa.owner_generation
++         AND sl.serve_id = sa.desired_serve_id
++         AND sl.binary_epoch = rm.binary_epoch`
++    );
++
++    return {
++      async acquire(options) {
++        return withRetry(() => {
++          const now = Date.now();
++
++          // 2. Read owner_generation fresh from session_assignment
++          const assignmentRow: any = selectAssignmentStmt.get({ sid: options.sessionId });
++          const assignmentExists = !!assignmentRow && assignmentRow.desired_serve_id === options.serveId;
++
++          // 1. Read binary_epoch fresh from routing_meta
++          const metaRow: any = selectMetaStmt.get();
++          if (!metaRow) {
++            return { ok: false, assignmentExists };
++          }
++          const binaryEpoch = Number(metaRow.binary_epoch);
++
++          if (!assignmentRow) {
++            return { ok: false, assignmentExists };
++          }
++          const ownerGeneration = Number(assignmentRow.owner_generation);
++          const desiredServeId = assignmentRow.desired_serve_id;
++
++          // If the desired serve ID on assignment does not match our serveId, do not proceed.
++          if (desiredServeId !== options.serveId) {
++            return { ok: false, assignmentExists };
++          }
++
++          // 3. Execute acquireCAS statement
++          const params = {
++            sid: options.sessionId,
++            serve: options.serveId,
++            uuid: options.instanceUuid,
++            gen: ownerGeneration,
++            epoch: binaryEpoch,
++            now,
++            ttlMs: options.ttlMs,
++          };
++
++          const res = acquireCASStmt.run(params);
++          if (res.changes > 0) {
++            return {
++              ok: true,
++              assignmentExists,
++              token: {
++                sessionId: options.sessionId,
++                serveId: options.serveId,
++                instanceUuid: options.instanceUuid,
++                ownerGeneration,
++                binaryEpoch,
++              },
++            };
++          }
++
++          return { ok: false, assignmentExists };
++        });
++      },
++
++      async renew(token, ttlMs) {
++        return withRetry(() => {
++          const now = Date.now();
++          const params = {
++            sid: token.sessionId,
++            serve: token.serveId,
++            uuid: token.instanceUuid,
++            gen: token.ownerGeneration,
++            epoch: token.binaryEpoch,
++            now,
++            ttlMs,
++          };
++
++          const res = renewCASStmt.run(params);
++          return res.changes > 0;
++        });
++      },
++
++      async release(token) {
++        return withRetry(() => {
++          const params = {
++            sid: token.sessionId,
++            serve: token.serveId,
++            uuid: token.instanceUuid,
++            gen: token.ownerGeneration,
++            epoch: token.binaryEpoch,
++          };
++
++          const res = releaseStmt.run(params);
++          return res.changes > 0;
++        });
++      },
++
++      async readValid(sessionId, token) {
++        return withRetry(() => {
++          const now = Date.now();
++          const params = {
++            sid: sessionId,
++            serve: token.serveId,
++            uuid: token.instanceUuid,
++            gen: token.ownerGeneration,
++            epoch: token.binaryEpoch,
++            now,
++          };
++
++          const row = readValidStmt.get(params);
++          return row !== undefined;
++        });
++      },
++
++      async registerSelf(options) {
++        return withRetry(() => {
++          const now = Date.now();
++          const metaRow: any = selectMetaStmt.get();
++          if (!metaRow) {
++            throw new Error("routing_meta singleton row (id=1) not found in routing database.");
++          }
++          const binaryEpoch = Number(metaRow.binary_epoch);
++
++          const params = {
++            serveId: options.serveId,
++            instanceUuid: options.instanceUuid,
++            endpoint: options.endpoint,
++            binaryEpoch,
++            heartbeatAt: now,
++          };
++
++          registerSelfStmt.run(params);
++          setSelfIdentity({ serveId: options.serveId, instanceUuid: options.instanceUuid });
++        });
++      },
++
++      async heartbeat(serveId) {
++        return withRetry(() => {
++          const now = Date.now();
++          const res = heartbeatStmt.run({
++            now,
++            serveId,
++          });
++          return res.changes > 0;
++        });
++      },
++
++      async markDead(serveId) {
++        return withRetry(() => {
++          const res = markDeadStmt.run({
++            serveId,
++          });
++          return res.changes > 0;
++        });
++      },
++
++      async close() {
++        db.close();
++      },
++    };
++  } catch (error) {
++    try {
++      db.close();
++    } catch {}
++    throw error;
++  }
++}
++
++let sharedLeasePromise: Promise<RoutingLeaseDbAdapter> | null = null;
++let selfIdentity: { serveId: string; instanceUuid: string } | null = null;
++
++export function getSelfIdentity(): { serveId: string; instanceUuid: string } | null {
++  return selfIdentity;
++}
++
++export function setSelfIdentity(id: { serveId: string; instanceUuid: string } | null): void {
++  selfIdentity = id;
++}
++
++export async function getSharedRoutingLease(): Promise<RoutingLeaseDbAdapter> {
++  if (!sharedLeasePromise) {
++    sharedLeasePromise = openRoutingLeaseDb();
++  }
++  return sharedLeasePromise;
++}
++
++export function __resetSharedRoutingLease(): void {
++  sharedLeasePromise = null;
++  selfIdentity = null;
++}
+diff --git a/packages/core/test/serve/routing-lease.test.ts b/packages/core/test/serve/routing-lease.test.ts
+new file mode 100644
+index 000000000..0820da0b8
+--- /dev/null
++++ b/packages/core/test/serve/routing-lease.test.ts
+@@ -0,0 +1,636 @@
++import { describe, expect, test } from "bun:test";
++import path from "node:path";
++import { createHash } from "node:crypto";
++import { tmpdir } from "../fixture/tmpdir";
++import { openRoutingLeaseDb, SchemaMismatchError, getRoutingDbPath, EXPECTED_DDL_CHECKSUM, getSharedRoutingLease, __resetSharedRoutingLease, getSelfIdentity, setSelfIdentity } from "../../src/serve/routing-lease";
++import { Flag } from "../../src/flag/flag";
++
++const ROUTING_DDL = `
++  CREATE TABLE IF NOT EXISTS serve_instance (
++    serve_id       TEXT PRIMARY KEY,
++    instance_uuid  TEXT NOT NULL,
++    endpoint       TEXT NOT NULL,
++    binary_epoch   INTEGER NOT NULL DEFAULT 0,
++    health_state   TEXT NOT NULL DEFAULT 'unknown',  -- healthy | unhealthy | unknown
++    heartbeat_at   INTEGER NOT NULL,
++    draining       INTEGER NOT NULL DEFAULT 0
++  );
++
++  CREATE TABLE IF NOT EXISTS session_assignment (
++    session_id        TEXT PRIMARY KEY,
++    directory_key     TEXT,
++    desired_serve_id  TEXT NOT NULL,
++    owner_generation  INTEGER NOT NULL DEFAULT 1,
++    state             TEXT NOT NULL DEFAULT 'assigned', -- assigned|draining|dormant|migrating
++    last_active_at    INTEGER NOT NULL,
++    updated_at        INTEGER NOT NULL
++  );
++  CREATE INDEX IF NOT EXISTS idx_assignment_serve ON session_assignment(desired_serve_id, state);
++
++  CREATE TABLE IF NOT EXISTS session_lease (
++    session_id        TEXT PRIMARY KEY,
++    serve_id          TEXT NOT NULL,
++    instance_uuid     TEXT NOT NULL,
++    owner_generation  INTEGER NOT NULL,
++    lease_expires_at  INTEGER NOT NULL,
++    heartbeat_at      INTEGER NOT NULL,
++    binary_epoch      INTEGER NOT NULL DEFAULT 0
++  );
++  CREATE INDEX IF NOT EXISTS idx_lease_serve ON session_lease(serve_id);
++  CREATE INDEX IF NOT EXISTS idx_lease_expiry ON session_lease(lease_expires_at);
++
++  CREATE TABLE IF NOT EXISTS routing_meta (
++    id INTEGER PRIMARY KEY CHECK (id = 1),
++    schema_version INTEGER NOT NULL,
++    ddl_checksum   TEXT NOT NULL,
++    binary_epoch   INTEGER NOT NULL,
++    updated_at     INTEGER NOT NULL
++  );
++`;
++
++const TEST_DDL_CHECKSUM = createHash("sha256").update(ROUTING_DDL).digest("hex");
++
++function initDatabaseSchema(db: any) {
++  db.run(ROUTING_DDL);
++  db.run(
++    "INSERT OR IGNORE INTO routing_meta (id, schema_version, ddl_checksum, binary_epoch, updated_at) VALUES (1, 1, ?, 0, ?)",
++    [TEST_DDL_CHECKSUM, Date.now()]
++  );
++}
++
++describe("Routing Lease Adapter", () => {
++  test("1. acquire happy path", async () => {
++    await using tmp = await tmpdir();
++    const dbFile = path.join(tmp.path, "routing.db");
++    
++    // Set the env/flag to point to our temp DB
++    const originalFlag = Flag.OPENCODE_ROUTING_DB;
++    process.env.OPENCODE_ROUTING_DB = dbFile;
++    (Flag as any).OPENCODE_ROUTING_DB = dbFile;
++
++    try {
++      // First, create and seed schema
++      const { Database } = await import("bun:sqlite");
++      const seedDb = new Database(dbFile);
++      initDatabaseSchema(seedDb);
++
++      const now = Date.now();
++      const serveId = "serve-1";
++      const sessionId = "session-1";
++      const instanceUuid = "uuid-1";
++
++      // Seed serve_instance and session_assignment
++      seedDb.run(
++        "INSERT INTO serve_instance (serve_id, instance_uuid, endpoint, heartbeat_at) VALUES (?, ?, ?, ?)",
++        [serveId, instanceUuid, "http://localhost:1234", now]
++      );
++      seedDb.run(
++        "INSERT INTO session_assignment (session_id, desired_serve_id, owner_generation, state, last_active_at, updated_at) VALUES (?, ?, 1, 'assigned', ?, ?)",
++        [sessionId, serveId, now, now]
++      );
++      seedDb.close();
++
++      // Open via adapter
++      const adapter = await openRoutingLeaseDb();
++      const res = await adapter.acquire({
++        sessionId,
++        serveId,
++        instanceUuid,
++        ttlMs: 5000,
++      });
++
++      expect(res.ok).toBe(true);
++      expect(res.assignmentExists).toBe(true);
++      expect(res.token).toEqual({
++        sessionId,
++        serveId,
++        instanceUuid,
++        ownerGeneration: 1,
++        binaryEpoch: 0,
++      });
++
++      // Verify DB row exists with exact token fields
++      const verifyDb = new Database(dbFile);
++      const row = verifyDb.prepare("SELECT * FROM session_lease WHERE session_id = ?").get(sessionId) as any;
++      expect(row).toBeDefined();
++      expect(row.serve_id).toBe(serveId);
++      expect(row.instance_uuid).toBe(instanceUuid);
++      expect(row.owner_generation).toBe(1);
++      expect(row.binary_epoch).toBe(0);
++      expect(row.lease_expires_at).toBeGreaterThan(now + 4000);
++      verifyDb.close();
++      await adapter.close();
++    } finally {
++      process.env.OPENCODE_ROUTING_DB = originalFlag;
++      (Flag as any).OPENCODE_ROUTING_DB = originalFlag;
++    }
++  });
++
++  test("2. renew (full token) success, then fail-closed", async () => {
++    await using tmp = await tmpdir();
++    const dbFile = path.join(tmp.path, "routing.db");
++    
++    const originalFlag = Flag.OPENCODE_ROUTING_DB;
++    process.env.OPENCODE_ROUTING_DB = dbFile;
++    (Flag as any).OPENCODE_ROUTING_DB = dbFile;
++
++    try {
++      const { Database } = await import("bun:sqlite");
++      const seedDb = new Database(dbFile);
++      initDatabaseSchema(seedDb);
++
++      const now = Date.now();
++      const serveId = "serve-1";
++      const sessionId = "session-1";
++      const instanceUuid = "uuid-1";
++
++      seedDb.run(
++        "INSERT INTO session_assignment (session_id, desired_serve_id, owner_generation, state, last_active_at, updated_at) VALUES (?, ?, 1, 'assigned', ?, ?)",
++        [sessionId, serveId, now, now]
++      );
++      seedDb.close();
++
++      const adapter = await openRoutingLeaseDb();
++      const acq = await adapter.acquire({
++        sessionId,
++        serveId,
++        instanceUuid,
++        ttlMs: 5000,
++      });
++      expect(acq.ok).toBe(true);
++      const token = acq.token!;
++
++      // Renew should succeed
++      const ren = await adapter.renew(token, 5000);
++      expect(ren).toBe(true);
++
++      // Simulate bumpEpoch on routing_meta (0 -> 1)
++      const modifyDb = new Database(dbFile);
++      modifyDb.run("UPDATE routing_meta SET binary_epoch = 1 WHERE id = 1");
++      modifyDb.close();
++
++      // Renew with old token should now fail
++      const renFailed = await adapter.renew(token, 5000);
++      expect(renFailed).toBe(false);
++
++      await adapter.close();
++    } finally {
++      process.env.OPENCODE_ROUTING_DB = originalFlag;
++      (Flag as any).OPENCODE_ROUTING_DB = originalFlag;
++    }
++  });
++
++  test("3. release (full token)", async () => {
++    await using tmp = await tmpdir();
++    const dbFile = path.join(tmp.path, "routing.db");
++    
++    const originalFlag = Flag.OPENCODE_ROUTING_DB;
++    process.env.OPENCODE_ROUTING_DB = dbFile;
++    (Flag as any).OPENCODE_ROUTING_DB = dbFile;
++
++    try {
++      const { Database } = await import("bun:sqlite");
++      const seedDb = new Database(dbFile);
++      initDatabaseSchema(seedDb);
++
++      const now = Date.now();
++      const serveId = "serve-1";
++      const sessionId = "session-1";
++      const instanceUuid = "uuid-1";
++
++      seedDb.run(
++        "INSERT INTO session_assignment (session_id, desired_serve_id, owner_generation, state, last_active_at, updated_at) VALUES (?, ?, 1, 'assigned', ?, ?)",
++        [sessionId, serveId, now, now]
++      );
++      seedDb.close();
++
++      const adapter = await openRoutingLeaseDb();
++      const acq = await adapter.acquire({
++        sessionId,
++        serveId,
++        instanceUuid,
++        ttlMs: 5000,
++      });
++      expect(acq.ok).toBe(true);
++      const token = acq.token!;
++
++      // Release with wrong token (e.g., wrong generation)
++      const wrongToken = { ...token, ownerGeneration: 99 };
++      const relWrong = await adapter.release(wrongToken);
++      expect(relWrong).toBe(false);
++
++      // Verify row is still there
++      const verifyDb = new Database(dbFile);
++      let row = verifyDb.prepare("SELECT * FROM session_lease WHERE session_id = ?").get(sessionId);
++      expect(row).toBeDefined();
++
++      // Release with correct token
++      const relCorrect = await adapter.release(token);
++      expect(relCorrect).toBe(true);
++
++      // Verify row is gone
++      row = verifyDb.prepare("SELECT * FROM session_lease WHERE session_id = ?").get(sessionId);
++      expect(row).toBeNull();
++
++      verifyDb.close();
++      await adapter.close();
++    } finally {
++      process.env.OPENCODE_ROUTING_DB = originalFlag;
++      (Flag as any).OPENCODE_ROUTING_DB = originalFlag;
++    }
++  });
++
++  test("4. boot-assert fail-closed", async () => {
++    await using tmp = await tmpdir();
++    const dbFile = path.join(tmp.path, "routing.db");
++    
++    const originalFlag = Flag.OPENCODE_ROUTING_DB;
++    process.env.OPENCODE_ROUTING_DB = dbFile;
++    (Flag as any).OPENCODE_ROUTING_DB = dbFile;
++
++    try {
++      const { Database } = await import("bun:sqlite");
++      const seedDb = new Database(dbFile);
++      seedDb.run(ROUTING_DDL);
++      // Tamper with ddl_checksum
++      seedDb.run(
++        "INSERT OR IGNORE INTO routing_meta (id, schema_version, ddl_checksum, binary_epoch, updated_at) VALUES (1, 1, ?, 0, ?)",
++        ["TAMPERED_CHECKSUM", Date.now()]
++      );
++      seedDb.close();
++
++      // Opening against a tampered DB should throw SchemaMismatchError
++      expect(openRoutingLeaseDb()).rejects.toThrow(SchemaMismatchError);
++    } finally {
++      process.env.OPENCODE_ROUTING_DB = originalFlag;
++      (Flag as any).OPENCODE_ROUTING_DB = originalFlag;
++    }
++  });
++
++  test("5. gated/absent", async () => {
++    await using tmp = await tmpdir();
++    const dbFile = path.join(tmp.path, "routing.db");
++    
++    const originalFlag = Flag.OPENCODE_ROUTING_DB;
++    process.env.OPENCODE_ROUTING_DB = dbFile;
++    (Flag as any).OPENCODE_ROUTING_DB = dbFile;
++
++    try {
++      const { Database } = await import("bun:sqlite");
++      const seedDb = new Database(dbFile);
++      initDatabaseSchema(seedDb);
++      seedDb.close();
++
++      const adapter = await openRoutingLeaseDb();
++      // Call acquire against a session with NO assignment in DB
++      const res = await adapter.acquire({
++        sessionId: "session-no-assignment",
++        serveId: "serve-1",
++        instanceUuid: "uuid-1",
++        ttlMs: 5000,
++      });
++
++      expect(res.ok).toBe(false);
++      expect(res.assignmentExists).toBe(false);
++      expect(res.token).toBeUndefined();
++
++      // Verify no lease row was written
++      const verifyDb = new Database(dbFile);
++      const row = verifyDb.prepare("SELECT * FROM session_lease WHERE session_id = ?").get("session-no-assignment");
++      expect(row).toBeNull();
++      verifyDb.close();
++      await adapter.close();
++    } finally {
++      process.env.OPENCODE_ROUTING_DB = originalFlag;
++      (Flag as any).OPENCODE_ROUTING_DB = originalFlag;
++    }
++  });
++
++  test("6. readValid", async () => {
++    await using tmp = await tmpdir();
++    const dbFile = path.join(tmp.path, "routing.db");
++    
++    const originalFlag = Flag.OPENCODE_ROUTING_DB;
++    process.env.OPENCODE_ROUTING_DB = dbFile;
++    (Flag as any).OPENCODE_ROUTING_DB = dbFile;
++
++    try {
++      const { Database } = await import("bun:sqlite");
++      const seedDb = new Database(dbFile);
++      initDatabaseSchema(seedDb);
++
++      const now = Date.now();
++      const serveId = "serve-1";
++      const sessionId = "session-1";
++      const instanceUuid = "uuid-1";
++
++      seedDb.run(
++        "INSERT INTO session_assignment (session_id, desired_serve_id, owner_generation, state, last_active_at, updated_at) VALUES (?, ?, 1, 'assigned', ?, ?)",
++        [sessionId, serveId, now, now]
++      );
++      seedDb.close();
++
++      const adapter = await openRoutingLeaseDb();
++      const acq = await adapter.acquire({
++        sessionId,
++        serveId,
++        instanceUuid,
++        ttlMs: 5000,
++      });
++      expect(acq.ok).toBe(true);
++      const token = acq.token!;
++
++      // readValid with correct token should be true
++      const valid = await adapter.readValid(sessionId, token);
++      expect(valid).toBe(true);
++
++      // readValid with expired lease (simulate by updating lease_expires_at to the past)
++      const modifyDb = new Database(dbFile);
++      modifyDb.run("UPDATE session_lease SET lease_expires_at = ? WHERE session_id = ?", [now - 1000, sessionId]);
++      modifyDb.close();
++
++      const validExpired = await adapter.readValid(sessionId, token);
++      expect(validExpired).toBe(false);
++
++      await adapter.close();
++    } finally {
++      process.env.OPENCODE_ROUTING_DB = originalFlag;
++      (Flag as any).OPENCODE_ROUTING_DB = originalFlag;
++    }
++  });
++
++  test("7. getRoutingDbPath path resolution", () => {
++    const originalFlag = Flag.OPENCODE_ROUTING_DB;
++    try {
++      // 7a. Error if unconfigured
++      process.env.OPENCODE_ROUTING_DB = "";
++      (Flag as any).OPENCODE_ROUTING_DB = "";
++      expect(() => getRoutingDbPath()).toThrow("OPENCODE_ROUTING_DB environment variable is not configured.");
++
++      // 7b. Memory
++      process.env.OPENCODE_ROUTING_DB = ":memory:";
++      (Flag as any).OPENCODE_ROUTING_DB = ":memory:";
++      expect(getRoutingDbPath()).toBe(":memory:");
++
++      // 7c. Absolute path
++      const absPath = "/var/lib/opencode/routing.db";
++      process.env.OPENCODE_ROUTING_DB = absPath;
++      (Flag as any).OPENCODE_ROUTING_DB = absPath;
++      expect(getRoutingDbPath()).toBe(absPath);
++
++      // 7d. Relative path
++      const relPath = "routing.db";
++      process.env.OPENCODE_ROUTING_DB = relPath;
++      (Flag as any).OPENCODE_ROUTING_DB = relPath;
++      const resolved = getRoutingDbPath();
++      expect(resolved.endsWith(path.join("opencode", "routing.db"))).toBe(true);
++    } finally {
++      process.env.OPENCODE_ROUTING_DB = originalFlag;
++      (Flag as any).OPENCODE_ROUTING_DB = originalFlag;
++    }
++  });
++
++  test("8. ROUTING_DDL checksum matches module constant", () => {
++    expect(TEST_DDL_CHECKSUM).toBe(EXPECTED_DDL_CHECKSUM);
++  });
++
++  test("9. registerSelf inserts or updates row with fresh binary_epoch", async () => {
++    await using tmp = await tmpdir();
++    const dbFile = path.join(tmp.path, "routing.db");
++    
++    const originalFlag = Flag.OPENCODE_ROUTING_DB;
++    process.env.OPENCODE_ROUTING_DB = dbFile;
++    (Flag as any).OPENCODE_ROUTING_DB = dbFile;
++
++    try {
++      const { Database } = await import("bun:sqlite");
++      const seedDb = new Database(dbFile);
++      initDatabaseSchema(seedDb);
++      seedDb.run("UPDATE routing_meta SET binary_epoch = 42 WHERE id = 1");
++      seedDb.close();
++
++      const adapter = await openRoutingLeaseDb();
++      const serveId = "serve-test-9";
++      const instanceUuid = "uuid-test-9";
++      const endpoint = "http://127.0.0.1:8080";
++
++      await adapter.registerSelf({ serveId, instanceUuid, endpoint });
++
++      // Verify DB row
++      const verifyDb = new Database(dbFile);
++      const row = verifyDb.prepare("SELECT * FROM serve_instance WHERE serve_id = ?").get(serveId) as any;
++      expect(row).toBeDefined();
++      expect(row.serve_id).toBe(serveId);
++      expect(row.instance_uuid).toBe(instanceUuid);
++      expect(row.endpoint).toBe(endpoint);
++      expect(row.binary_epoch).toBe(42);
++      expect(row.health_state).toBe("healthy");
++      expect(row.draining).toBe(0);
++      expect(row.heartbeat_at).toBeGreaterThan(0);
++      verifyDb.close();
++
++      await adapter.close();
++    } finally {
++      process.env.OPENCODE_ROUTING_DB = originalFlag;
++      (Flag as any).OPENCODE_ROUTING_DB = originalFlag;
++    }
++  });
++
++  test("10. heartbeat updates heartbeat_at and sets health_state='healthy'", async () => {
++    await using tmp = await tmpdir();
++    const dbFile = path.join(tmp.path, "routing.db");
++    
++    const originalFlag = Flag.OPENCODE_ROUTING_DB;
++    process.env.OPENCODE_ROUTING_DB = dbFile;
++    (Flag as any).OPENCODE_ROUTING_DB = dbFile;
++
++    try {
++      const { Database } = await import("bun:sqlite");
++      const seedDb = new Database(dbFile);
++      initDatabaseSchema(seedDb);
++      seedDb.close();
++
++      const adapter = await openRoutingLeaseDb();
++      const serveId = "serve-test-10";
++      const instanceUuid = "uuid-test-10";
++      const endpoint = "http://127.0.0.1:8080";
++
++      await adapter.registerSelf({ serveId, instanceUuid, endpoint });
++
++      // Update heartbeat_at to the past, and health_state to unknown
++      const modifyDb = new Database(dbFile);
++      modifyDb.run("UPDATE serve_instance SET heartbeat_at = 100, health_state = 'unknown' WHERE serve_id = ?", [serveId]);
++      modifyDb.close();
++
++      const res = await adapter.heartbeat(serveId);
++      expect(res).toBe(true);
++
++      // Verify row
++      const verifyDb = new Database(dbFile);
++      const row = verifyDb.prepare("SELECT * FROM serve_instance WHERE serve_id = ?").get(serveId) as any;
++      expect(row).toBeDefined();
++      expect(row.heartbeat_at).toBeGreaterThan(100);
++      expect(row.health_state).toBe("healthy");
++      verifyDb.close();
++
++      await adapter.close();
++    } finally {
++      process.env.OPENCODE_ROUTING_DB = originalFlag;
++      (Flag as any).OPENCODE_ROUTING_DB = originalFlag;
++    }
++  });
++
++  test("11. markDead sets draining=1", async () => {
++    await using tmp = await tmpdir();
++    const dbFile = path.join(tmp.path, "routing.db");
++    
++    const originalFlag = Flag.OPENCODE_ROUTING_DB;
++    process.env.OPENCODE_ROUTING_DB = dbFile;
++    (Flag as any).OPENCODE_ROUTING_DB = dbFile;
++
++    try {
++      const { Database } = await import("bun:sqlite");
++      const seedDb = new Database(dbFile);
++      initDatabaseSchema(seedDb);
++      seedDb.close();
++
++      const adapter = await openRoutingLeaseDb();
++      const serveId = "serve-test-11";
++      const instanceUuid = "uuid-test-11";
++      const endpoint = "http://127.0.0.1:8080";
++
++      await adapter.registerSelf({ serveId, instanceUuid, endpoint });
++
++      const res = await adapter.markDead(serveId);
++      expect(res).toBe(true);
++
++      // Verify row
++      const verifyDb = new Database(dbFile);
++      const row = verifyDb.prepare("SELECT * FROM serve_instance WHERE serve_id = ?").get(serveId) as any;
++      expect(row).toBeDefined();
++      expect(row.draining).toBe(1);
++      verifyDb.close();
++
++      await adapter.close();
++    } finally {
++      process.env.OPENCODE_ROUTING_DB = originalFlag;
++      (Flag as any).OPENCODE_ROUTING_DB = originalFlag;
++    }
++  });
++
++  test("12. getSharedRoutingLease returns same instance and respects __resetSharedRoutingLease", async () => {
++    await using tmp = await tmpdir();
++    const dbFile = path.join(tmp.path, "routing.db");
++    
++    const originalFlag = Flag.OPENCODE_ROUTING_DB;
++    process.env.OPENCODE_ROUTING_DB = dbFile;
++    (Flag as any).OPENCODE_ROUTING_DB = dbFile;
++
++    try {
++      const { Database } = await import("bun:sqlite");
++      const seedDb = new Database(dbFile);
++      initDatabaseSchema(seedDb);
++      seedDb.close();
++
++      __resetSharedRoutingLease();
++      const lease1 = await getSharedRoutingLease();
++      const lease2 = await getSharedRoutingLease();
++      expect(lease1).toBe(lease2);
++
++      __resetSharedRoutingLease();
++      const lease3 = await getSharedRoutingLease();
++      expect(lease3).not.toBe(lease1);
++
++      await lease1.close();
++      await lease3.close();
++    } finally {
++      process.env.OPENCODE_ROUTING_DB = originalFlag;
++      (Flag as any).OPENCODE_ROUTING_DB = originalFlag;
++      __resetSharedRoutingLease();
++    }
++  });
++
++  test("13. acquire fails but assignment exists", async () => {
++    await using tmp = await tmpdir();
++    const dbFile = path.join(tmp.path, "routing.db");
++    
++    const originalFlag = Flag.OPENCODE_ROUTING_DB;
++    process.env.OPENCODE_ROUTING_DB = dbFile;
++    (Flag as any).OPENCODE_ROUTING_DB = dbFile;
++
++    try {
++      const { Database } = await import("bun:sqlite");
++      const seedDb = new Database(dbFile);
++      initDatabaseSchema(seedDb);
++
++      const now = Date.now();
++      const serveId = "serve-1";
++      const sessionId = "session-1";
++      const instanceUuid = "uuid-1";
++
++      // Seed session_assignment
++      seedDb.run(
++        "INSERT INTO session_assignment (session_id, desired_serve_id, owner_generation, state, last_active_at, updated_at) VALUES (?, ?, 1, 'assigned', ?, ?)",
++        [sessionId, serveId, now, now]
++      );
++      
++      // Seed a session_lease owned by ANOTHER instanceUuid on the same epoch + generation
++      seedDb.run(
++        "INSERT INTO session_lease (session_id, serve_id, instance_uuid, owner_generation, lease_expires_at, heartbeat_at, binary_epoch) VALUES (?, ?, ?, 1, ?, ?, 0)",
++        [sessionId, serveId, "uuid-other", now + 10000, now]
++      );
++      seedDb.close();
++
++      const adapter = await openRoutingLeaseDb();
++      // Try to acquire the lease. Since it is held by "uuid-other" and hasn't expired, it should fail.
++      const res = await adapter.acquire({
++        sessionId,
++        serveId,
++        instanceUuid,
++        ttlMs: 5000,
++      });
++
++      expect(res.ok).toBe(false);
++      expect(res.assignmentExists).toBe(true); // Assigned to us, but held by someone else!
++      expect(res.token).toBeUndefined();
++
++      await adapter.close();
++    } finally {
++      process.env.OPENCODE_ROUTING_DB = originalFlag;
++      (Flag as any).OPENCODE_ROUTING_DB = originalFlag;
++    }
++  });
++
++  test("14. self identity storage and __resetSharedRoutingLease", async () => {
++    expect(getSelfIdentity()).toBeNull();
++    setSelfIdentity({ serveId: "foo", instanceUuid: "bar" });
++    expect(getSelfIdentity()).toEqual({ serveId: "foo", instanceUuid: "bar" });
++    
++    __resetSharedRoutingLease();
++    expect(getSelfIdentity()).toBeNull();
++
++    await using tmp = await tmpdir();
++    const dbFile = path.join(tmp.path, "routing.db");
++    
++    const originalFlag = Flag.OPENCODE_ROUTING_DB;
++    process.env.OPENCODE_ROUTING_DB = dbFile;
++    (Flag as any).OPENCODE_ROUTING_DB = dbFile;
++
++    try {
++      const { Database } = await import("bun:sqlite");
++      const seedDb = new Database(dbFile);
++      initDatabaseSchema(seedDb);
++      seedDb.close();
++
++      const adapter = await openRoutingLeaseDb();
++      await adapter.registerSelf({ serveId: "s1", instanceUuid: "u1", endpoint: "ep" });
++      expect(getSelfIdentity()).toEqual({ serveId: "s1", instanceUuid: "u1" });
++
++      await adapter.close();
++    } finally {
++      process.env.OPENCODE_ROUTING_DB = originalFlag;
++      (Flag as any).OPENCODE_ROUTING_DB = originalFlag;
++      __resetSharedRoutingLease();
++    }
++  });
++});
+diff --git a/packages/opencode/src/cli/cmd/serve.ts b/packages/opencode/src/cli/cmd/serve.ts
+index c0f62b3ca..4bc8c36ec 100644
+--- a/packages/opencode/src/cli/cmd/serve.ts
++++ b/packages/opencode/src/cli/cmd/serve.ts
+@@ -1,4 +1,6 @@
+-import { Effect } from "effect"
++import { Effect, Schedule, Deferred } from "effect"
++import { randomUUID } from "node:crypto"
++import { getSharedRoutingLease } from "@opencode-ai/core/serve/routing-lease"
+ import { effectCmd } from "../effect-cmd"
+ import { withNetworkOptions, resolveNetworkOptions } from "../network"
+ import { Flag } from "@opencode-ai/core/flag/flag"
+@@ -19,6 +21,44 @@ export const ServeCommand = effectCmd({
+     const server = yield* Effect.promise(() => Server.listen(opts))
+     console.log(`opencode server listening on http://${server.hostname}:${server.port}`)
+ 
+-    yield* Effect.never
++    if (Flag.OPENCODE_ROUTING_DB && Flag.OPENCODE_SERVE_ID) {
++      const serveId = Flag.OPENCODE_SERVE_ID
++      const instanceUuid = randomUUID()
++      const endpoint = `http://127.0.0.1:${server.port}`
++      const lease = yield* Effect.promise(() => getSharedRoutingLease())
++      yield* Effect.promise(() => lease.registerSelf({ serveId, instanceUuid, endpoint }))
++      
++      yield* Effect.scoped(
++        Effect.gen(function* () {
++          yield* Effect.promise(() => lease.heartbeat(serveId)).pipe(
++            Effect.ignore,
++            Effect.repeat(Schedule.spaced("5 seconds")),
++            Effect.forkScoped
++          )
++          yield* Effect.addFinalizer(() =>
++            Effect.promise(() => lease.markDead(serveId)).pipe(Effect.ignore)
++          )
++          
++          const sigtermDeferred = yield* Deferred.make<void>()
++          const sigtermHandler = () => {
++            Effect.runSync(Deferred.succeed(sigtermDeferred, undefined))
++          }
++          process.once("SIGTERM", sigtermHandler)
++          process.once("SIGINT", sigtermHandler)
++
++          try {
++            yield* Deferred.await(sigtermDeferred)
++          } finally {
++            process.off("SIGTERM", sigtermHandler)
++            process.off("SIGINT", sigtermHandler)
++          }
++        })
++      )
++    } else {
++      if (Flag.OPENCODE_ROUTING_DB) {
++        console.log("routing DB set but OPENCODE_SERVE_ID missing -> skipping self-registration")
++      }
++      yield* Effect.never
++    }
+   }),
+ })
+diff --git a/packages/opencode/src/session/prompt.ts b/packages/opencode/src/session/prompt.ts
+index b3f85c813..8d76e8924 100644
+--- a/packages/opencode/src/session/prompt.ts
++++ b/packages/opencode/src/session/prompt.ts
+@@ -42,13 +42,15 @@ import { Truncate } from "@/tool/truncate"
+ import { Image } from "@/image/image"
+ import { decodeDataUrl } from "@/util/data-url"
+ import { Process } from "@/util/process"
+-import { Cause, Effect, Exit, Latch, Layer, Option, Scope, Context, Schema, Types } from "effect"
++import { Cause, Effect, Exit, Latch, Layer, Option, Scope, Context, Schema, Types, Deferred, Schedule, Ref } from "effect"
+ import { InstanceState } from "@/effect/instance-state"
+ import { TaskTool, type TaskPromptOps } from "@/tool/task"
+ import { SessionRunState } from "./run-state"
+ import { RuntimeFlags } from "@/effect/runtime-flags"
+ import { EventV2Bridge } from "@/event-v2-bridge"
+ import { Database } from "@opencode-ai/core/database/database"
++import { Flag } from "@opencode-ai/core/flag/flag"
++import { getSharedRoutingLease, getSelfIdentity } from "@opencode-ai/core/serve/routing-lease"
+ import { SessionEvent } from "@opencode-ai/core/session/event"
+ import { SessionMessage } from "@opencode-ai/core/session/message"
+ import { ModelV2 } from "@opencode-ai/core/model"
+@@ -83,6 +85,25 @@ function isOrphanedInterruptedTool(part: SessionV1.ToolPart) {
+   return part.state.status === "error" && part.state.metadata?.interrupted === true
+ }
+ 
++export interface LeaseGuardState {
++  validUntil: number
++  lost: boolean
++}
++
++export function leaseDeadlineExceeded(
++  state: LeaseGuardState | null,
++  now: number,
++  marginMs: number
++): boolean {
++  if (state === null) return false
++  if (state.lost) return true
++  return now >= state.validUntil - marginMs
++}
++
++export const leaseGuardStates = new Map<SessionID, Ref.Ref<LeaseGuardState>>()
++
++
++
+ export interface Interface {
+   readonly cancel: (sessionID: SessionID) => Effect.Effect<void>
+   readonly prompt: (input: PromptInput) => Effect.Effect<SessionV1.WithParts, Image.Error>
+@@ -1131,6 +1152,17 @@ export const layer = Layer.effect(
+       throw new Error("Impossible")
+     })
+ 
++    const checkLeaseDeadline = (sessionID: SessionID) => {
++      return Effect.gen(function* () {
++        const ref = leaseGuardStates.get(sessionID)
++        if (!ref) return
++        const s = yield* Ref.get(ref)
++        if (leaseDeadlineExceeded(s, Date.now(), 5000)) {
++          yield* Effect.die(new Error(`session lease deadline exceeded for ${sessionID}`))
++        }
++      })
++    }
++
+     const runLoop: (sessionID: SessionID) => Effect.Effect<SessionV1.WithParts> = Effect.fn("SessionPrompt.run")(
+       function* (sessionID: SessionID) {
+         const ctx = yield* InstanceState.context
+@@ -1139,6 +1171,7 @@ export const layer = Layer.effect(
+         const session = yield* sessions.get(sessionID).pipe(Effect.orDie)
+ 
+         while (true) {
++          yield* checkLeaseDeadline(sessionID)
+           yield* status.set(sessionID, { type: "busy" })
+           yield* Effect.logInfo("loop", { "session.id": sessionID, step })
+ 
+@@ -1401,10 +1434,65 @@ export const layer = Layer.effect(
+       },
+     )
+ 
++    const withSessionLease = (sessionID: SessionID, work: Effect.Effect<SessionV1.WithParts>): Effect.Effect<SessionV1.WithParts> => {
++      return Effect.scoped(Effect.gen(function* () {
++        if (!Flag.OPENCODE_ROUTING_DB) return yield* work          // routing OFF: transparent passthrough (byte-identical to today)
++        const identity = getSelfIdentity()
++        if (!identity) {
++          yield* Effect.logWarning(`Routing lease DB is configured, but serve identity is not registered. Failing open for session ${sessionID}.`)
++          return yield* work
++        }        // serve didn't self-register: D2a fail-open
++        const lease = yield* Effect.promise(() => getSharedRoutingLease())
++        const TTL = 30_000
++        const acq = yield* Effect.promise(() => lease.acquire({ sessionId: sessionID, serveId: identity.serveId, instanceUuid: identity.instanceUuid, ttlMs: TTL }))
++        if (!acq.ok) {
++          if (acq.assignmentExists) {
++            return yield* Effect.die(new Error(`session lease held by another instance for assigned session ${sessionID}`))  // FAIL-CLOSED
++          }
++          yield* Effect.logWarning(`No assignment found for session ${sessionID}. Failing open.`)
++          return yield* work                                         // no assignment → D2a fail-open (log once)
++        }
++        const token = acq.token!
++
++        // Create the shared state Ref
++        const guardStateRef = yield* Ref.make<LeaseGuardState>({ validUntil: Date.now() + TTL, lost: false })
++        leaseGuardStates.set(sessionID, guardStateRef)
++        yield* Effect.addFinalizer(() => Effect.sync(() => {
++          leaseGuardStates.delete(sessionID)
++        }))
++
++        yield* Effect.addFinalizer(() => Effect.promise(() => lease.release(token)).pipe(Effect.ignore))   // fenced release on success/cancel/interrupt
++        const leaseLost = yield* Deferred.make<void>()
++        // renewal fiber, scoped (interrupted before release):
++        yield* Effect.promise(() => lease.renew(token, TTL).catch(() => false)).pipe(
++          Effect.flatMap((ok) => {
++            if (ok) {
++              return Ref.set(guardStateRef, { validUntil: Date.now() + TTL, lost: false })
++            } else {
++              return Ref.set(guardStateRef, { validUntil: 0, lost: true }).pipe(
++                Effect.andThen(Deferred.succeed(leaseLost, undefined))
++              )
++            }
++          }),
++          Effect.repeat(Schedule.spaced("10 seconds")),   // TTL/3
++          Effect.forkScoped,
++        )
++        // fail-closed if the lease is lost mid-run: race the work against the lost signal
++        return yield* Effect.raceFirst(
++          work,
++          Deferred.await(leaseLost).pipe(Effect.andThen(Effect.die(new Error(`session lease lost mid-run for ${sessionID}`)))),
++        )
++      }))
++    }
++
+     const loop: (input: LoopInput) => Effect.Effect<SessionV1.WithParts> = Effect.fn("SessionPrompt.loop")(function* (
+       input: LoopInput,
+     ) {
+-      return yield* state.ensureRunning(input.sessionID, lastAssistant(input.sessionID), runLoop(input.sessionID))
++      return yield* state.ensureRunning(
++        input.sessionID,
++        lastAssistant(input.sessionID),
++        withSessionLease(input.sessionID, runLoop(input.sessionID)),
++      )
+     })
+ 
+     const shell: (input: ShellInput) => Effect.Effect<SessionV1.WithParts, Session.BusyError> = Effect.fn(
+diff --git a/packages/opencode/test/cli/serve/serve-process.test.ts b/packages/opencode/test/cli/serve/serve-process.test.ts
+index 6dbea372b..70c72cdd0 100644
+--- a/packages/opencode/test/cli/serve/serve-process.test.ts
++++ b/packages/opencode/test/cli/serve/serve-process.test.ts
+@@ -9,6 +9,54 @@ import { describe, expect } from "bun:test"
+ import { Effect } from "effect"
+ import { HttpClient } from "effect/unstable/http"
+ import { cliIt } from "../../lib/cli-process"
++import { createHash } from "node:crypto"
++import path from "node:path"
++import { Database } from "bun:sqlite"
++import { tmpdir } from "../../fixture/fixture"
++import { EXPECTED_DDL_CHECKSUM } from "@opencode-ai/core/serve/routing-lease"
++
++const ROUTING_DDL = `
++  CREATE TABLE IF NOT EXISTS serve_instance (
++    serve_id       TEXT PRIMARY KEY,
++    instance_uuid  TEXT NOT NULL,
++    endpoint       TEXT NOT NULL,
++    binary_epoch   INTEGER NOT NULL DEFAULT 0,
++    health_state   TEXT NOT NULL DEFAULT 'unknown',  -- healthy | unhealthy | unknown
++    heartbeat_at   INTEGER NOT NULL,
++    draining       INTEGER NOT NULL DEFAULT 0
++  );
++
++  CREATE TABLE IF NOT EXISTS session_assignment (
++    session_id        TEXT PRIMARY KEY,
++    directory_key     TEXT,
++    desired_serve_id  TEXT NOT NULL,
++    owner_generation  INTEGER NOT NULL DEFAULT 1,
++    state             TEXT NOT NULL DEFAULT 'assigned', -- assigned|draining|dormant|migrating
++    last_active_at    INTEGER NOT NULL,
++    updated_at        INTEGER NOT NULL
++  );
++  CREATE INDEX IF NOT EXISTS idx_assignment_serve ON session_assignment(desired_serve_id, state);
++
++  CREATE TABLE IF NOT EXISTS session_lease (
++    session_id        TEXT PRIMARY KEY,
++    serve_id          TEXT NOT NULL,
++    instance_uuid     TEXT NOT NULL,
++    owner_generation  INTEGER NOT NULL,
++    lease_expires_at  INTEGER NOT NULL,
++    heartbeat_at      INTEGER NOT NULL,
++    binary_epoch      INTEGER NOT NULL DEFAULT 0
++  );
++  CREATE INDEX IF NOT EXISTS idx_lease_serve ON session_lease(serve_id);
++  CREATE INDEX IF NOT EXISTS idx_lease_expiry ON session_lease(lease_expires_at);
++
++  CREATE TABLE IF NOT EXISTS routing_meta (
++    id INTEGER PRIMARY KEY CHECK (id = 1),
++    schema_version INTEGER NOT NULL,
++    ddl_checksum   TEXT NOT NULL,
++    binary_epoch   INTEGER NOT NULL,
++    updated_at     INTEGER NOT NULL
++  );
++`;
+ 
+ describe("opencode serve (subprocess)", () => {
+   // Smoke test: server starts, binds a port, and /global/health responds.
+@@ -58,4 +106,80 @@ describe("opencode serve (subprocess)", () => {
+       }),
+     60_000,
+   )
++
++  cliIt.live(
++    "registers itself in routing DB and marks itself draining on shutdown",
++    ({ opencode }) =>
++      Effect.gen(function* () {
++        // Create a temp routing DB
++        const tmp = yield* Effect.promise(() => tmpdir())
++        yield* Effect.addFinalizer(() => Effect.promise(() => tmp[Symbol.asyncDispose]()))
++        const dbFile = path.join(tmp.path, "routing.db")
++
++        // Seed schema and routing_meta row with valid checksum
++        const seedDb = new Database(dbFile)
++        seedDb.exec("PRAGMA journal_mode=WAL;")
++        seedDb.run(ROUTING_DDL)
++        seedDb.run(
++          "INSERT OR IGNORE INTO routing_meta (id, schema_version, ddl_checksum, binary_epoch, updated_at) VALUES (1, 1, ?, 0, ?)",
++          [EXPECTED_DDL_CHECKSUM, Date.now()]
++        )
++        seedDb.close()
++
++        const serveId = "serve-test-1"
++
++        // Spawn with env pointing to the routing DB and having a serve ID
++        const server = yield* opencode.serve({
++          env: {
++            OPENCODE_ROUTING_DB: dbFile,
++            OPENCODE_SERVE_ID: serveId,
++          },
++        })
++
++        expect(server.port).toBeGreaterThan(0)
++
++        // After it's ready, poll/retry routing DB until the registration row exists
++        let rowBefore: any = null
++        for (let i = 0; i < 30; i++) {
++          const verifyDbBefore = new Database(dbFile)
++          verifyDbBefore.exec("PRAGMA busy_timeout=3000;")
++          rowBefore = verifyDbBefore.prepare("SELECT * FROM serve_instance WHERE serve_id = ?").get(serveId) as any
++          verifyDbBefore.close()
++
++          if (rowBefore) {
++            break
++          }
++          yield* Effect.sleep("100 millis")
++        }
++
++        expect(rowBefore).toBeDefined()
++        expect(rowBefore.serve_id).toBe(serveId)
++        expect(rowBefore.health_state).toBe("healthy")
++        expect(rowBefore.draining).toBe(0)
++        expect(rowBefore.instance_uuid).toBeTruthy()
++        expect(rowBefore.endpoint).toBe(`http://127.0.0.1:${server.port}`)
++
++        // Trigger scope close of opencode.serve by killing the handle and awaiting exit
++        server.kill()
++        yield* Effect.promise(() => server.exited)
++
++        // Poll/retry database for up to 3 seconds to let finalizer flush markDead
++        let rowAfter: any = null
++        for (let i = 0; i < 30; i++) {
++          const verifyDbAfter = new Database(dbFile)
++          verifyDbAfter.exec("PRAGMA busy_timeout=3000;")
++          rowAfter = verifyDbAfter.prepare("SELECT * FROM serve_instance WHERE serve_id = ?").get(serveId) as any
++          verifyDbAfter.close()
++
++          if (rowAfter && rowAfter.draining === 1) {
++            break
++          }
++          yield* Effect.sleep("100 millis")
++        }
++
++        expect(rowAfter).toBeDefined()
++        expect(rowAfter.draining).toBe(1)
++      }),
++    60_000,
++  )
+ })
+diff --git a/packages/opencode/test/session/prompt.test.ts b/packages/opencode/test/session/prompt.test.ts
+index 08828018a..bcef4216f 100644
+--- a/packages/opencode/test/session/prompt.test.ts
++++ b/packages/opencode/test/session/prompt.test.ts
+@@ -1,12 +1,15 @@
+ import { NodeFileSystem } from "@effect/platform-node"
++import { Flag } from "@opencode-ai/core/flag/flag"
++import { setSelfIdentity, __resetSharedRoutingLease } from "@opencode-ai/core/serve/routing-lease"
++import os from "os"
+ import { ConfigV1 } from "@opencode-ai/core/v1/config/config"
+ import { SessionV1 } from "@opencode-ai/core/v1/session"
+ import { Database } from "@opencode-ai/core/database/database"
+ import { eq } from "drizzle-orm"
+ import { EventV2Bridge } from "@/event-v2-bridge"
+ import { FetchHttpClient } from "effect/unstable/http"
+-import { expect } from "bun:test"
+-import { Cause, Deferred, Duration, Effect, Exit, Fiber, Layer } from "effect"
++import { expect, describe, it as bunIt } from "bun:test"
++import { Cause, Deferred, Duration, Effect, Exit, Fiber, Layer, Ref } from "effect"
+ import path from "path"
+ import { fileURLToPath, pathToFileURL } from "url"
+ import { NamedError } from "@opencode-ai/core/util/error"
+@@ -34,7 +37,7 @@ import { SessionCompaction } from "../../src/session/compaction"
+ import { SessionSummary } from "../../src/session/summary"
+ import { Instruction } from "../../src/session/instruction"
+ import { SessionProcessor } from "../../src/session/processor"
+-import { SessionPrompt } from "../../src/session/prompt"
++import { SessionPrompt, leaseDeadlineExceeded, leaseGuardStates } from "../../src/session/prompt"
+ import { SessionRevert } from "../../src/session/revert"
+ import { SessionRunState } from "../../src/session/run-state"
+ import { MessageID, PartID, SessionID } from "../../src/session/schema"
+@@ -2324,3 +2327,443 @@ noLLMServer.instance(
+     }),
+   30_000,
+ )
++
++const ROUTING_DDL = `
++  CREATE TABLE IF NOT EXISTS serve_instance (
++    serve_id       TEXT PRIMARY KEY,
++    instance_uuid  TEXT NOT NULL,
++    endpoint       TEXT NOT NULL,
++    binary_epoch   INTEGER NOT NULL DEFAULT 0,
++    health_state   TEXT NOT NULL DEFAULT 'unknown',
++    heartbeat_at   INTEGER NOT NULL,
++    draining       INTEGER NOT NULL DEFAULT 0
++  );
++
++  CREATE TABLE IF NOT EXISTS session_assignment (
++    session_id        TEXT PRIMARY KEY,
++    directory_key     TEXT,
++    desired_serve_id  TEXT NOT NULL,
++    owner_generation  INTEGER NOT NULL DEFAULT 1,
++    state             TEXT NOT NULL DEFAULT 'assigned',
++    last_active_at    INTEGER NOT NULL,
++    updated_at        INTEGER NOT NULL
++  );
++
++  CREATE TABLE IF NOT EXISTS session_lease (
++    session_id        TEXT PRIMARY KEY,
++    serve_id          TEXT NOT NULL,
++    instance_uuid     TEXT NOT NULL,
++    owner_generation  INTEGER NOT NULL,
++    lease_expires_at  INTEGER NOT NULL,
++    heartbeat_at      INTEGER NOT NULL,
++    binary_epoch      INTEGER NOT NULL DEFAULT 0
++  );
++
++  CREATE TABLE IF NOT EXISTS routing_meta (
++    id INTEGER PRIMARY KEY CHECK (id = 1),
++    schema_version INTEGER NOT NULL,
++    ddl_checksum   TEXT NOT NULL,
++    binary_epoch   INTEGER NOT NULL,
++    updated_at     INTEGER NOT NULL
++  );
++`
++
++const TEST_DDL_CHECKSUM = "e5c8e4094735034be618553ee3594a26f20d06004902ed0da8f66dc25eef4a68"
++
++it.instance(
++  "leased run: lease acquired during prompt run and released after completion",
++  () =>
++    Effect.gen(function* () {
++      const { llm } = yield* useServerConfig((url) => providerCfg(url))
++      const prompt = yield* SessionPrompt.Service
++      const sessions = yield* Session.Service
++      const chat = yield* sessions.create({})
++
++      const tempDbPath = path.join(os.tmpdir(), "routing-prompt-test-" + Math.random().toString(36).slice(2) + ".db")
++      const { Database } = require("bun:sqlite")
++      const db = new Database(tempDbPath)
++      db.run(ROUTING_DDL)
++      db.run(
++        "INSERT OR IGNORE INTO routing_meta (id, schema_version, ddl_checksum, binary_epoch, updated_at) VALUES (1, 1, ?, 0, ?)",
++        [TEST_DDL_CHECKSUM, Date.now()]
++      )
++
++      const serveId = "serve-test"
++      const instanceUuid = "uuid-test"
++      const now = Date.now()
++      db.run(
++        "INSERT INTO serve_instance (serve_id, instance_uuid, endpoint, heartbeat_at) VALUES (?, ?, ?, ?)",
++        [serveId, instanceUuid, "http://localhost:1234", now]
++      )
++      db.run(
++        "INSERT INTO session_assignment (session_id, desired_serve_id, owner_generation, state, last_active_at, updated_at) VALUES (?, ?, 1, 'assigned', ?, ?)",
++        [chat.id, serveId, now, now]
++      )
++      db.close()
++
++      const originalFlag = Flag.OPENCODE_ROUTING_DB
++      process.env.OPENCODE_ROUTING_DB = tempDbPath
++      ;(Flag as any).OPENCODE_ROUTING_DB = tempDbPath
++      setSelfIdentity({ serveId, instanceUuid })
++
++      try {
++        const { promise: waitPromise, resolve: resolveWait } = defer<void>()
++        // Hold LLM server response to keep run in-flight
++        yield* llm.hold("done", waitPromise)
++
++        yield* user(chat.id, "hello")
++        const runFiber = yield* prompt.loop({ sessionID: chat.id }).pipe(Effect.forkChild)
++
++        // Poll until the lease row is written
++        const leaseRow = yield* pollWithTimeout(
++          Effect.sync(() => {
++            const verifyDb = new Database(tempDbPath)
++            const row = verifyDb.prepare("SELECT * FROM session_lease WHERE session_id = ?").get(chat.id) as any
++            verifyDb.close()
++            return row || undefined
++          }),
++          "lease row was never written to routing database",
++          "5 seconds"
++        )
++
++        expect(leaseRow).toBeDefined()
++        expect(leaseRow.serve_id).toBe(serveId)
++        expect(leaseRow.instance_uuid).toBe(instanceUuid)
++
++        // Let LLM response complete
++        resolveWait()
++
++        // Wait for the prompt loop run to finish
++        const result = yield* Fiber.join(runFiber)
++        expect(result.info.role).toBe("assistant")
++
++        // Verify lease row is now GONE (released on finalizer)
++        const verifyDb = new Database(tempDbPath)
++        const rowAfter = verifyDb.prepare("SELECT * FROM session_lease WHERE session_id = ?").get(chat.id)
++        verifyDb.close()
++        expect(rowAfter).toBeNull()
++
++      } finally {
++        process.env.OPENCODE_ROUTING_DB = originalFlag
++        ;(Flag as any).OPENCODE_ROUTING_DB = originalFlag
++        __resetSharedRoutingLease()
++        const fs = require("fs")
++        try { fs.unlinkSync(tempDbPath) } catch {}
++      }
++    }),
++  30_000,
++)
++
++it.instance(
++  "D2a no-assignment: routing on but no assignment for session allows run to complete normally (fail-open)",
++  () =>
++    Effect.gen(function* () {
++      const { llm } = yield* useServerConfig((url) => providerCfg(url))
++      const prompt = yield* SessionPrompt.Service
++      const sessions = yield* Session.Service
++      const chat = yield* sessions.create({})
++
++      const tempDbPath = path.join(os.tmpdir(), "routing-prompt-test-" + Math.random().toString(36).slice(2) + ".db")
++      const { Database } = require("bun:sqlite")
++      const db = new Database(tempDbPath)
++      db.run(ROUTING_DDL)
++      db.run(
++        "INSERT OR IGNORE INTO routing_meta (id, schema_version, ddl_checksum, binary_epoch, updated_at) VALUES (1, 1, ?, 0, ?)",
++        [TEST_DDL_CHECKSUM, Date.now()]
++      )
++
++      const serveId = "serve-test"
++      const instanceUuid = "uuid-test"
++      const now = Date.now()
++      db.run(
++        "INSERT INTO serve_instance (serve_id, instance_uuid, endpoint, heartbeat_at) VALUES (?, ?, ?, ?)",
++        [serveId, instanceUuid, "http://localhost:1234", now]
++      )
++      // NOTE: NO session_assignment row seeded!
++      db.close()
++
++      const originalFlag = Flag.OPENCODE_ROUTING_DB
++      process.env.OPENCODE_ROUTING_DB = tempDbPath
++      ;(Flag as any).OPENCODE_ROUTING_DB = tempDbPath
++      setSelfIdentity({ serveId, instanceUuid })
++
++      try {
++        yield* llm.text("done")
++
++        yield* user(chat.id, "hello")
++        const result = yield* prompt.loop({ sessionID: chat.id })
++        expect(result.info.role).toBe("assistant")
++
++        // Verify NO lease row was written
++        const verifyDb = new Database(tempDbPath)
++        const row = verifyDb.prepare("SELECT * FROM session_lease WHERE session_id = ?").get(chat.id)
++        verifyDb.close()
++        expect(row).toBeNull()
++
++      } finally {
++        process.env.OPENCODE_ROUTING_DB = originalFlag
++        ;(Flag as any).OPENCODE_ROUTING_DB = originalFlag
++        __resetSharedRoutingLease()
++        const fs = require("fs")
++        try { fs.unlinkSync(tempDbPath) } catch {}
++      }
++    }),
++  30_000,
++)
++
++it.instance(
++  "leased run: fail-closed if session is assigned to us but lease cannot be acquired",
++  () =>
++    Effect.gen(function* () {
++      const { llm } = yield* useServerConfig((url) => providerCfg(url))
++      const prompt = yield* SessionPrompt.Service
++      const sessions = yield* Session.Service
++      const chat = yield* sessions.create({})
++
++      const tempDbPath = path.join(os.tmpdir(), "routing-prompt-test-" + Math.random().toString(36).slice(2) + ".db")
++      const { Database } = require("bun:sqlite")
++      const db = new Database(tempDbPath)
++      db.run(ROUTING_DDL)
++      db.run(
++        "INSERT OR IGNORE INTO routing_meta (id, schema_version, ddl_checksum, binary_epoch, updated_at) VALUES (1, 1, ?, 0, ?)",
++        [TEST_DDL_CHECKSUM, Date.now()]
++      )
++
++      const serveId = "serve-test"
++      const instanceUuid = "uuid-test"
++      const now = Date.now()
++      db.run(
++        "INSERT INTO serve_instance (serve_id, instance_uuid, endpoint, heartbeat_at) VALUES (?, ?, ?, ?)",
++        [serveId, instanceUuid, "http://localhost:1234", now]
++      )
++      db.run(
++        "INSERT INTO session_assignment (session_id, desired_serve_id, owner_generation, state, last_active_at, updated_at) VALUES (?, ?, 1, 'assigned', ?, ?)",
++        [chat.id, serveId, now, now]
++      )
++      // INSERT a lease held by ANOTHER instanceUuid so we cannot acquire it
++      db.run(
++        "INSERT INTO session_lease (session_id, serve_id, instance_uuid, owner_generation, lease_expires_at, heartbeat_at, binary_epoch) VALUES (?, ?, 'uuid-other', 1, ?, ?, 0)",
++        [chat.id, serveId, now + 10000, now]
++      )
++      db.close()
++
++      const originalFlag = Flag.OPENCODE_ROUTING_DB
++      process.env.OPENCODE_ROUTING_DB = tempDbPath
++      ;(Flag as any).OPENCODE_ROUTING_DB = tempDbPath
++      setSelfIdentity({ serveId, instanceUuid })
++
++      try {
++        yield* user(chat.id, "hello")
++        const exit = yield* prompt.loop({ sessionID: chat.id }).pipe(Effect.exit)
++
++        expect(Exit.isFailure(exit)).toBe(true)
++        if (Exit.isFailure(exit)) {
++          const error = Cause.squash(exit.cause) as any
++          expect(error.message).toContain("session lease held by another instance for assigned session")
++        }
++
++      } finally {
++        process.env.OPENCODE_ROUTING_DB = originalFlag
++        ;(Flag as any).OPENCODE_ROUTING_DB = originalFlag
++        __resetSharedRoutingLease()
++        const fs = require("fs")
++        try { fs.unlinkSync(tempDbPath) } catch {}
++      }
++    }),
++  30_000,
++)
++
++it.instance(
++  "leased run: fail-closed if lease is lost mid-run",
++  () =>
++    Effect.gen(function* () {
++      const { llm } = yield* useServerConfig((url) => providerCfg(url))
++      const prompt = yield* SessionPrompt.Service
++      const sessions = yield* Session.Service
++      const chat = yield* sessions.create({})
++
++      const tempDbPath = path.join(os.tmpdir(), "routing-prompt-test-" + Math.random().toString(36).slice(2) + ".db")
++      const { Database } = require("bun:sqlite")
++      const db = new Database(tempDbPath)
++      db.run(ROUTING_DDL)
++      db.run(
++        "INSERT OR IGNORE INTO routing_meta (id, schema_version, ddl_checksum, binary_epoch, updated_at) VALUES (1, 1, ?, 0, ?)",
++        [TEST_DDL_CHECKSUM, Date.now()]
++      )
++
++      const serveId = "serve-test"
++      const instanceUuid = "uuid-test"
++      const now = Date.now()
++      db.run(
++        "INSERT INTO serve_instance (serve_id, instance_uuid, endpoint, heartbeat_at) VALUES (?, ?, ?, ?)",
++        [serveId, instanceUuid, "http://localhost:1234", now]
++      )
++      db.run(
++        "INSERT INTO session_assignment (session_id, desired_serve_id, owner_generation, state, last_active_at, updated_at) VALUES (?, ?, 1, 'assigned', ?, ?)",
++        [chat.id, serveId, now, now]
++      )
++      db.close()
++
++      const originalFlag = Flag.OPENCODE_ROUTING_DB
++      process.env.OPENCODE_ROUTING_DB = tempDbPath
++      ;(Flag as any).OPENCODE_ROUTING_DB = tempDbPath
++      setSelfIdentity({ serveId, instanceUuid })
++
++      try {
++        const { promise: waitPromise, resolve: resolveWait } = defer<void>()
++        yield* llm.hold("done", waitPromise)
++
++        yield* user(chat.id, "hello")
++        const runFiber = yield* prompt.loop({ sessionID: chat.id }).pipe(Effect.forkChild)
++
++        // Wait until lease is acquired
++        yield* pollWithTimeout(
++          Effect.sync(() => {
++            const verifyDb = new Database(tempDbPath)
++            const row = verifyDb.prepare("SELECT * FROM session_lease WHERE session_id = ?").get(chat.id)
++            verifyDb.close()
++            return row || undefined
++          }),
++          "lease row was never written to routing database",
++          "5 seconds"
++        )
++
++        // Simulate ownership loss by bumping owner_generation on session_assignment (making renewal fail)
++        const modifyDb = new Database(tempDbPath)
++        modifyDb.run("UPDATE session_assignment SET owner_generation = 2 WHERE session_id = ?", [chat.id])
++        modifyDb.close()
++
++        // Wait for renewal fiber to fail-closed (> 10s renewal interval)
++        yield* Effect.sleep("11 seconds")
++
++        const exit = yield* Fiber.join(runFiber).pipe(Effect.exit)
++        expect(Exit.isFailure(exit)).toBe(true)
++        if (Exit.isFailure(exit)) {
++          const error = Cause.squash(exit.cause) as any
++          expect(error.message).toContain("session lease lost mid-run")
++        }
++
++        resolveWait()
++      } finally {
++        process.env.OPENCODE_ROUTING_DB = originalFlag
++        ;(Flag as any).OPENCODE_ROUTING_DB = originalFlag
++        __resetSharedRoutingLease()
++        const fs = require("fs")
++        try { fs.unlinkSync(tempDbPath) } catch {}
++      }
++    }),
++  30_000,
++)
++
++describe("leaseDeadlineExceeded", () => {
++  bunIt("should return false if state is null (routing off / no lease)", () => {
++    expect(leaseDeadlineExceeded(null, Date.now(), 5000)).toBe(false)
++  })
++
++  bunIt("should return true if state.lost is true", () => {
++    expect(leaseDeadlineExceeded({ validUntil: Date.now() + 10000, lost: true }, Date.now(), 5000)).toBe(true)
++  })
++
++  bunIt("should return true if now is past validUntil - margin", () => {
++    const validUntil = Date.now() + 4000
++    expect(leaseDeadlineExceeded({ validUntil, lost: false }, Date.now(), 5000)).toBe(true)
++  })
++
++  bunIt("should return true if now is exactly at validUntil - margin", () => {
++    const validUntil = Date.now() + 5000
++    expect(leaseDeadlineExceeded({ validUntil, lost: false }, Date.now(), 5000)).toBe(true)
++  })
++
++  bunIt("should return false if now is well before validUntil - margin", () => {
++    const validUntil = Date.now() + 10000
++    expect(leaseDeadlineExceeded({ validUntil, lost: false }, Date.now(), 5000)).toBe(false)
++  })
++
++})
++
++it.instance(
++  "leased run: guard terminates run loop if lease deadline is exceeded",
++  () =>
++    Effect.gen(function* () {
++      const { llm } = yield* useServerConfig((url) => providerCfg(url))
++      const prompt = yield* SessionPrompt.Service
++      const sessions = yield* Session.Service
++      const chat = yield* sessions.create({
++        permission: [{ permission: "*", pattern: "*", action: "allow" }],
++      })
++
++      const tempDbPath = path.join(os.tmpdir(), "routing-prompt-test-" + Math.random().toString(36).slice(2) + ".db")
++      const { Database } = require("bun:sqlite")
++      const db = new Database(tempDbPath)
++      db.run(ROUTING_DDL)
++      db.run(
++        "INSERT OR IGNORE INTO routing_meta (id, schema_version, ddl_checksum, binary_epoch, updated_at) VALUES (1, 1, ?, 0, ?)",
++        [TEST_DDL_CHECKSUM, Date.now()]
++      )
++
++      const serveId = "serve-test"
++      const instanceUuid = "uuid-test"
++      const now = Date.now()
++      db.run(
++        "INSERT INTO serve_instance (serve_id, instance_uuid, endpoint, heartbeat_at) VALUES (?, ?, ?, ?)",
++        [serveId, instanceUuid, "http://localhost:1234", now]
++      )
++      db.run(
++        "INSERT INTO session_assignment (session_id, desired_serve_id, owner_generation, state, last_active_at, updated_at) VALUES (?, ?, 1, 'assigned', ?, ?)",
++        [chat.id, serveId, now, now]
++      )
++      db.close()
++
++      const originalFlag = Flag.OPENCODE_ROUTING_DB
++      process.env.OPENCODE_ROUTING_DB = tempDbPath
++      ;(Flag as any).OPENCODE_ROUTING_DB = tempDbPath
++      setSelfIdentity({ serveId, instanceUuid })
++
++      try {
++        yield* llm.tool("first", { value: "first" })
++        const { promise: waitPromise, resolve: resolveWait } = defer<void>()
++        yield* llm.hold("second", waitPromise)
++
++        yield* user(chat.id, "hello")
++        const runFiber = yield* prompt.loop({ sessionID: chat.id }).pipe(Effect.forkChild)
++
++        // Wait until lease is acquired
++        yield* pollWithTimeout(
++          Effect.sync(() => {
++            const verifyDb = new Database(tempDbPath)
++            const row = verifyDb.prepare("SELECT * FROM session_lease WHERE session_id = ?").get(chat.id)
++            verifyDb.close()
++            return row || undefined
++          }),
++          "lease row was never written to routing database",
++          "5 seconds"
++        )
++
++        // Locate our in-memory Ref and artificially set it to expired (validUntil is past, lost: false)
++        const ref = leaseGuardStates.get(chat.id)
++        expect(ref).toBeDefined()
++        if (ref) {
++          yield* Ref.set(ref, { validUntil: Date.now() - 10000, lost: false })
++        }
++
++        // Complete the LLM server response hold. The run loop will proceed to the top of the next iteration
++        resolveWait()
++
++        const exit = yield* Fiber.join(runFiber).pipe(Effect.exit)
++        expect(Exit.isFailure(exit)).toBe(true)
++        if (Exit.isFailure(exit)) {
++          const error = Cause.squash(exit.cause) as any
++          expect(error.message).toContain("session lease deadline exceeded for")
++        }
++
++      } finally {
++        process.env.OPENCODE_ROUTING_DB = originalFlag
++        ;(Flag as any).OPENCODE_ROUTING_DB = originalFlag
++        __resetSharedRoutingLease()
++        const fs = require("fs")
++        try { fs.unlinkSync(tempDbPath) } catch {}
++      }
++    }),
++  30_000,
++)
++

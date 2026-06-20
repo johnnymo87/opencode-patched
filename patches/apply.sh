@@ -26,6 +26,15 @@
 #                                               publishing Created, returning the durable canonical
 #                                               row (fails loud on a lost write) instead of the
 #                                               in-memory Info (bead workstation-p196; mn9r M3)
+#   9. serve-lease.patch          (local)      - serve-side session-lease participation (mn9r M4):
+#                                               OPENCODE_ROUTING_DB/OPENCODE_SERVE_ID flags +
+#                                               packages/core/src/serve/routing-lease.ts adapter
+#                                               (fenced lease CAS against pigeon-daemon.db),
+#                                               serve.ts self-registration + self-heartbeat (D1a),
+#                                               and a fenced acquire/renew/release wrap + per-iteration
+#                                               deadline guard around the agent run loop (D2a). Whole
+#                                               feature is gated on OPENCODE_ROUTING_DB; unset = no-op
+#                                               (bead workstation-mn9r).
 #
 # DROPPED on the v1.17 line (see workstation docs/plans/2026-06-11-opencode-1.17-cutover-runbook.md):
 #   - prompt-loop-cache.patch (#25367) + cache-aligned-compaction.patch (#25100):
@@ -87,6 +96,7 @@ PATCHES=(
   sqlite-foreign-key-wrap
   event-session-scope
   createnext-readback
+  serve-lease
 )
 
 for name in "${PATCHES[@]}"; do
