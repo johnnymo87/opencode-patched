@@ -22,6 +22,10 @@
 #                                               on modern effect-drizzle error wrappers
 #   7. event-session-scope.patch (local)      - optional ?session_ids=a,b,c filter on GET /event
 #                                               (pool-of-K-serves per-session SSE; bead workstation-x8wi)
+#   8. createnext-readback.patch (local)      - Session.createNext reads the row back after
+#                                               publishing Created, returning the durable canonical
+#                                               row (fails loud on a lost write) instead of the
+#                                               in-memory Info (bead workstation-p196; mn9r M3)
 #
 # DROPPED on the v1.17 line (see workstation docs/plans/2026-06-11-opencode-1.17-cutover-runbook.md):
 #   - prompt-loop-cache.patch (#25367) + cache-aligned-compaction.patch (#25100):
@@ -82,6 +86,7 @@ PATCHES=(
   vim
   sqlite-foreign-key-wrap
   event-session-scope
+  createnext-readback
 )
 
 for name in "${PATCHES[@]}"; do
