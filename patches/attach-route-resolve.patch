@@ -1,0 +1,379 @@
+diff --git a/packages/opencode/src/cli/cmd/attach.ts b/packages/opencode/src/cli/cmd/attach.ts
+index 278cee8a7..26f3f34fe 100644
+--- a/packages/opencode/src/cli/cmd/attach.ts
++++ b/packages/opencode/src/cli/cmd/attach.ts
+@@ -1,18 +1,18 @@
+ import { cmd } from "./cmd"
+ import { UI } from "@/cli/ui"
+ import { errorMessage } from "@opencode-ai/tui/util/error"
++import { resolveServeUrl } from "@opencode-ai/tui/util/route"
+ import { validateSession } from "../tui/validate-session"
+ import { ServerAuth } from "@/server/auth"
+ 
+ export const AttachCommand = cmd({
+-  command: "attach <url>",
++  command: "attach [url]",
+   describe: "attach to a running opencode server",
+   builder: (yargs) =>
+     yargs
+       .positional("url", {
+         type: "string",
+-        describe: "http://localhost:4096",
+-        demandOption: true,
++        describe: "http://localhost:4096 (optional when --session is given: the owning serve is resolved via pigeon /route)",
+       })
+       .option("dir", {
+         type: "string",
+@@ -63,9 +63,25 @@ export const AttachCommand = cmd({
+     const headers = ServerAuth.headers({ password: args.password, username: args.username })
+     const config = await TuiConfig.get()
+ 
++    // Pool-aware resolution. With a K-serve pool sharing one opencode.db, only
++    // the serve that owns a session emits its turn events on its in-memory bus.
++    // When a session id is known, resolve the owning serve from pigeon's
++    // GET /route so the TUI attaches to the right serve. Any /route failure
++    // degrades to the explicitly-passed <url> (never worse). If neither a
++    // resolvable session nor a <url> is available, fail loud — there is no
++    // pre-pool ":4096" default to fall back to (that default is the exact
++    // staleness bug this fixes).
++    const fallback = args.url ?? ""
++    const url = args.session ? await resolveServeUrl({ sessionID: args.session, fallback }) : fallback
++    if (!url) {
++      UI.error("attach: provide a <url>, or a --session that pigeon /route can resolve to an owning serve")
++      process.exitCode = 1
++      return
++    }
++
+     try {
+       await validateSession({
+-        url: args.url,
++        url,
+         sessionID: args.session,
+         directory,
+         headers,
+@@ -81,7 +97,7 @@ export const AttachCommand = cmd({
+     const { createLegacyTuiPluginHost } = await import("@/plugin/tui/runtime")
+     await Effect.runPromise(
+       run({
+-        url: args.url,
++        url,
+         config,
+         pluginHost: createLegacyTuiPluginHost(),
+         args: {
+diff --git a/packages/tui/package.json b/packages/tui/package.json
+index 4ac7d0f56..60924e8b1 100644
+--- a/packages/tui/package.json
++++ b/packages/tui/package.json
+@@ -40,6 +40,7 @@
+     "./util/locale": "./src/util/locale.ts",
+     "./util/persistence": "./src/util/persistence.ts",
+     "./util/record": "./src/util/record.ts",
++    "./util/route": "./src/util/route.ts",
+     "./logo": "./src/logo.ts",
+     "./ui/dialog": "./src/ui/dialog.tsx",
+     "./ui/spinner": "./src/ui/spinner.ts",
+diff --git a/packages/tui/src/app.tsx b/packages/tui/src/app.tsx
+index 668eebc13..9f523484d 100644
+--- a/packages/tui/src/app.tsx
++++ b/packages/tui/src/app.tsx
+@@ -288,6 +288,7 @@ export const run = Effect.fn("Tui.run")(function* (input: TuiInput) {
+                                       <PluginRuntimeProvider value={pluginRuntime}>
+                                         <SDKProvider
+                                           url={input.url}
++                                          sessionID={input.args.sessionID}
+                                           directory={input.directory}
+                                           fetch={input.fetch}
+                                           headers={input.headers}
+diff --git a/packages/tui/src/context/sdk.tsx b/packages/tui/src/context/sdk.tsx
+index 93180c6e2..19c9fbab8 100644
+--- a/packages/tui/src/context/sdk.tsx
++++ b/packages/tui/src/context/sdk.tsx
+@@ -2,6 +2,7 @@ import { createOpencodeClient } from "@opencode-ai/sdk/v2"
+ import type { GlobalEvent } from "@opencode-ai/sdk/v2"
+ import { Flag } from "@opencode-ai/core/flag/flag"
+ import { createSimpleContext } from "./helper"
++import { resolveServeUrl } from "../util/route"
+ import { batch, onCleanup, onMount } from "solid-js"
+ 
+ export type EventSource = {
+@@ -12,6 +13,7 @@ export const { use: useSDK, provider: SDKProvider } = createSimpleContext({
+   name: "SDK",
+   init: (props: {
+     url: string
++    sessionID?: string
+     directory?: string
+     fetch?: typeof fetch
+     headers?: RequestInit["headers"]
+@@ -20,9 +22,14 @@ export const { use: useSDK, provider: SDKProvider } = createSimpleContext({
+     const abort = new AbortController()
+     let sse: AbortController | undefined
+ 
++    // The serve we are currently connected to. Starts at props.url (already
++    // resolved by `opencode attach`) but can change when a session migrates
++    // serves in a K-serve pool — see the re-resolve in startSSE().
++    let currentUrl = props.url
++
+     function createSDK() {
+       return createOpencodeClient({
+-        baseUrl: props.url,
++        baseUrl: currentUrl,
+         signal: abort.signal,
+         directory: props.directory,
+         fetch: props.fetch,
+@@ -88,20 +95,48 @@ export const { use: useSDK, provider: SDKProvider } = createSimpleContext({
+         while (true) {
+           if (abort.signal.aborted || ctrl.signal.aborted) break
+ 
+-          const events = await sdk.global.event({
+-            signal: ctrl.signal,
+-            sseMaxRetryAttempts: 0,
+-          })
+-
+-          if (Flag.OPENCODE_EXPERIMENTAL_WORKSPACES) {
+-            // Start syncing workspaces, it's important to do this after
+-            // we've started listening to events
+-            await sdk.sync.start().catch(() => {})
++          // Follow a session that migrated serves (pool-health reshuffle /
++          // idle-migration). Re-resolve the owning serve from pigeon /route
++          // before each (re)connect and rebuild the whole client if it moved,
++          // so REST/control submits follow too (a non-owner serve can reject a
++          // prompt under serve-lease enforcement). Any /route failure degrades
++          // to the current url, so this is never worse than reconnecting in
++          // place.
++          if (props.sessionID) {
++            const next = await resolveServeUrl({
++              sessionID: props.sessionID,
++              fallback: currentUrl,
++              signal: ctrl.signal,
++            })
++            if (next !== currentUrl) {
++              currentUrl = next
++              sdk = createSDK()
++            }
+           }
+ 
+-          for await (const event of events.stream) {
+-            if (ctrl.signal.aborted) break
+-            handleEvent(event)
++          try {
++            const events = await sdk.global.event({
++              signal: ctrl.signal,
++              sseMaxRetryAttempts: 0,
++            })
++
++            if (Flag.OPENCODE_EXPERIMENTAL_WORKSPACES) {
++              // Start syncing workspaces, it's important to do this after
++              // we've started listening to events
++              await sdk.sync.start().catch(() => {})
++            }
++
++            for await (const event of events.stream) {
++              if (ctrl.signal.aborted) break
++              handleEvent(event)
++            }
++          } catch {
++            // SSE connect/stream error: a non-2xx (409/410/421/503), a refused
++            // connection, or a mid-stream network drop. These all signal the
++            // owning serve moved or went unhealthy (pool rediscover triggers).
++            // Swallow and fall through to backoff + re-resolve + reconnect
++            // instead of letting the error escape and kill the loop (which is
++            // what upstream does — a thrown error permanently stops SSE).
+           }
+ 
+           if (timer) clearTimeout(timer)
+@@ -145,7 +180,9 @@ export const { use: useSDK, provider: SDKProvider } = createSimpleContext({
+       directory: props.directory,
+       event: emitter,
+       fetch: props.fetch ?? fetch,
+-      url: props.url,
++      get url() {
++        return currentUrl
++      },
+     }
+   },
+ })
+diff --git a/packages/tui/src/util/route.ts b/packages/tui/src/util/route.ts
+new file mode 100644
+index 000000000..841e51dbb
+--- /dev/null
++++ b/packages/tui/src/util/route.ts
+@@ -0,0 +1,82 @@
++/**
++ * Pool-aware serve resolution via the pigeon ingress router's `GET /route`.
++ *
++ * In a pool of K `opencode serve` processes sharing one `opencode.db`, pigeon
++ * places each session on one serve (HRW rendezvous). opencode's streaming event
++ * bus is in-memory per process, so a TUI only receives a session's turns if it
++ * is attached to the serve that actually runs the session. This resolves the
++ * owning serve for a session id.
++ *
++ * Mirrors the bash `parse_serve_url` + curl flow in workstation
++ * `pkgs/oc-auto-attach/default.nix`: extract `.apiBase` from a `GET /route` body
++ * and degrade to a caller-supplied fallback on ANY failure (pigeon down, non-2xx,
++ * empty/garbage body, missing/null/empty `apiBase`). The fix can never be worse
++ * than the pre-pool single-serve behavior.
++ */
++
++const DEFAULT_PIGEON_URL = "http://127.0.0.1:4731"
++
++/**
++ * Extract `.apiBase` from a pigeon `GET /route` JSON body. Pure (no network).
++ * Returns `fallback` when the body is empty, not JSON, or `apiBase` is
++ * absent/null/empty/non-string. Never throws.
++ */
++export function parseServeUrl(body: string, fallback: string): string {
++  try {
++    const parsed = JSON.parse(body) as unknown
++    if (parsed && typeof parsed === "object") {
++      const apiBase = (parsed as { apiBase?: unknown }).apiBase
++      if (typeof apiBase === "string" && apiBase.length > 0) return apiBase
++    }
++  } catch {
++    // not JSON — fall through to the fallback
++  }
++  return fallback
++}
++
++/** The pigeon daemon base URL, matching `opencode-send`/`oc-auto-attach`. */
++export function pigeonDaemonUrl(): string {
++  const env = typeof process !== "undefined" ? process.env?.PIGEON_DAEMON_URL : undefined
++  return env && env.length > 0 ? env : DEFAULT_PIGEON_URL
++}
++
++/**
++ * Resolve the owning serve's base URL for a session via pigeon `GET /route`.
++ * Bounded by a short timeout so a hung/absent pigeon cannot stall attach or an
++ * SSE reconnect. NEVER throws: any failure returns `fallback`.
++ */
++export async function resolveServeUrl(opts: {
++  sessionID: string
++  fallback: string
++  pigeonUrl?: string
++  fetch?: typeof fetch
++  signal?: AbortSignal
++  timeoutMs?: number
++}): Promise<string> {
++  const { sessionID, fallback } = opts
++  if (!sessionID) return fallback
++
++  const pigeonUrl = (opts.pigeonUrl ?? pigeonDaemonUrl()).replace(/\/+$/, "")
++  const fetchFn = opts.fetch ?? fetch
++  const url = `${pigeonUrl}/route?session_id=${encodeURIComponent(sessionID)}`
++
++  const timeoutMs = opts.timeoutMs ?? 3000
++  let signal: AbortSignal | undefined
++  try {
++    const timeoutSignal = AbortSignal.timeout(timeoutMs)
++    signal = opts.signal ? AbortSignal.any([opts.signal, timeoutSignal]) : timeoutSignal
++  } catch {
++    // AbortSignal.timeout/any unavailable — proceed without a bound rather than
++    // failing the resolve outright.
++    signal = opts.signal
++  }
++
++  try {
++    const res = await fetchFn(url, { signal })
++    if (!res.ok) return fallback
++    const body = await res.text()
++    return parseServeUrl(body, fallback)
++  } catch {
++    return fallback
++  }
++}
+diff --git a/packages/tui/test/util/route.test.ts b/packages/tui/test/util/route.test.ts
+new file mode 100644
+index 000000000..f2a80130c
+--- /dev/null
++++ b/packages/tui/test/util/route.test.ts
+@@ -0,0 +1,91 @@
++import { expect, test } from "bun:test"
++import { parseServeUrl, resolveServeUrl } from "../../src/util/route"
++
++// parseServeUrl: pure extraction of .apiBase from a pigeon `GET /route` body,
++// degrading to the fallback on anything unexpected. Mirrors the bash
++// parse_serve_url in workstation pkgs/oc-auto-attach/default.nix.
++
++test("parseServeUrl returns apiBase from a valid route body", () => {
++  const body = JSON.stringify({
++    apiBase: "http://127.0.0.1:4097",
++    eventUrl: "http://127.0.0.1:4097/event?session_ids=ses_x",
++  })
++  expect(parseServeUrl(body, "http://127.0.0.1:4096")).toBe("http://127.0.0.1:4097")
++})
++
++test("parseServeUrl falls back on an empty body", () => {
++  expect(parseServeUrl("", "http://127.0.0.1:4096")).toBe("http://127.0.0.1:4096")
++})
++
++test("parseServeUrl falls back on non-JSON garbage", () => {
++  expect(parseServeUrl("not json at all", "http://127.0.0.1:4096")).toBe("http://127.0.0.1:4096")
++})
++
++test("parseServeUrl falls back when apiBase is absent", () => {
++  expect(parseServeUrl(JSON.stringify({ serveId: "serve-1" }), "http://127.0.0.1:4096")).toBe(
++    "http://127.0.0.1:4096",
++  )
++})
++
++test("parseServeUrl falls back when apiBase is null", () => {
++  expect(parseServeUrl(JSON.stringify({ apiBase: null }), "http://127.0.0.1:4096")).toBe(
++    "http://127.0.0.1:4096",
++  )
++})
++
++test("parseServeUrl falls back when apiBase is an empty string", () => {
++  expect(parseServeUrl(JSON.stringify({ apiBase: "" }), "http://127.0.0.1:4096")).toBe(
++    "http://127.0.0.1:4096",
++  )
++})
++
++test("parseServeUrl falls back when apiBase is not a string", () => {
++  expect(parseServeUrl(JSON.stringify({ apiBase: 4097 }), "http://127.0.0.1:4096")).toBe(
++    "http://127.0.0.1:4096",
++  )
++})
++
++// resolveServeUrl: the network wrapper. It must NEVER throw and must degrade to
++// the fallback on any failure (non-2xx, connection refused, bad body).
++
++test("resolveServeUrl queries pigeon /route and returns the owning serve apiBase", async () => {
++  let requestedUrl = ""
++  const fakeFetch = (async (url: string | URL | Request) => {
++    requestedUrl = String(url)
++    return new Response(JSON.stringify({ apiBase: "http://127.0.0.1:4097" }), { status: 200 })
++  }) as unknown as typeof fetch
++
++  const result = await resolveServeUrl({
++    sessionID: "ses_abc",
++    fallback: "http://127.0.0.1:4096",
++    pigeonUrl: "http://127.0.0.1:4731",
++    fetch: fakeFetch,
++  })
++
++  expect(result).toBe("http://127.0.0.1:4097")
++  expect(requestedUrl).toBe("http://127.0.0.1:4731/route?session_id=ses_abc")
++})
++
++test("resolveServeUrl falls back when pigeon returns 503", async () => {
++  const fakeFetch = (async () => new Response("", { status: 503 })) as unknown as typeof fetch
++  const result = await resolveServeUrl({
++    sessionID: "ses_abc",
++    fallback: "http://127.0.0.1:4096",
++    pigeonUrl: "http://127.0.0.1:4731",
++    fetch: fakeFetch,
++  })
++  expect(result).toBe("http://127.0.0.1:4096")
++})
++
++test("resolveServeUrl falls back when fetch throws (connection refused)", async () => {
++  const fakeFetch = (async () => {
++    throw new Error("connect ECONNREFUSED 127.0.0.1:4731")
++  }) as unknown as typeof fetch
++  const result = await resolveServeUrl({
++    sessionID: "ses_abc",
++    fallback: "http://127.0.0.1:4096",
++    pigeonUrl: "http://127.0.0.1:4731",
++    fetch: fakeFetch,
++  })
++  expect(result).toBe("http://127.0.0.1:4096")
++})

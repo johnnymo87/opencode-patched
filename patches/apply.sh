@@ -35,6 +35,15 @@
 #                                               deadline guard around the agent run loop (D2a). Whole
 #                                               feature is gated on OPENCODE_ROUTING_DB; unset = no-op
 #                                               (bead workstation-mn9r).
+#  10. attach-route-resolve.patch (local)      - pool-aware `opencode attach` (mn9r M7, bead
+#                                               workstation-7zr7): packages/tui/src/util/route.ts
+#                                               (parseServeUrl + resolveServeUrl via pigeon GET /route,
+#                                               PIGEON_DAEMON_URL default :4731, degrade to fallback),
+#                                               attach.ts `[url]` optional + self-resolve from --session,
+#                                               and a startSSE re-resolve + try/catch reconnect in
+#                                               context/sdk.tsx so the TUI follows a session that
+#                                               migrates serves (idle-migration / pool-health reshuffle)
+#                                               and survives 409/410/421/503/connection-refused drops.
 #
 # DROPPED on the v1.17 line (see workstation docs/plans/2026-06-11-opencode-1.17-cutover-runbook.md):
 #   - prompt-loop-cache.patch (#25367) + cache-aligned-compaction.patch (#25100):
@@ -97,6 +106,7 @@ PATCHES=(
   event-session-scope
   createnext-readback
   serve-lease
+  attach-route-resolve
 )
 
 for name in "${PATCHES[@]}"; do
