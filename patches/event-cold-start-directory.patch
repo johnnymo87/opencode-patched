@@ -1,0 +1,133 @@
+diff --git a/packages/opencode/src/server/routes/instance/httpapi/handlers/event.ts b/packages/opencode/src/server/routes/instance/httpapi/handlers/event.ts
+index 7186644ce2..1f7467d32b 100644
+--- a/packages/opencode/src/server/routes/instance/httpapi/handlers/event.ts
++++ b/packages/opencode/src/server/routes/instance/httpapi/handlers/event.ts
+@@ -26,9 +26,10 @@ function eventResponse(events: EventV2.Interface) {
+   return Effect.gen(function* () {
+     const instance = yield* InstanceState.context
+     const workspaceID = yield* InstanceState.workspaceID
+-    // Optional per-session filter (?session_ids=a,b,c). When present, only events
+-    // whose session aggregate (event.data.sessionID) is in the set are forwarded;
+-    // events without a string sessionID (server.*, lifecycle) always pass.
++    // Optional per-session filter (?session_ids=a,b,c). When present, session-scoped
++    // events (those with a string event.data.sessionID) are forwarded iff their
++    // sessionID is in the set, independent of directory; non-session events fall
++    // back to directory/workspace scoping below. Absent => directory scoping only.
+     const searchParams = yield* HttpServerRequest.ParsedSearchParams
+     const sessionIdsRaw = searchParams["session_ids"]
+     const sessionIds =
+@@ -46,17 +47,24 @@ function eventResponse(events: EventV2.Interface) {
+     const queue = yield* Queue.unbounded<EventV2.Payload>()
+     const unsubscribe = yield* events.listen((event) => Effect.sync(() => Queue.offerUnsafe(queue, event)))
+     yield* Effect.addFinalizer(() => unsubscribe)
++    const matchesDirectory = (event: EventV2.Payload) =>
++      event.location?.directory === instance.directory &&
++      (event.location.workspaceID === undefined || event.location.workspaceID === workspaceID)
+     const stream = Stream.fromQueue(queue).pipe(
+-      Stream.filter(
+-        (event) =>
+-          event.location?.directory === instance.directory &&
+-          (event.location.workspaceID === undefined || event.location.workspaceID === workspaceID),
+-      ),
+       Stream.filter((event) => {
+-        if (sessionIds === undefined) return true
+         const sid = (event.data as Record<string, unknown> | undefined)?.["sessionID"]
+-        if (typeof sid !== "string") return true // global / non-session event: always pass
+-        return sessionIds.has(sid)
++        // Per-session subscription (?session_ids=): gate session-scoped events
++        // purely on session-aggregate membership. sessionID is globally unique,
++        // so this cannot leak another session's events, and unlike the directory
++        // clause it is immune to the cold-start directory-resolution race
++        // (workstation-yl00): the forked agent loop can stamp a location.directory
++        // that differs from the subscriber's captured instance.directory because
++        // FSUtil.resolve realpaths an existing dir but only normalizes a
++        // not-yet-existing one, so an exact-string directory match silently drops
++        // the watched session's live events. Non-session events (no sessionID) and
++        // subscriptions without ?session_ids= still fall back to directory scoping.
++        if (sessionIds !== undefined && typeof sid === "string") return sessionIds.has(sid)
++        return matchesDirectory(event)
+       }),
+       Stream.map((event) => ({ id: event.id, type: event.type, properties: event.data })),
+     )
+diff --git a/packages/opencode/test/server/httpapi-event.test.ts b/packages/opencode/test/server/httpapi-event.test.ts
+index 456cf72d9d..005274ccc3 100644
+--- a/packages/opencode/test/server/httpapi-event.test.ts
++++ b/packages/opencode/test/server/httpapi-event.test.ts
+@@ -2,7 +2,7 @@ import { afterEach, describe, expect } from "bun:test"
+ import { Effect, Layer, Queue, Schema, Stream } from "effect"
+ import { EventPaths } from "../../src/server/routes/instance/httpapi/groups/event"
+ import { resetDatabase } from "../fixture/db"
+-import { disposeAllInstances, TestInstance } from "../fixture/fixture"
++import { disposeAllInstances, TestInstance, tmpdir } from "../fixture/fixture"
+ import { testEffect } from "../lib/effect"
+ import { httpApiLayer, requestInDirectory } from "./httpapi-layer"
+ import { HttpClient, HttpClientRequest } from "effect/unstable/http"
+@@ -34,6 +34,16 @@ const readEvent = (reader: Queue.Dequeue<Uint8Array>) =>
+     return Schema.decodeUnknownSync(EventData)(JSON.parse(new TextDecoder().decode(value).replace(/^data: /, "")))
+   })
+ 
++// Drain events until one of `type` arrives (skipping unrelated init/heartbeat
++// events). Fails via readEvent's per-take timeout if the target never arrives.
++const readUntil = (reader: Queue.Dequeue<Uint8Array>, type: string) =>
++  Effect.gen(function* () {
++    while (true) {
++      const event = yield* readEvent(reader)
++      if (event.type === type) return event
++    }
++  })
++
+ const openEventStream = (directory: string) =>
+   Effect.gen(function* () {
+     const response = yield* requestInDirectory(EventPaths.event, directory)
+@@ -175,4 +185,51 @@ describe("event HttpApi", () => {
+       }),
+     { git: true, config: { formatter: false, lsp: false } },
+   )
++
++  // Regression for workstation-yl00: an attached TUI subscribes to GET /event with
++  // ?session_ids=<sid> via a directory whose resolved string can differ from the
++  // directory the owning agent loop stamps on the session's published events
++  // (FSUtil.resolve realpaths an existing dir but only normalizes a not-yet-existing
++  // one; the request fiber and the forked run loop can resolve at different lifecycle
++  // moments). The pre-fix handler ANDs a directory-equality filter ahead of the
++  // session filter, so the mismatched directory silently drops every message.* /
++  // session.* event for the watched session even though it is on the (global) bus.
++  // A per-session subscription must instead be gated purely on session-aggregate
++  // membership, which is directory-independent and cannot leak another session.
++  it.instance(
++    "delivers watched-session events to a session-scoped stream emitted by a different directory instance (yl00)",
++    () =>
++      Effect.gen(function* () {
++        const { directory } = yield* TestInstance
++
++        // A second, unrelated instance directory: models a subscriber whose
++        // captured instance.directory differs from the directory stamped on the
++        // watched session's events (the cold-start directory-resolution race).
++        const other = yield* Effect.acquireRelease(
++          Effect.promise(() => tmpdir({ git: true, config: { formatter: false, lsp: false } })),
++          (handle) => Effect.promise(() => handle[Symbol.asyncDispose]()),
++        )
++
++        // The watched session lives in (and emits from) `directory`.
++        const createdWatched = yield* requestInDirectory("/session", directory, { method: "POST" })
++        expect(createdWatched.status).toBe(200)
++        const watched = (yield* createdWatched.json) as { id: string }
++
++        // Subscribe scoped to the watched session, but bound to the OTHER
++        // directory instance — i.e. event.location.directory !== instance.directory.
++        const scoped = yield* openSessionScopedStream(other.path, [watched.id])
++        expect(yield* readEvent(scoped.reader)).toMatchObject({ type: "server.connected" })
++
++        // Emit a session-scoped event for the watched session from `directory`.
++        const deleteWatched = yield* requestInDirectory(`/session/${watched.id}`, directory, { method: "DELETE" })
++        expect(deleteWatched.status).toBe(200)
++
++        // Must arrive despite the directory mismatch (pre-fix it is dropped).
++        expect(yield* readUntil(scoped.reader, "session.deleted")).toMatchObject({
++          type: "session.deleted",
++          properties: { sessionID: watched.id },
++        })
++      }),
++    { git: true, config: { formatter: false, lsp: false } },
++  )
+ })

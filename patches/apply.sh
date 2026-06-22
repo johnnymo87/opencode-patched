@@ -44,6 +44,17 @@
 #                                               context/sdk.tsx so the TUI follows a session that
 #                                               migrates serves (idle-migration / pool-health reshuffle)
 #                                               and survives 409/410/421/503/connection-refused drops.
+#  11. event-cold-start-directory.patch (local) - fix the cold-start live-delivery race on GET /event
+#                                               (bead workstation-yl00). Builds on event-session-scope:
+#                                               when ?session_ids= is present, session-scoped events are
+#                                               gated purely on session-aggregate membership instead of
+#                                               an exact-string directory match. A subscriber whose
+#                                               captured instance.directory differs from the directory
+#                                               the forked agent loop stamps on its events (FSUtil.resolve
+#                                               realpaths an existing dir but only normalizes a not-yet-
+#                                               existing one) was silently dropping all message.*/session.*
+#                                               for the watched session. sessionID is globally unique, so
+#                                               no cross-directory leak. MUST apply after event-session-scope.
 #
 # DROPPED on the v1.17 line (see workstation docs/plans/2026-06-11-opencode-1.17-cutover-runbook.md):
 #   - prompt-loop-cache.patch (#25367) + cache-aligned-compaction.patch (#25100):
@@ -107,6 +118,7 @@ PATCHES=(
   createnext-readback
   serve-lease
   attach-route-resolve
+  event-cold-start-directory
 )
 
 for name in "${PATCHES[@]}"; do
