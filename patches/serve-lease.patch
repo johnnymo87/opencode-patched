@@ -1,13 +1,25 @@
 diff --git a/packages/core/src/flag/flag.ts b/packages/core/src/flag/flag.ts
-index a0eb78a13e..01b51ea1ac 100644
+index a0eb78a13e..5be4e463a9 100644
 --- a/packages/core/src/flag/flag.ts
 +++ b/packages/core/src/flag/flag.ts
-@@ -45,6 +45,8 @@ export const Flag = {
+@@ -45,6 +45,20 @@ export const Flag = {
    OPENCODE_MODELS_URL: process.env["OPENCODE_MODELS_URL"],
    OPENCODE_MODELS_PATH: process.env["OPENCODE_MODELS_PATH"],
    OPENCODE_DB: process.env["OPENCODE_DB"],
 +  OPENCODE_ROUTING_DB: process.env["OPENCODE_ROUTING_DB"],
 +  OPENCODE_SERVE_ID: process.env["OPENCODE_SERVE_ID"],
++  // Serve self-heartbeat interval (ms). Default 5000. Lowered in tests for a
++  // tighter RED/GREEN signal; also a legitimate production tunable.
++  get OPENCODE_HEARTBEAT_INTERVAL_MS() {
++    return process.env["OPENCODE_HEARTBEAT_INTERVAL_MS"]
++  },
++  // TEST-ONLY fault injection: after the serve heartbeat is started, busy-block
++  // the main event loop for this many ms to prove the heartbeat is starvation-
++  // immune (the worker keeps beating; a main-loop fiber would freeze). Unset in
++  // production = no-op. Read at access time because tests set it per-spawn.
++  get OPENCODE_TEST_BLOCK_MAIN_LOOP_MS() {
++    return process.env["OPENCODE_TEST_BLOCK_MAIN_LOOP_MS"]
++  },
  
    OPENCODE_WORKSPACE_ID: process.env["OPENCODE_WORKSPACE_ID"],
    OPENCODE_EXPERIMENTAL_WORKSPACES: enabledByExperimental("OPENCODE_EXPERIMENTAL_WORKSPACES"),
@@ -1138,18 +1150,19 @@ index 0000000000..0820da0b80
 +  });
 +});
 diff --git a/packages/opencode/src/cli/cmd/serve.ts b/packages/opencode/src/cli/cmd/serve.ts
-index c0f62b3ca0..4bc8c36ec6 100644
+index c0f62b3ca0..1c5d191195 100644
 --- a/packages/opencode/src/cli/cmd/serve.ts
 +++ b/packages/opencode/src/cli/cmd/serve.ts
-@@ -1,4 +1,6 @@
+@@ -1,4 +1,7 @@
 -import { Effect } from "effect"
-+import { Effect, Schedule, Deferred } from "effect"
++import { Effect, Deferred } from "effect"
 +import { randomUUID } from "node:crypto"
-+import { getSharedRoutingLease } from "@opencode-ai/core/serve/routing-lease"
++import { getSharedRoutingLease, getRoutingDbPath } from "@opencode-ai/core/serve/routing-lease"
++import { startServeHeartbeat } from "../../serve/heartbeat"
  import { effectCmd } from "../effect-cmd"
  import { withNetworkOptions, resolveNetworkOptions } from "../network"
  import { Flag } from "@opencode-ai/core/flag/flag"
-@@ -19,6 +21,44 @@ export const ServeCommand = effectCmd({
+@@ -19,6 +22,74 @@ export const ServeCommand = effectCmd({
      const server = yield* Effect.promise(() => Server.listen(opts))
      console.log(`opencode server listening on http://${server.hostname}:${server.port}`)
  
@@ -1163,15 +1176,45 @@ index c0f62b3ca0..4bc8c36ec6 100644
 +      
 +      yield* Effect.scoped(
 +        Effect.gen(function* () {
-+          yield* Effect.promise(() => lease.heartbeat(serveId)).pipe(
-+            Effect.ignore,
-+            Effect.repeat(Schedule.spaced("5 seconds")),
-+            Effect.forkScoped
++          const intervalMs = Number(Flag.OPENCODE_HEARTBEAT_INTERVAL_MS) || 5000
++          // Fix C: run the heartbeat on a worker thread so a CPU-heavy main-loop
++          // turn can't starve it (with a main-thread fallback if the worker can't
++          // boot). See packages/opencode/src/serve/heartbeat.ts.
++          const heartbeat = yield* Effect.promise(() =>
++            startServeHeartbeat({
++              dbPath: getRoutingDbPath(),
++              serveId,
++              intervalMs,
++              fallbackBeat: () => lease.heartbeat(serveId),
++            })
 +          )
++          console.log(`serve heartbeat started (mode=${heartbeat.mode}, interval=${intervalMs}ms)`)
++
++          // Finalizers run LIFO: register markDead FIRST so it runs LAST, after
++          // the heartbeat has stopped — otherwise a trailing beat could resurrect
++          // health_state='healthy' over the draining marker.
 +          yield* Effect.addFinalizer(() =>
 +            Effect.promise(() => lease.markDead(serveId)).pipe(Effect.ignore)
 +          )
-+          
++          yield* Effect.addFinalizer(() =>
++            Effect.promise(() => heartbeat.stop()).pipe(Effect.ignore)
++          )
++
++          // TEST-ONLY fault injection (see Flag.OPENCODE_TEST_BLOCK_MAIN_LOOP_MS):
++          // self-sequencing — yield first so the first heartbeat lands, then
++          // busy-block the main event loop to prove the heartbeat is starvation-
++          // immune. With a main-loop fiber this freezes heartbeat_at (RED).
++          const blockMs = Number(Flag.OPENCODE_TEST_BLOCK_MAIN_LOOP_MS) || 0
++          if (blockMs > 0) {
++            yield* Effect.sleep(`${Math.max(intervalMs * 2, 1000)} millis`)
++            yield* Effect.sync(() => {
++              const end = Date.now() + blockMs
++              while (Date.now() < end) {
++                /* busy-block the main event loop */
++              }
++            })
++          }
++
 +          const sigtermDeferred = yield* Deferred.make<void>()
 +          const sigtermHandler = () => {
 +            Effect.runSync(Deferred.succeed(sigtermDeferred, undefined))
@@ -1195,6 +1238,198 @@ index c0f62b3ca0..4bc8c36ec6 100644
 +    }
    }),
  })
+diff --git a/packages/opencode/src/serve/heartbeat.ts b/packages/opencode/src/serve/heartbeat.ts
+new file mode 100644
+index 0000000000..02caab6b69
+--- /dev/null
++++ b/packages/opencode/src/serve/heartbeat.ts
+@@ -0,0 +1,186 @@
++// Starvation-immune serve heartbeat (mn9r Fix C, bead workstation-uzig).
++//
++// A serve in the routing pool must write `serve_instance.heartbeat_at` every
++// `intervalMs` so pigeon's health poller doesn't declare it dead. Running this
++// on the main JS event loop (as an Effect fiber) means a CPU-heavy synchronous
++// agent turn — or a GC pause — starves it: pigeon then false-declares the live
++// serve dead, migrates its session away, and the serve's next lease renew fails
++// ("session lease lost mid-run"). We move the beat to a worker_threads Worker
++// (own V8 isolate + own event loop), immune to main-thread blocking.
++//
++// SAFETY (belt-and-suspenders): if the worker fails to boot — e.g. a future
++// `bun --compile` worker-resolution regression — we fall back to a main-thread
++// timer beat, i.e. exactly today's (starvable) behavior. A silent worker failure
++// thus degrades to the status quo, never to "no heartbeat at all". This is why
++// the worker source is shipped as an INLINE BLOB rather than via
++// `new Worker(new URL("./heartbeat-worker.ts", import.meta.url))`: the latter's
++// bundler auto-discovery is empirically broken inside the compiled single-file
++// binary (works under `bun run` — the classic dev-passes/prod-fails trap), while
++// a blob worker with a static `import { Database } from "bun:sqlite"` is verified
++// to work in the compiled binary.
++
++declare const Worker: {
++  new (url: string | URL, options?: { type?: "module" | "classic" }): {
++    onmessage: ((event: { data: any }) => void) | null
++    onerror: ((event: { message?: string }) => void) | null
++    postMessage(message: any): void
++    terminate(): void
++  }
++}
++
++// Worker source. Kept as a string (no `${...}` / no backticks inside) so the
++// outer template literal doesn't interpolate it; it is turned into a Blob URL
++// at runtime. The static `import` fails fast at worker init (surfaced via
++// onerror / the ack timeout) rather than later inside a handler.
++const WORKER_SRC = `
++import { Database } from "bun:sqlite";
++
++let db = null;
++let stmt = null;
++let timer = null;
++let serveId = null;
++
++function beat() {
++  try {
++    stmt.run(Date.now(), serveId);
++  } catch (err) {
++    // SQLITE_BUSY and friends: one missed beat is harmless against the ~20s
++    // stale window. Surface it but keep going.
++    try { postMessage({ type: "beat-error", message: String(err) }); } catch (e) {}
++  }
++}
++
++self.onmessage = (e) => {
++  const msg = e.data;
++  if (msg && msg.type === "stop") {
++    if (timer) clearInterval(timer);
++    try { if (db) db.close(); } catch (e) {}
++    try { postMessage({ type: "stopped" }); } catch (e) {}
++    return;
++  }
++  // First message is the config payload.
++  try {
++    serveId = msg.serveId;
++    db = new Database(msg.dbPath);
++    // busy_timeout is per-connection and not inherited — set it on our own handle.
++    db.exec("PRAGMA busy_timeout=" + (msg.busyTimeoutMs || 2000) + ";");
++    stmt = db.prepare("UPDATE serve_instance SET heartbeat_at = ?, health_state = 'healthy' WHERE serve_id = ?");
++    beat(); // first beat proves we can open + write the DB
++    postMessage({ type: "alive" });
++    timer = setInterval(beat, msg.intervalMs || 5000);
++  } catch (err) {
++    try { postMessage({ type: "error", message: String(err) }); } catch (e) {}
++  }
++};
++`
++
++export interface HeartbeatHandle {
++  // Which path is live — for logging/tests.
++  readonly mode: "worker" | "fallback"
++  // Stops the heartbeat. MUST be awaited BEFORE markDead so a late beat can't
++  // resurrect health_state='healthy' over the draining marker.
++  stop(): Promise<void>
++}
++
++export interface StartHeartbeatOptions {
++  // Absolute routing DB path (worker has its own cwd/isolate — never pass relative).
++  dbPath: string
++  serveId: string
++  intervalMs: number
++  busyTimeoutMs?: number
++  // Main-thread beat used by the fallback path — the existing lease.heartbeat.
++  fallbackBeat: () => Promise<unknown>
++  // Max time to wait for the worker's first-beat ack before falling back.
++  ackTimeoutMs?: number
++}
++
++/**
++ * Starts the serve heartbeat on a worker thread, falling back to a main-thread
++ * timer if the worker doesn't ack its first beat in time.
++ */
++export async function startServeHeartbeat(opts: StartHeartbeatOptions): Promise<HeartbeatHandle> {
++  const { dbPath, serveId, intervalMs, busyTimeoutMs = 2000, fallbackBeat, ackTimeoutMs = 5000 } = opts
++
++  // Main-thread timer beat — behaviorally identical to the pre-Fix-C heartbeat
++  // (and just as starvable). Only used when the worker can't be trusted.
++  const startFallback = (): HeartbeatHandle => {
++    void Promise.resolve(fallbackBeat()).catch(() => {}) // immediate first beat
++    const timer = setInterval(() => {
++      void Promise.resolve(fallbackBeat()).catch(() => {})
++    }, intervalMs)
++    return {
++      mode: "fallback",
++      async stop() {
++        clearInterval(timer)
++      },
++    }
++  }
++
++  // TEST-ONLY: force the main-thread fallback path so it can be exercised without
++  // actually breaking the worker. Unset in production = no-op.
++  if (process.env["OPENCODE_TEST_FORCE_HEARTBEAT_FALLBACK"]) {
++    console.error("[serve-heartbeat] OPENCODE_TEST_FORCE_HEARTBEAT_FALLBACK set; using main-thread fallback")
++    return startFallback()
++  }
++
++  let url: string | undefined
++  let worker: InstanceType<typeof Worker>
++  try {
++    url = URL.createObjectURL(new Blob([WORKER_SRC], { type: "application/javascript" }))
++    worker = new Worker(url, { type: "module" })
++  } catch (err) {
++    if (url) URL.revokeObjectURL(url)
++    console.error(`[serve-heartbeat] worker construction failed; using main-thread fallback: ${err}`)
++    return startFallback()
++  }
++
++  const alive = await new Promise<boolean>((resolve) => {
++    let settled = false
++    const done = (v: boolean) => {
++      if (settled) return
++      settled = true
++      resolve(v)
++    }
++    worker.onmessage = (event) => {
++      const type = event?.data?.type
++      if (type === "alive") done(true)
++      else if (type === "error") {
++        console.error(`[serve-heartbeat] worker init error: ${event.data.message}`)
++        done(false)
++      }
++    }
++    worker.onerror = (event) => {
++      console.error(`[serve-heartbeat] worker onerror: ${event?.message ?? "unknown"}`)
++      done(false)
++    }
++    setTimeout(() => done(false), ackTimeoutMs)
++    worker.postMessage({ dbPath, serveId, intervalMs, busyTimeoutMs })
++  })
++
++  if (url) URL.revokeObjectURL(url)
++
++  if (!alive) {
++    try {
++      worker.terminate()
++    } catch {}
++    console.error(
++      "[serve-heartbeat] worker did not ack first beat; falling back to main-thread heartbeat (degraded: starvable)",
++    )
++    return startFallback()
++  }
++
++  // Worker owns the heartbeat. Swallow any later beat-error chatter.
++  worker.onmessage = () => {}
++  worker.onerror = () => {}
++
++  return {
++    mode: "worker",
++    async stop() {
++      // terminate() kills the worker thread immediately — no in-flight beat can
++      // land after this, so the subsequent markDead write is the last word.
++      try {
++        worker.terminate()
++      } catch {}
++    },
++  }
++}
 diff --git a/packages/opencode/src/session/prompt.ts b/packages/opencode/src/session/prompt.ts
 index b3f85c813f..e46481c717 100644
 --- a/packages/opencode/src/session/prompt.ts
@@ -1364,7 +1599,7 @@ index b3f85c813f..e46481c717 100644
  
      const shell: (input: ShellInput) => Effect.Effect<SessionV1.WithParts, Session.BusyError> = Effect.fn(
 diff --git a/packages/opencode/test/cli/serve/serve-process.test.ts b/packages/opencode/test/cli/serve/serve-process.test.ts
-index 6dbea372b2..70c72cdd01 100644
+index 6dbea372b2..20e2783561 100644
 --- a/packages/opencode/test/cli/serve/serve-process.test.ts
 +++ b/packages/opencode/test/cli/serve/serve-process.test.ts
 @@ -9,6 +9,54 @@ import { describe, expect } from "bun:test"
@@ -1422,7 +1657,7 @@ index 6dbea372b2..70c72cdd01 100644
  
  describe("opencode serve (subprocess)", () => {
    // Smoke test: server starts, binds a port, and /global/health responds.
-@@ -58,4 +106,80 @@ describe("opencode serve (subprocess)", () => {
+@@ -58,4 +106,217 @@ describe("opencode serve (subprocess)", () => {
        }),
      60_000,
    )
@@ -1499,6 +1734,143 @@ index 6dbea372b2..70c72cdd01 100644
 +
 +        expect(rowAfter).toBeDefined()
 +        expect(rowAfter.draining).toBe(1)
++      }),
++    60_000,
++  )
++
++  // Fix C (mn9r, bead workstation-uzig): the serve heartbeat must keep advancing
++  // even when the main JS event loop is blocked by synchronous CPU work. The old
++  // implementation ran the heartbeat as an Effect fiber on the same event loop,
++  // so a CPU-heavy turn starved it -> pigeon false-declares the serve dead ->
++  // session migrated mid-run -> "session lease lost mid-run". Moving the beat to
++  // a worker thread makes it starvation-immune.
++  //
++  // We drive a deterministic block via OPENCODE_TEST_BLOCK_MAIN_LOOP_MS: the serve
++  // starts its heartbeat, yields so the first beat lands, then busy-loops the main
++  // thread. From this (separate) process we poll serve_instance.heartbeat_at across
++  // the block window. RED (main-loop fiber): heartbeat_at frozen. GREEN (worker):
++  // heartbeat_at advances by >= one interval.
++  cliIt.live(
++    "heartbeat keeps advancing while the main event loop is blocked (starvation-immune)",
++    ({ opencode }) =>
++      Effect.gen(function* () {
++        const tmp = yield* Effect.promise(() => tmpdir())
++        yield* Effect.addFinalizer(() => Effect.promise(() => tmp[Symbol.asyncDispose]()))
++        const dbFile = path.join(tmp.path, "routing.db")
++
++        const seedDb = new Database(dbFile)
++        seedDb.exec("PRAGMA journal_mode=WAL;")
++        seedDb.run(ROUTING_DDL)
++        seedDb.run(
++          "INSERT OR IGNORE INTO routing_meta (id, schema_version, ddl_checksum, binary_epoch, updated_at) VALUES (1, 1, ?, 0, ?)",
++          [EXPECTED_DDL_CHECKSUM, Date.now()],
++        )
++        seedDb.close()
++
++        const serveId = "serve-test-hb"
++        const intervalMs = 500
++        const blockMs = 6000
++
++        const server = yield* opencode.serve({
++          env: {
++            OPENCODE_ROUTING_DB: dbFile,
++            OPENCODE_SERVE_ID: serveId,
++            OPENCODE_HEARTBEAT_INTERVAL_MS: String(intervalMs),
++            OPENCODE_TEST_BLOCK_MAIN_LOOP_MS: String(blockMs),
++          },
++        })
++        expect(server.port).toBeGreaterThan(0)
++
++        const readHeartbeat = (): number | null => {
++          const db = new Database(dbFile)
++          db.exec("PRAGMA busy_timeout=3000;")
++          const row = db.prepare("SELECT heartbeat_at FROM serve_instance WHERE serve_id = ?").get(serveId) as any
++          db.close()
++          return row ? Number(row.heartbeat_at) : null
++        }
++
++        // Wait until the serve has registered (heartbeat_at present).
++        let registered = false
++        for (let i = 0; i < 100; i++) {
++          if (readHeartbeat() !== null) {
++            registered = true
++            break
++          }
++          yield* Effect.sleep("100 millis")
++        }
++        expect(registered).toBe(true)
++
++        // The serve yields ~max(2*interval,1000)ms (first beat lands) then busy-
++        // blocks for blockMs. Sample heartbeat_at at two points both well inside
++        // that block window. GREEN: the worker keeps beating across the block.
++        yield* Effect.sleep("2200 millis")
++        const hbEarly = readHeartbeat()!
++        yield* Effect.sleep("2300 millis")
++        const hbLate = readHeartbeat()!
++
++        // RED (main-loop fiber): both samples are frozen at the pre-block beat
++        // (advance ~0). GREEN (worker): advances by multiple intervals.
++        expect(hbLate - hbEarly).toBeGreaterThanOrEqual(intervalMs)
++      }),
++    60_000,
++  )
++
++  // Safety net: if the worker can't boot (e.g. a future bun --compile worker-
++  // resolution regression), startServeHeartbeat falls back to a main-thread beat
++  // == today's behavior. That degraded path is exactly what's hard to notice in
++  // prod, so prove it actually heartbeats. OPENCODE_TEST_FORCE_HEARTBEAT_FALLBACK
++  // forces the fallback without breaking the worker.
++  cliIt.live(
++    "falls back to a main-thread heartbeat when the worker is unavailable",
++    ({ opencode }) =>
++      Effect.gen(function* () {
++        const tmp = yield* Effect.promise(() => tmpdir())
++        yield* Effect.addFinalizer(() => Effect.promise(() => tmp[Symbol.asyncDispose]()))
++        const dbFile = path.join(tmp.path, "routing.db")
++
++        const seedDb = new Database(dbFile)
++        seedDb.exec("PRAGMA journal_mode=WAL;")
++        seedDb.run(ROUTING_DDL)
++        seedDb.run(
++          "INSERT OR IGNORE INTO routing_meta (id, schema_version, ddl_checksum, binary_epoch, updated_at) VALUES (1, 1, ?, 0, ?)",
++          [EXPECTED_DDL_CHECKSUM, Date.now()],
++        )
++        seedDb.close()
++
++        const serveId = "serve-test-fb"
++        const intervalMs = 500
++
++        const server = yield* opencode.serve({
++          env: {
++            OPENCODE_ROUTING_DB: dbFile,
++            OPENCODE_SERVE_ID: serveId,
++            OPENCODE_HEARTBEAT_INTERVAL_MS: String(intervalMs),
++            OPENCODE_TEST_FORCE_HEARTBEAT_FALLBACK: "1",
++          },
++        })
++        expect(server.port).toBeGreaterThan(0)
++
++        const readHeartbeat = (): number | null => {
++          const db = new Database(dbFile)
++          db.exec("PRAGMA busy_timeout=3000;")
++          const row = db.prepare("SELECT heartbeat_at FROM serve_instance WHERE serve_id = ?").get(serveId) as any
++          db.close()
++          return row ? Number(row.heartbeat_at) : null
++        }
++
++        let hb1: number | null = null
++        for (let i = 0; i < 100; i++) {
++          hb1 = readHeartbeat()
++          if (hb1 !== null) break
++          yield* Effect.sleep("100 millis")
++        }
++        expect(hb1).not.toBeNull()
++
++        // No main-loop block here — just confirm the fallback timer advances the
++        // heartbeat over a multi-interval window.
++        yield* Effect.sleep("2500 millis")
++        const hb2 = readHeartbeat()!
++        expect(hb2 - hb1!).toBeGreaterThanOrEqual(intervalMs)
 +      }),
 +    60_000,
 +  )

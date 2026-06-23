@@ -39,7 +39,18 @@
 #                                               the lease token via a Ref) when the assignment still points
 #                                               at this serve — benign owner_generation churn no longer
 #                                               fail-closes the run; only a genuine reassignment to another
-#                                               serve dies "session lease lost mid-run".
+#                                               serve dies "session lease lost mid-run". Fix C (bead
+#                                               workstation-uzig): the self-heartbeat moved OFF the agent
+#                                               event loop onto a worker_threads Worker (inline blob, static
+#                                               import bun:sqlite, own DB handle + busy_timeout) so a
+#                                               CPU-heavy/synchronous turn can't starve it -> no false
+#                                               dead-serve. packages/opencode/src/serve/heartbeat.ts; first-
+#                                               beat handshake + main-thread fallback if the worker can't
+#                                               boot (degrades to pre-Fix-C behavior, never to no heartbeat);
+#                                               worker terminated before markDead. New flags
+#                                               OPENCODE_HEARTBEAT_INTERVAL_MS (prod tunable, default 5000)
+#                                               and OPENCODE_TEST_BLOCK_MAIN_LOOP_MS /
+#                                               OPENCODE_TEST_FORCE_HEARTBEAT_FALLBACK (test-only seams).
 #  10. attach-route-resolve.patch (local)      - pool-aware `opencode attach` (mn9r M7, bead
 #                                               workstation-7zr7): packages/tui/src/util/route.ts
 #                                               (parseServeUrl + resolveServeUrl via pigeon GET /route,
