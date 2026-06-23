@@ -34,7 +34,12 @@
 #                                               and a fenced acquire/renew/release wrap + per-iteration
 #                                               deadline guard around the agent run loop (D2a). Whole
 #                                               feature is gated on OPENCODE_ROUTING_DB; unset = no-op
-#                                               (bead workstation-mn9r).
+#                                               (bead workstation-mn9r). Fix D (bead workstation-oqa1):
+#                                               the renewal fiber re-acquires on a failed renew (rotating
+#                                               the lease token via a Ref) when the assignment still points
+#                                               at this serve — benign owner_generation churn no longer
+#                                               fail-closes the run; only a genuine reassignment to another
+#                                               serve dies "session lease lost mid-run".
 #  10. attach-route-resolve.patch (local)      - pool-aware `opencode attach` (mn9r M7, bead
 #                                               workstation-7zr7): packages/tui/src/util/route.ts
 #                                               (parseServeUrl + resolveServeUrl via pigeon GET /route,

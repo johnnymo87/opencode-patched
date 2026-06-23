@@ -1,5 +1,5 @@
 diff --git a/packages/core/src/flag/flag.ts b/packages/core/src/flag/flag.ts
-index a0eb78a13..01b51ea1a 100644
+index a0eb78a13e..01b51ea1ac 100644
 --- a/packages/core/src/flag/flag.ts
 +++ b/packages/core/src/flag/flag.ts
 @@ -45,6 +45,8 @@ export const Flag = {
@@ -13,7 +13,7 @@ index a0eb78a13..01b51ea1a 100644
    OPENCODE_EXPERIMENTAL_WORKSPACES: enabledByExperimental("OPENCODE_EXPERIMENTAL_WORKSPACES"),
 diff --git a/packages/core/src/serve/routing-lease.ts b/packages/core/src/serve/routing-lease.ts
 new file mode 100644
-index 000000000..92a91af61
+index 0000000000..92a91af610
 --- /dev/null
 +++ b/packages/core/src/serve/routing-lease.ts
 @@ -0,0 +1,478 @@
@@ -497,7 +497,7 @@ index 000000000..92a91af61
 +}
 diff --git a/packages/core/test/serve/routing-lease.test.ts b/packages/core/test/serve/routing-lease.test.ts
 new file mode 100644
-index 000000000..0820da0b8
+index 0000000000..0820da0b80
 --- /dev/null
 +++ b/packages/core/test/serve/routing-lease.test.ts
 @@ -0,0 +1,636 @@
@@ -1138,7 +1138,7 @@ index 000000000..0820da0b8
 +  });
 +});
 diff --git a/packages/opencode/src/cli/cmd/serve.ts b/packages/opencode/src/cli/cmd/serve.ts
-index c0f62b3ca..4bc8c36ec 100644
+index c0f62b3ca0..4bc8c36ec6 100644
 --- a/packages/opencode/src/cli/cmd/serve.ts
 +++ b/packages/opencode/src/cli/cmd/serve.ts
 @@ -1,4 +1,6 @@
@@ -1196,7 +1196,7 @@ index c0f62b3ca..4bc8c36ec 100644
    }),
  })
 diff --git a/packages/opencode/src/session/prompt.ts b/packages/opencode/src/session/prompt.ts
-index b3f85c813..8d76e8924 100644
+index b3f85c813f..e46481c717 100644
 --- a/packages/opencode/src/session/prompt.ts
 +++ b/packages/opencode/src/session/prompt.ts
 @@ -42,13 +42,15 @@ import { Truncate } from "@/tool/truncate"
@@ -1212,7 +1212,7 @@ index b3f85c813..8d76e8924 100644
  import { EventV2Bridge } from "@/event-v2-bridge"
  import { Database } from "@opencode-ai/core/database/database"
 +import { Flag } from "@opencode-ai/core/flag/flag"
-+import { getSharedRoutingLease, getSelfIdentity } from "@opencode-ai/core/serve/routing-lease"
++import { getSharedRoutingLease, getSelfIdentity, type AcquireResult } from "@opencode-ai/core/serve/routing-lease"
  import { SessionEvent } from "@opencode-ai/core/session/event"
  import { SessionMessage } from "@opencode-ai/core/session/message"
  import { ModelV2 } from "@opencode-ai/core/model"
@@ -1268,7 +1268,7 @@ index b3f85c813..8d76e8924 100644
            yield* status.set(sessionID, { type: "busy" })
            yield* Effect.logInfo("loop", { "session.id": sessionID, step })
  
-@@ -1401,10 +1434,65 @@ export const layer = Layer.effect(
+@@ -1401,10 +1434,93 @@ export const layer = Layer.effect(
        },
      )
  
@@ -1291,6 +1291,10 @@ index b3f85c813..8d76e8924 100644
 +          return yield* work                                         // no assignment → D2a fail-open (log once)
 +        }
 +        const token = acq.token!
++        // Hold the live lease token in a Ref so the renewal fiber can rotate it after a
++        // successful re-acquire (benign owner_generation churn), and so the release
++        // finalizer always releases whichever token we currently hold.
++        const tokenRef = yield* Ref.make(token)
 +
 +        // Create the shared state Ref
 +        const guardStateRef = yield* Ref.make<LeaseGuardState>({ validUntil: Date.now() + TTL, lost: false })
@@ -1299,18 +1303,42 @@ index b3f85c813..8d76e8924 100644
 +          leaseGuardStates.delete(sessionID)
 +        }))
 +
-+        yield* Effect.addFinalizer(() => Effect.promise(() => lease.release(token)).pipe(Effect.ignore))   // fenced release on success/cancel/interrupt
++        yield* Effect.addFinalizer(() =>
++          Ref.get(tokenRef).pipe(Effect.flatMap((t) => Effect.promise(() => lease.release(t)).pipe(Effect.ignore))),
++        )   // fenced release of the currently-held token on success/cancel/interrupt
 +        const leaseLost = yield* Deferred.make<void>()
 +        // renewal fiber, scoped (interrupted before release):
-+        yield* Effect.promise(() => lease.renew(token, TTL).catch(() => false)).pipe(
++        yield* Ref.get(tokenRef).pipe(
++          Effect.flatMap((t) => Effect.promise(() => lease.renew(t, TTL).catch(() => false))),
 +          Effect.flatMap((ok) => {
 +            if (ok) {
 +              return Ref.set(guardStateRef, { validUntil: Date.now() + TTL, lost: false })
-+            } else {
-+              return Ref.set(guardStateRef, { validUntil: 0, lost: true }).pipe(
-+                Effect.andThen(Deferred.succeed(leaseLost, undefined))
-+              )
 +            }
++            // Renew CAS failed (e.g. owner_generation was bumped). Before failing closed,
++            // try a fresh acquire: if the assignment still points at THIS serve, rendezvous
++            // merely re-stamped a new generation onto us, so re-acquire at the new generation
++            // and continue with the rotated token. Only fail closed when the session is
++            // genuinely assigned elsewhere (acquire returns ok:false) — preserving the
++            // single-writer invariant.
++            return Effect.promise(() =>
++              lease
++                .acquire({ sessionId: sessionID, serveId: identity.serveId, instanceUuid: identity.instanceUuid, ttlMs: TTL })
++                .catch((): AcquireResult => ({ ok: false, assignmentExists: false })),
++            ).pipe(
++              Effect.flatMap((re) => {
++                if (re.ok && re.token) {
++                  return Ref.set(tokenRef, re.token).pipe(
++                    Effect.andThen(Ref.set(guardStateRef, { validUntil: Date.now() + TTL, lost: false })),
++                    Effect.andThen(
++                      Effect.logInfo(`re-acquired session lease after generation change for ${sessionID}`),
++                    ),
++                  )
++                }
++                return Ref.set(guardStateRef, { validUntil: 0, lost: true }).pipe(
++                  Effect.andThen(Deferred.succeed(leaseLost, undefined)),
++                )
++              }),
++            )
 +          }),
 +          Effect.repeat(Schedule.spaced("10 seconds")),   // TTL/3
 +          Effect.forkScoped,
@@ -1336,7 +1364,7 @@ index b3f85c813..8d76e8924 100644
  
      const shell: (input: ShellInput) => Effect.Effect<SessionV1.WithParts, Session.BusyError> = Effect.fn(
 diff --git a/packages/opencode/test/cli/serve/serve-process.test.ts b/packages/opencode/test/cli/serve/serve-process.test.ts
-index 6dbea372b..70c72cdd0 100644
+index 6dbea372b2..70c72cdd01 100644
 --- a/packages/opencode/test/cli/serve/serve-process.test.ts
 +++ b/packages/opencode/test/cli/serve/serve-process.test.ts
 @@ -9,6 +9,54 @@ import { describe, expect } from "bun:test"
@@ -1476,7 +1504,7 @@ index 6dbea372b..70c72cdd0 100644
 +  )
  })
 diff --git a/packages/opencode/test/session/prompt.test.ts b/packages/opencode/test/session/prompt.test.ts
-index 08828018a..bcef4216f 100644
+index 08828018a4..2b3b2f0820 100644
 --- a/packages/opencode/test/session/prompt.test.ts
 +++ b/packages/opencode/test/session/prompt.test.ts
 @@ -1,12 +1,15 @@
@@ -1506,7 +1534,7 @@ index 08828018a..bcef4216f 100644
  import { SessionRevert } from "../../src/session/revert"
  import { SessionRunState } from "../../src/session/run-state"
  import { MessageID, PartID, SessionID } from "../../src/session/schema"
-@@ -2324,3 +2327,443 @@ noLLMServer.instance(
+@@ -2324,3 +2327,548 @@ noLLMServer.instance(
      }),
    30_000,
  )
@@ -1757,7 +1785,7 @@ index 08828018a..bcef4216f 100644
 +)
 +
 +it.instance(
-+  "leased run: fail-closed if lease is lost mid-run",
++  "leased run: re-acquires and continues when generation bumps but assignment still points to us",
 +  () =>
 +    Effect.gen(function* () {
 +      const { llm } = yield* useServerConfig((url) => providerCfg(url))
@@ -1811,9 +1839,114 @@ index 08828018a..bcef4216f 100644
 +          "5 seconds"
 +        )
 +
-+        // Simulate ownership loss by bumping owner_generation on session_assignment (making renewal fail)
++        // Bump owner_generation but keep desired_serve_id pointing at THIS serve.
++        // This mimics benign generation churn (e.g. a reassign sweep that rendezvous
++        // re-picked the same serve): the next renew fails the CAS, but the assignment
++        // still belongs to us.
 +        const modifyDb = new Database(tempDbPath)
 +        modifyDb.run("UPDATE session_assignment SET owner_generation = 2 WHERE session_id = ?", [chat.id])
++        modifyDb.close()
++
++        // Fix D: the renewal fiber must re-acquire at the bumped generation rather
++        // than fail-closed. Wait for the lease row to be re-stamped at generation 2
++        // (the renewal interval is 10s).
++        const reacquired = yield* pollWithTimeout(
++          Effect.sync(() => {
++            const verifyDb = new Database(tempDbPath)
++            const row = verifyDb.prepare("SELECT * FROM session_lease WHERE session_id = ?").get(chat.id) as any
++            verifyDb.close()
++            return row && row.owner_generation === 2 ? row : undefined
++          }),
++          "lease was not re-acquired at the bumped generation",
++          "14 seconds"
++        )
++        expect(reacquired.serve_id).toBe(serveId)
++        expect(reacquired.instance_uuid).toBe(instanceUuid)
++
++        // Let the held LLM response complete; the run must finish normally (no fail-closed).
++        resolveWait()
++        const result = yield* Fiber.join(runFiber)
++        expect(result.info.role).toBe("assistant")
++
++        // Lease released on the rotated (generation 2) token after completion.
++        const verifyDb = new Database(tempDbPath)
++        const rowAfter = verifyDb.prepare("SELECT * FROM session_lease WHERE session_id = ?").get(chat.id)
++        verifyDb.close()
++        expect(rowAfter).toBeNull()
++      } finally {
++        process.env.OPENCODE_ROUTING_DB = originalFlag
++        ;(Flag as any).OPENCODE_ROUTING_DB = originalFlag
++        __resetSharedRoutingLease()
++        const fs = require("fs")
++        try { fs.unlinkSync(tempDbPath) } catch {}
++      }
++    }),
++  30_000,
++)
++
++it.instance(
++  "leased run: fail-closed when the session is reassigned to a different serve mid-run",
++  () =>
++    Effect.gen(function* () {
++      const { llm } = yield* useServerConfig((url) => providerCfg(url))
++      const prompt = yield* SessionPrompt.Service
++      const sessions = yield* Session.Service
++      const chat = yield* sessions.create({})
++
++      const tempDbPath = path.join(os.tmpdir(), "routing-prompt-test-" + Math.random().toString(36).slice(2) + ".db")
++      const { Database } = require("bun:sqlite")
++      const db = new Database(tempDbPath)
++      db.run(ROUTING_DDL)
++      db.run(
++        "INSERT OR IGNORE INTO routing_meta (id, schema_version, ddl_checksum, binary_epoch, updated_at) VALUES (1, 1, ?, 0, ?)",
++        [TEST_DDL_CHECKSUM, Date.now()]
++      )
++
++      const serveId = "serve-test"
++      const instanceUuid = "uuid-test"
++      const now = Date.now()
++      db.run(
++        "INSERT INTO serve_instance (serve_id, instance_uuid, endpoint, heartbeat_at) VALUES (?, ?, ?, ?)",
++        [serveId, instanceUuid, "http://localhost:1234", now]
++      )
++      db.run(
++        "INSERT INTO session_assignment (session_id, desired_serve_id, owner_generation, state, last_active_at, updated_at) VALUES (?, ?, 1, 'assigned', ?, ?)",
++        [chat.id, serveId, now, now]
++      )
++      db.close()
++
++      const originalFlag = Flag.OPENCODE_ROUTING_DB
++      process.env.OPENCODE_ROUTING_DB = tempDbPath
++      ;(Flag as any).OPENCODE_ROUTING_DB = tempDbPath
++      setSelfIdentity({ serveId, instanceUuid })
++
++      try {
++        const { promise: waitPromise, resolve: resolveWait } = defer<void>()
++        yield* llm.hold("done", waitPromise)
++
++        yield* user(chat.id, "hello")
++        const runFiber = yield* prompt.loop({ sessionID: chat.id }).pipe(Effect.forkChild)
++
++        // Wait until lease is acquired
++        yield* pollWithTimeout(
++          Effect.sync(() => {
++            const verifyDb = new Database(tempDbPath)
++            const row = verifyDb.prepare("SELECT * FROM session_lease WHERE session_id = ?").get(chat.id)
++            verifyDb.close()
++            return row || undefined
++          }),
++          "lease row was never written to routing database",
++          "5 seconds"
++        )
++
++        // Genuine reassignment: bump owner_generation AND repoint desired_serve_id at
++        // ANOTHER serve. The renewal CAS fails and the re-acquire must also fail
++        // (desired_serve_id != us), so the run must fail-closed.
++        const modifyDb = new Database(tempDbPath)
++        modifyDb.run(
++          "UPDATE session_assignment SET owner_generation = 2, desired_serve_id = 'serve-other' WHERE session_id = ?",
++          [chat.id]
++        )
 +        modifyDb.close()
 +
 +        // Wait for renewal fiber to fail-closed (> 10s renewal interval)
