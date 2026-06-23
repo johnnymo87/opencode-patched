@@ -1,0 +1,237 @@
+diff --git a/packages/core/src/project/copy.ts b/packages/core/src/project/copy.ts
+index 0e3246b3b..5be07179b 100644
+--- a/packages/core/src/project/copy.ts
++++ b/packages/core/src/project/copy.ts
+@@ -1,6 +1,6 @@
+ export * as ProjectCopy from "./copy"
+ 
+-import { Context, Effect, Layer, Schema } from "effect"
++import { Context, Deferred, Effect, Layer, Schema } from "effect"
+ import path from "path"
+ import { AbsolutePath } from "../schema"
+ import { FSUtil } from "../fs-util"
+@@ -94,6 +94,30 @@ export type Error =
+   | StrategyUnavailableError
+   | Git.WorktreeError
+ 
++/**
++ * Upper bound on the fan-out concurrency inside {@link Interface.refresh}. A
++ * refresh stats every tracked directory and runs a `git worktree list`
++ * subprocess per source directory; with `concurrency: "unbounded"` a single
++ * refresh over a many-worktree project (one prod refresh touched 136 dirs)
++ * spawned that many subprocesses + fs stats at once, blocking the Bun event
++ * loop. A small fixed cap keeps the subprocess/stat fan-out bounded.
++ * See workstation-sqd5 (opencode 1.17.x reconnect-storm wedge).
++ */
++export const REFRESH_CONCURRENCY = 4
++
++/**
++ * Process-wide single-flight for {@link Interface.refresh}, keyed by projectID.
++ * Each location boot builds a FRESH ProjectCopy.Service (LayerMap + Layer.fresh
++ * in location-layer.ts) and `refreshAfterBoot` runs once per boot, so a
++ * reconnect/poll storm fired one refresh per booting instance for the SAME
++ * project (16-20 concurrent/min in prod, RSS ~19.6 GB, HTTP wedge). This map
++ * lives at module scope — shared across every Service instance in the serve
++ * process — so concurrent refreshes for one projectID coalesce onto a single
++ * in-flight run; the entry is removed when that run settles.
++ * See workstation-sqd5.
++ */
++const refreshInFlight = new Map<Project.ID, Deferred.Deferred<RefreshResult, Error>>()
++
+ export interface Strategy {
+   readonly id: StrategyID
+   readonly create: (input: {
+@@ -230,12 +254,12 @@ export const layer = Layer.effect(
+       )
+     })
+ 
+-    const refresh = Effect.fn("ProjectCopy.refresh")(function* (input: RefreshInput) {
++    const refreshImpl = Effect.fn("ProjectCopy.refresh")(function* (input: RefreshInput) {
+       const stored = yield* directories.list(input.projectID)
+       const checked = yield* Effect.forEach(
+         stored,
+         (item) => fs.isDir(item.directory).pipe(Effect.map((exists) => ({ ...item, exists }))),
+-        { concurrency: "unbounded" },
++        { concurrency: REFRESH_CONCURRENCY },
+       )
+       const sourceDirectories = checked
+         .filter((item) => item.strategy === undefined && item.exists)
+@@ -254,7 +278,7 @@ export const layer = Layer.effect(
+               ),
+             ),
+           ),
+-        { concurrency: "unbounded" },
++        { concurrency: REFRESH_CONCURRENCY },
+       ).pipe(
+         Effect.map((sets) => new Map(sets.flat(2).map((item) => [item.directory, item] as const)).values().toArray()),
+       )
+@@ -287,6 +311,27 @@ export const layer = Layer.effect(
+       return changes
+     })
+ 
++    // Single-flight wrapper: coalesce concurrent refreshes for the same
++    // projectID onto one in-flight run (see refreshInFlight above). A
++    // reconnect/poll storm boots many instances of the same project at once;
++    // without this each fired its own unbounded refresh and the herd blocked
++    // the event loop (workstation-sqd5). The owner runs refreshImpl; late
++    // callers await its result. The entry is cleared when the owner settles.
++    const refresh = Effect.fnUntraced(function* (input: RefreshInput) {
++      const existing = refreshInFlight.get(input.projectID)
++      if (existing) return yield* Deferred.await(existing)
++      const deferred = Deferred.makeUnsafe<RefreshResult, Error>()
++      refreshInFlight.set(input.projectID, deferred)
++      return yield* refreshImpl(input).pipe(
++        Effect.onExit((exit) =>
++          Effect.sync(() => {
++            if (refreshInFlight.get(input.projectID) === deferred) refreshInFlight.delete(input.projectID)
++            Deferred.doneUnsafe(deferred, exit)
++          }),
++        ),
++      )
++    })
++
+     return Service.of({
+       register,
+       create,
+diff --git a/packages/core/test/project-copy.test.ts b/packages/core/test/project-copy.test.ts
+index 47f2176c3..b11bc16c2 100644
+--- a/packages/core/test/project-copy.test.ts
++++ b/packages/core/test/project-copy.test.ts
+@@ -3,7 +3,7 @@ import { $ } from "bun"
+ import fs from "fs/promises"
+ import path from "path"
+ import { eq } from "drizzle-orm"
+-import { Effect, Fiber, Layer, Stream } from "effect"
++import { Deferred, Effect, Fiber, Layer, Stream } from "effect"
+ import { AbsolutePath } from "@opencode-ai/core/schema"
+ import { FSUtil } from "@opencode-ai/core/fs-util"
+ import { Git } from "@opencode-ai/core/git"
+@@ -404,4 +404,128 @@ describe("ProjectCopy", () => {
+       expect(yield* stored(input.projectID)).not.toContainEqual({ directory: missing, strategy: null })
+     }),
+   )
++
++  // workstation-sqd5: the 1.17.x reconnect-storm wedge. refreshAfterBoot runs
++  // once per location boot; a reconnect/poll storm fired N concurrent refreshes
++  // for the same projectID, each with unbounded fan-out (a `git worktree list`
++  // subprocess + fs.isDir per source dir), blocking the event loop. The fix:
++  // (1) coalesce concurrent refreshes per projectID, (2) bound the fan-out.
++  const countingStrategy = (id: string, onList: () => Effect.Effect<void>): ProjectCopy.Strategy => ({
++    id: ProjectCopy.StrategyID.make(id),
++    create: () => Effect.die("unused"),
++    remove: () => Effect.die("unused"),
++    list: () => onList().pipe(Effect.as([])),
++  })
++
++  it.live("coalesces concurrent refreshes for the same projectID into one run", () =>
++    Effect.gen(function* () {
++      const input = yield* setup()
++      const copy = yield* ProjectCopy.Service
++      let listCalls = 0
++      const gate = Deferred.makeUnsafe<void>()
++      yield* copy.register(
++        countingStrategy("test/coalesce", () =>
++          Effect.sync(() => {
++            listCalls++
++          }).pipe(Effect.andThen(Deferred.await(gate))),
++        ),
++      )
++
++      // Fork many concurrent refreshes; the owner blocks inside the counting
++      // strategy while the others must coalesce onto its in-flight run.
++      const fiber = yield* Effect.forEach(
++        Array.from({ length: 16 }),
++        () => copy.refresh({ projectID: input.projectID }),
++        { concurrency: "unbounded" },
++      ).pipe(Effect.forkScoped)
++
++      // Let every caller reach the wrapper and park behind the gated owner.
++      yield* Effect.sleep("150 millis")
++      yield* Deferred.succeed(gate, undefined)
++      const results = yield* Fiber.join(fiber)
++
++      // Exactly one underlying refresh ran; every caller saw the shared result.
++      expect(listCalls).toBe(1)
++      expect(results.length).toBe(16)
++      for (const result of results) expect(result).toEqual(results[0])
++    }),
++  )
++
++  it.live("refreshes distinct projectIDs independently (dedup is keyed on projectID)", () =>
++    Effect.gen(function* () {
++      const input = yield* setup()
++      const copy = yield* ProjectCopy.Service
++      const projectB = Project.ID.make("copy-project-b")
++      yield* input.db
++        .insert(ProjectTable)
++        .values({ id: projectB, worktree: input.sourceDirectory, sandboxes: [], time_created: 1, time_updated: 1 })
++        .run()
++        .pipe(Effect.orDie)
++      yield* input.db
++        .insert(ProjectDirectoryTable)
++        .values({ project_id: projectB, directory: input.sourceDirectory })
++        .run()
++        .pipe(Effect.orDie)
++
++      let listCalls = 0
++      const gate = Deferred.makeUnsafe<void>()
++      yield* copy.register(
++        countingStrategy("test/per-project", () =>
++          Effect.sync(() => {
++            listCalls++
++          }).pipe(Effect.andThen(Deferred.await(gate))),
++        ),
++      )
++
++      const fiber = yield* Effect.forEach(
++        [input.projectID, input.projectID, projectB, projectB],
++        (projectID) => copy.refresh({ projectID }),
++        { concurrency: "unbounded" },
++      ).pipe(Effect.forkScoped)
++      yield* Effect.sleep("150 millis")
++      yield* Deferred.succeed(gate, undefined)
++      yield* Fiber.join(fiber)
++
++      // Two distinct projects => two runs; the duplicate per project coalesced.
++      expect(listCalls).toBe(2)
++    }),
++  )
++
++  it.live("bounds refresh fan-out concurrency", () =>
++    Effect.gen(function* () {
++      const input = yield* setup()
++      const copy = yield* ProjectCopy.Service
++      const n = 12
++      for (let i = 0; i < n; i++) {
++        const dir = abs(`${input.root.path}-src-${i}`)
++        yield* Effect.promise(() => fs.mkdir(dir, { recursive: true }))
++        yield* Effect.addFinalizer(() =>
++          Effect.promise(() => fs.rm(dir, { recursive: true, force: true })).pipe(Effect.ignore),
++        )
++        yield* input.db
++          .insert(ProjectDirectoryTable)
++          .values({ project_id: input.projectID, directory: dir })
++          .run()
++          .pipe(Effect.orDie)
++      }
++
++      let current = 0
++      let max = 0
++      yield* copy.register(
++        countingStrategy("test/concurrency", () =>
++          Effect.gen(function* () {
++            current++
++            max = Math.max(max, current)
++            yield* Effect.sleep("60 millis")
++            current--
++          }),
++        ),
++      )
++
++      yield* copy.refresh({ projectID: input.projectID })
++
++      expect(max).toBeLessThanOrEqual(ProjectCopy.REFRESH_CONCURRENCY)
++      expect(max).toBeGreaterThan(1)
++    }),
++  )
+ })

@@ -71,6 +71,20 @@
 #                                               existing one) was silently dropping all message.*/session.*
 #                                               for the watched session. sessionID is globally unique, so
 #                                               no cross-directory leak. MUST apply after event-session-scope.
+#  12. project-copy-debounce.patch (local)    - tame the 1.17.x reconnect-storm wedge (bead
+#                                               workstation-sqd5). ProjectCopy.refreshAfterBoot runs once
+#                                               per location boot; a reconnect/poll storm fired N concurrent
+#                                               refreshes for the SAME projectID, each with unbounded-
+#                                               concurrency fs.isDir + a `git worktree list` subprocess per
+#                                               source dir (one refresh touched 136 dirs), blocking the Bun
+#                                               event loop (RSS ~19.6 GB, HTTP wedge). Fix in
+#                                               packages/core/src/project/copy.ts: (a) a module-scope
+#                                               single-flight Map<projectID, Deferred> so concurrent
+#                                               refreshes coalesce onto one run (each location boot builds a
+#                                               FRESH Service via LayerMap+Layer.fresh, so the dedup MUST be
+#                                               module-level), and (b) replace concurrency:"unbounded" with
+#                                               REFRESH_CONCURRENCY=4 at both fan-out sites. Disjoint from
+#                                               all other patches (only file touched besides its test).
 #
 # DROPPED on the v1.17 line (see workstation docs/plans/2026-06-11-opencode-1.17-cutover-runbook.md):
 #   - prompt-loop-cache.patch (#25367) + cache-aligned-compaction.patch (#25100):
@@ -135,6 +149,7 @@ PATCHES=(
   serve-lease
   attach-route-resolve
   event-cold-start-directory
+  project-copy-debounce
 )
 
 for name in "${PATCHES[@]}"; do
