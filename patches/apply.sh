@@ -85,6 +85,41 @@
 #                                               module-level), and (b) replace concurrency:"unbounded" with
 #                                               REFRESH_CONCURRENCY=4 at both fan-out sites. Disjoint from
 #                                               all other patches (only file touched besides its test).
+#                                               EXTENDED (bead workstation-wvv2): also DISABLE the per-boot
+#                                               refresh BY DEFAULT to kill its per-boot O(#dirs) cost
+#                                               (~136 dirs / ~300 git subprocesses = a core pegged for
+#                                               minutes on every cold boot). A guard at the head of
+#                                               refreshAfterBoot returns early unless
+#                                               OPENCODE_PROJECT_COPY_REFRESH_ON_BOOT === "1" (unset =
+#                                               disabled = fork default; ="1" restores upstream every-boot
+#                                               behavior). Safe headless: source dirs self-register via
+#                                               Project.saveProjectDirectory on open, the Move Session
+#                                               dialog refreshes on demand, project identity is git-derived;
+#                                               the explicit refresh() API is untouched (gate is only at the
+#                                               boot entry). Consumer-inventory + verdict in
+#                                               docs/plans/2026-06-23-projectcopy-refresh-cost-design.md.
+#  13. step-end-diff-bound.patch (local)     - bound the step-end summary diff that pins one core at 100%
+#                                               CPU forever (upstream anomalyco/opencode#29762; bead
+#                                               workstation-0lik). Snapshot.diffFull (packages/opencode/src/
+#                                               snapshot/index.ts) built per-file unified diffs at step-end
+#                                               summary time via jsdiff structuredPatch(...,{context:
+#                                               MAX_SAFE_INTEGER}) with NO bound. jsdiff Myers diff is
+#                                               O(N*D); a full-file rewrite of a sub-2MB file drives D~=N+M,
+#                                               pinning the single JS thread for minutes + ~1GB path-array
+#                                               alloc while the Bun event loop is blocked (silent, zero I/O,
+#                                               matches the gdb fixed-PC profile). summary runs via
+#                                               Effect.forkIn but that's a cooperative fiber on the SAME
+#                                               thread, so a synchronous jsdiff call still freezes the loop.
+#                                               Fix: new exported boundedFilePatch() + named constants
+#                                               (SNAPSHOT_DIFF_MAX_BYTES=1MiB, _MAX_EDIT_LENGTH=4000,
+#                                               _TIMEOUT_MS=1000) compose a cheap size pre-guard with jsdiff's
+#                                               own {maxEditLength,timeout}; when any cap trips it returns
+#                                               undefined so the OPTIONAL FileDiff.patch field is omitted
+#                                               (counts-only) — consumers already guard typeof patch!=="string"
+#                                               (app/src/utils/diffs.ts), so omission is parser-safe. Only
+#                                               touches snapshot/index.ts + its new test; disjoint from all
+#                                               other patches. DOES NOT address the distinct, uncharacterized
+#                                               flat-RSS read-only-subagent spin variant (#32965) — deferred.
 #
 # DROPPED on the v1.17 line (see workstation docs/plans/2026-06-11-opencode-1.17-cutover-runbook.md):
 #   - prompt-loop-cache.patch (#25367) + cache-aligned-compaction.patch (#25100):
@@ -150,6 +185,7 @@ PATCHES=(
   attach-route-resolve
   event-cold-start-directory
   project-copy-debounce
+  step-end-diff-bound
 )
 
 for name in "${PATCHES[@]}"; do

@@ -1,5 +1,5 @@
 diff --git a/packages/core/src/project/copy.ts b/packages/core/src/project/copy.ts
-index 0e3246b3b..5be07179b 100644
+index 0e3246b3b..653e21e5c 100644
 --- a/packages/core/src/project/copy.ts
 +++ b/packages/core/src/project/copy.ts
 @@ -1,6 +1,6 @@
@@ -41,7 +41,35 @@ index 0e3246b3b..5be07179b 100644
  export interface Strategy {
    readonly id: StrategyID
    readonly create: (input: {
-@@ -230,12 +254,12 @@ export const layer = Layer.effect(
+@@ -123,7 +147,27 @@ export interface Interface {
+ 
+ export class Service extends Context.Service<Service, Interface>()("@opencode/ProjectCopy") {}
+ 
++/**
++ * Env flag that re-enables the per-boot project-copy refresh. Default (unset or
++ * anything but "1") = DISABLED: {@link refreshAfterBoot} is a no-op.
++ *
++ * The boot refresh runs a full O(#tracked-dirs) scan — fs.isDir per dir plus a
++ * `git worktree list` subprocess per source dir (one prod refresh touched 136
++ * dirs / ~300 subprocesses) — on EVERY location boot (location-layer.ts wires it
++ * via Layer.fresh, idleTTL 60m), pegging a core for minutes on big multi-worktree
++ * projects. Nothing in the headless serve/TUI path depends on it: source dirs
++ * self-register via Project.saveProjectDirectory on open, the Move Session dialog
++ * triggers its own on-demand refresh, and project identity is git-derived
++ * (Project.resolve), not directory-index-derived. So the fork build disables the
++ * boot refresh by default; set OPENCODE_PROJECT_COPY_REFRESH_ON_BOOT=1 to restore
++ * the upstream every-boot behavior. The explicit refresh() API + Move Session
++ * dialog call copies.refresh() directly and are unaffected (the gate is only at
++ * the boot entry point). See workstation-wvv2 (builds on workstation-sqd5).
++ */
++export const REFRESH_ON_BOOT_ENV = "OPENCODE_PROJECT_COPY_REFRESH_ON_BOOT"
++
+ export const refreshAfterBoot = Effect.gen(function* () {
++  if (process.env[REFRESH_ON_BOOT_ENV] !== "1") return
+   const location = yield* Location.Service
+   const boot = yield* PluginBoot.Service
+   const copies = yield* Service
+@@ -230,12 +274,12 @@ export const layer = Layer.effect(
        )
      })
  
@@ -56,7 +84,7 @@ index 0e3246b3b..5be07179b 100644
        )
        const sourceDirectories = checked
          .filter((item) => item.strategy === undefined && item.exists)
-@@ -254,7 +278,7 @@ export const layer = Layer.effect(
+@@ -254,7 +298,7 @@ export const layer = Layer.effect(
                ),
              ),
            ),
@@ -65,7 +93,7 @@ index 0e3246b3b..5be07179b 100644
        ).pipe(
          Effect.map((sets) => new Map(sets.flat(2).map((item) => [item.directory, item] as const)).values().toArray()),
        )
-@@ -287,6 +311,27 @@ export const layer = Layer.effect(
+@@ -287,6 +331,27 @@ export const layer = Layer.effect(
        return changes
      })
  
@@ -94,10 +122,10 @@ index 0e3246b3b..5be07179b 100644
        register,
        create,
 diff --git a/packages/core/test/project-copy.test.ts b/packages/core/test/project-copy.test.ts
-index 47f2176c3..b11bc16c2 100644
+index 47f2176c3..0b3f91211 100644
 --- a/packages/core/test/project-copy.test.ts
 +++ b/packages/core/test/project-copy.test.ts
-@@ -3,7 +3,7 @@ import { $ } from "bun"
+@@ -3,13 +3,15 @@ import { $ } from "bun"
  import fs from "fs/promises"
  import path from "path"
  import { eq } from "drizzle-orm"
@@ -106,7 +134,15 @@ index 47f2176c3..b11bc16c2 100644
  import { AbsolutePath } from "@opencode-ai/core/schema"
  import { FSUtil } from "@opencode-ai/core/fs-util"
  import { Git } from "@opencode-ai/core/git"
-@@ -404,4 +404,128 @@ describe("ProjectCopy", () => {
+ import { Database } from "@opencode-ai/core/database/database"
+ import { EventV2 } from "@opencode-ai/core/event"
+ import { Project } from "@opencode-ai/core/project"
++import { Location } from "@opencode-ai/core/location"
++import { PluginBoot } from "@opencode-ai/core/plugin/boot"
+ import { ProjectDirectoryTable, ProjectTable } from "@opencode-ai/core/project/sql"
+ import { ProjectCopy } from "@opencode-ai/core/project/copy"
+ import { ProjectDirectories } from "@opencode-ai/core/project/directories"
+@@ -404,4 +406,210 @@ describe("ProjectCopy", () => {
        expect(yield* stored(input.projectID)).not.toContainEqual({ directory: missing, strategy: null })
      }),
    )
@@ -232,6 +268,88 @@ index 47f2176c3..b11bc16c2 100644
 +
 +      expect(max).toBeLessThanOrEqual(ProjectCopy.REFRESH_CONCURRENCY)
 +      expect(max).toBeGreaterThan(1)
++    }),
++  )
++
++  // workstation-wvv2: the per-boot refresh COST. refreshAfterBoot runs a full
++  // O(#tracked-dirs) scan (fs.isDir + a `git worktree list` subprocess per
++  // source dir) on EVERY location boot (Layer.fresh, idleTTL 60m). The fork
++  // build DISABLES the boot refresh by DEFAULT — nothing in the headless
++  // serve/TUI path depends on it (source dirs self-register via
++  // Project.saveProjectDirectory on open; the Move Session dialog refreshes on
++  // demand; project identity is git-derived, not index-derived). The boot
++  // refresh runs only when OPENCODE_PROJECT_COPY_REFRESH_ON_BOOT === "1". The
++  // explicit refresh() API + Move Session dialog are gated only here at the
++  // boot entry, so they are unaffected.
++  const REFRESH_ON_BOOT_ENV = "OPENCODE_PROJECT_COPY_REFRESH_ON_BOOT"
++
++  const withBootRefreshEnv = (value: string | undefined) =>
++    Effect.acquireRelease(
++      Effect.sync(() => {
++        const prev = process.env[REFRESH_ON_BOOT_ENV]
++        if (value === undefined) delete process.env[REFRESH_ON_BOOT_ENV]
++        else process.env[REFRESH_ON_BOOT_ENV] = value
++        return prev
++      }),
++      (prev) =>
++        Effect.sync(() => {
++          if (prev === undefined) delete process.env[REFRESH_ON_BOOT_ENV]
++          else process.env[REFRESH_ON_BOOT_ENV] = prev
++        }),
++    )
++
++  const bootLayers = (input: { projectID: Project.ID; sourceDirectory: AbsolutePath }) =>
++    Layer.mergeAll(
++      Layer.mock(Location.Service, {
++        directory: input.sourceDirectory,
++        workspaceID: undefined,
++        project: { id: input.projectID, directory: input.sourceDirectory },
++        vcs: undefined,
++      }),
++      Layer.mock(PluginBoot.Service, { wait: () => Effect.void }),
++    )
++
++  it.live("refreshAfterBoot is a no-op when OPENCODE_PROJECT_COPY_REFRESH_ON_BOOT is unset (default off)", () =>
++    Effect.gen(function* () {
++      const input = yield* setup()
++      const copy = yield* ProjectCopy.Service
++      let listCalls = 0
++      yield* copy.register(
++        countingStrategy("test/boot-default-off", () =>
++          Effect.sync(() => {
++            listCalls++
++          }),
++        ),
++      )
++      yield* withBootRefreshEnv(undefined)
++
++      yield* ProjectCopy.refreshAfterBoot.pipe(Effect.provide(bootLayers(input)))
++      // refreshAfterBoot forks its work; give a forked refresh ample time to run.
++      yield* Effect.sleep("300 millis")
++
++      expect(listCalls).toBe(0)
++    }),
++  )
++
++  it.live("refreshAfterBoot runs the refresh when OPENCODE_PROJECT_COPY_REFRESH_ON_BOOT=1", () =>
++    Effect.gen(function* () {
++      const input = yield* setup()
++      const copy = yield* ProjectCopy.Service
++      let listCalls = 0
++      const ran = Deferred.makeUnsafe<void>()
++      yield* copy.register(
++        countingStrategy("test/boot-enabled", () =>
++          Effect.sync(() => {
++            listCalls++
++          }).pipe(Effect.andThen(Deferred.succeed(ran, undefined))),
++        ),
++      )
++      yield* withBootRefreshEnv("1")
++
++      yield* ProjectCopy.refreshAfterBoot.pipe(Effect.provide(bootLayers(input)))
++      yield* Deferred.await(ran).pipe(Effect.timeout("5 seconds"))
++
++      expect(listCalls).toBeGreaterThanOrEqual(1)
 +    }),
 +  )
  })

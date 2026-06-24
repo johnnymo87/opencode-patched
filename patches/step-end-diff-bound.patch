@@ -1,0 +1,172 @@
+diff --git a/packages/opencode/src/snapshot/index.ts b/packages/opencode/src/snapshot/index.ts
+index fd25437bb..8c5cbd709 100644
+--- a/packages/opencode/src/snapshot/index.ts
++++ b/packages/opencode/src/snapshot/index.ts
+@@ -31,6 +31,69 @@ export type FileDiff = typeof FileDiff.Type
+ const prune = "7.days"
+ const limit = 2 * 1024 * 1024
+ const core = ["-c", "core.longpaths=true", "-c", "core.symlinks=true"]
++
++// --- Bounded step-end summary diff (upstream anomalyco/opencode#29762; bead workstation-0lik) ---
++//
++// `diffFull` builds a per-file unified diff at step-end summary time
++// (Session.summary -> computeDiff -> Snapshot.diffFull). It previously called
++// jsdiff `structuredPatch(..., { context: Number.MAX_SAFE_INTEGER })` with NO
++// upper bound. jsdiff's Myers diff is O(N*D); a full-file rewrite of a sub-2MB
++// file drives the edit distance D ~= N+M, which pins the single JS thread for
++// minutes and allocates ~1GB of path arrays while the Bun event loop is fully
++// blocked (no logs, no I/O, single core at 100% — the reported spin). The
++// summary runs via `Effect.forkIn`, but that is a cooperative fiber on the SAME
++// thread, so a synchronous jsdiff call still freezes everything.
++//
++// `boundedFilePatch` caps the work three composing ways and, when any cap trips,
++// omits the inline patch text by returning `undefined`. The optional
++// `FileDiff.patch` field is then dropped while the caller keeps the cheap
++// additions/deletions counts from `git --numstat`. Downstream consumers already
++// treat a non-string patch as "no inline diff available"
++// (packages/app/src/utils/diffs.ts guards `typeof value.patch !== "string"`;
++// the TUI renders with `when={entry.file.patch}`), so omission is safe — and
++// parser-safe, unlike a fake placeholder string which would be fed to the diff
++// parser.
++
++/**
++ * Combined `before.length + after.length` byte ceiling. Above this we skip
++ * inline diffing entirely (cheap O(1) pre-guard). With
++ * `context: Number.MAX_SAFE_INTEGER` the patch text for a large file is enormous
++ * regardless of how many lines actually changed, and the Myers cost is
++ * potentially unbounded, so a counts-only diff is the right trade-off here.
++ * Default 1 MiB: comfortably larger than ordinary edits, while a full-file
++ * rewrite of a file near the 2 MiB snapshot `limit` (combined ~4 MiB) is caught.
++ */
++export const SNAPSHOT_DIFF_MAX_BYTES = 1024 * 1024
++
++/**
++ * jsdiff Myers edit-distance ceiling. `structuredPatch` returns `undefined`
++ * once the edit length exceeds this, bounding the work for pathological
++ * many-change diffs that still slip under {@link SNAPSHOT_DIFF_MAX_BYTES}.
++ * Default 4000: generous for real edits, but caps the O(N*D) blow-up.
++ */
++export const SNAPSHOT_DIFF_MAX_EDIT_LENGTH = 4000
++
++/**
++ * jsdiff wall-clock ceiling in ms. A hard belt-and-suspenders stop so a single
++ * diff can never block the event loop for longer than this. Default 1000 ms.
++ */
++export const SNAPSHOT_DIFF_TIMEOUT_MS = 1000
++
++/**
++ * Bounded replacement for the inline step-end patch computation. Returns the
++ * unified-diff text, or `undefined` when any bound trips (caller omits the
++ * optional `patch` field and keeps counts only).
++ */
++export function boundedFilePatch(file: string, before: string, after: string): string | undefined {
++  if (before.length + after.length > SNAPSHOT_DIFF_MAX_BYTES) return undefined
++  const structured = structuredPatch(file, file, before, after, "", "", {
++    context: Number.MAX_SAFE_INTEGER,
++    maxEditLength: SNAPSHOT_DIFF_MAX_EDIT_LENGTH,
++    timeout: SNAPSHOT_DIFF_TIMEOUT_MS,
++  })
++  if (!structured) return undefined
++  return formatPatch(structured)
++}
+ const cfg = ["-c", "core.autocrlf=false", ...core]
+ const quote = [...cfg, "-c", "core.quotepath=false"]
+ interface GitResult {
+@@ -732,8 +795,6 @@ export const layer: Layer.Layer<Service, never, FSUtil.Service | AppProcess.Serv
+               }
+ 
+               const step = 100
+-              const patch = (file: string, before: string, after: string) =>
+-                formatPatch(structuredPatch(file, file, before, after, "", "", { context: Number.MAX_SAFE_INTEGER }))
+ 
+               for (let i = 0; i < rows.length; i += step) {
+                 const run = rows.slice(i, i + step)
+@@ -744,7 +805,7 @@ export const layer: Layer.Layer<Service, never, FSUtil.Service | AppProcess.Serv
+                   const [before, after] = row.binary ? ["", ""] : text ? [hit.before, hit.after] : yield* show(row)
+                   result.push({
+                     file: row.file,
+-                    patch: row.binary ? "" : patch(row.file, before, after),
++                    patch: row.binary ? "" : boundedFilePatch(row.file, before, after),
+                     additions: row.additions,
+                     deletions: row.deletions,
+                     status: row.status,
+diff --git a/packages/opencode/test/snapshot/bounded-diff.test.ts b/packages/opencode/test/snapshot/bounded-diff.test.ts
+new file mode 100644
+index 000000000..c31ca7110
+--- /dev/null
++++ b/packages/opencode/test/snapshot/bounded-diff.test.ts
+@@ -0,0 +1,74 @@
++import { describe, expect, test } from "bun:test"
++import {
++  boundedFilePatch,
++  SNAPSHOT_DIFF_MAX_BYTES,
++  SNAPSHOT_DIFF_MAX_EDIT_LENGTH,
++} from "../../src/snapshot"
++
++// Regression tests for the step-end "100% CPU forever" spin
++// (upstream anomalyco/opencode#29762; bead workstation-0lik).
++//
++// Snapshot.diffFull builds a per-file unified diff at step-end summary time via
++// jsdiff `structuredPatch(..., { context: Number.MAX_SAFE_INTEGER })` with NO
++// bound. jsdiff's Myers diff is O(N*D); a full-file rewrite of a sub-2MB file
++// drives D ~= N+M, pinning the single JS thread for minutes and allocating
++// ~1GB of path arrays while the Bun event loop is blocked. `boundedFilePatch`
++// is the bounded replacement: it caps the work and, when any cap trips, omits
++// the inline patch text (returns undefined -> the optional FileDiff.patch field
++// is dropped) while the caller keeps the cheap additions/deletions counts.
++
++// Build deterministic multi-line content of roughly `targetBytes` bytes.
++const blob = (targetBytes: number, make: (i: number) => string) => {
++  const out: string[] = []
++  let size = 0
++  for (let i = 0; size < targetBytes; i++) {
++    const line = make(i)
++    out.push(line)
++    size += line.length + 1 // newline
++  }
++  return out.join("\n") + "\n"
++}
++
++describe("boundedFilePatch (#29762 / workstation-0lik)", () => {
++  test("returns a real unified patch for a small change", () => {
++    const before = "alpha\nbeta\ngamma\n"
++    const after = "alpha\nBETA\ngamma\n"
++    const patch = boundedFilePatch("f.txt", before, after)
++    expect(typeof patch).toBe("string")
++    expect(patch).toContain("-beta")
++    expect(patch).toContain("+BETA")
++  })
++
++  test("omits the patch (counts-only) when combined size exceeds the byte ceiling, without an O(N*D) spin", () => {
++    // The upstream #29762 repro shape: two ~2MB full-file-different blobs.
++    const before = blob(2_000_000, (i) => `A-${i}-${(i * 7919) % 100000}-${"x".repeat(32)}`)
++    const after = blob(2_000_000, (i) => `B-${i}-${(i * 104729) % 100003}-${"y".repeat(32)}`)
++    expect(before.length + after.length).toBeGreaterThan(SNAPSHOT_DIFF_MAX_BYTES)
++
++    const start = performance.now()
++    const patch = boundedFilePatch("foo.json", before, after)
++    const elapsed = performance.now() - start
++
++    expect(patch).toBeUndefined()
++    // Pre-guard short-circuits before jsdiff runs: must be effectively instant,
++    // never the multi-second/minute Myers explosion this fix exists to prevent.
++    expect(elapsed).toBeLessThan(500)
++  })
++
++  test("omits the patch when the edit distance exceeds maxEditLength (under the byte ceiling)", () => {
++    // Stay under the byte ceiling but force D >> maxEditLength via a full rewrite
++    // of many short lines. The bound must abort and yield counts-only.
++    const count = SNAPSHOT_DIFF_MAX_EDIT_LENGTH * 2
++    const before = Array.from({ length: count }, (_, i) => `old-${i}`).join("\n") + "\n"
++    const after = Array.from({ length: count }, (_, i) => `new-${i}`).join("\n") + "\n"
++    expect(before.length + after.length).toBeLessThan(SNAPSHOT_DIFF_MAX_BYTES)
++
++    const start = performance.now()
++    const patch = boundedFilePatch("data.txt", before, after)
++    const elapsed = performance.now() - start
++
++    expect(patch).toBeUndefined()
++    // Bounded by maxEditLength + timeout: must finish quickly, not spin.
++    expect(elapsed).toBeLessThan(2000)
++  })
++})
