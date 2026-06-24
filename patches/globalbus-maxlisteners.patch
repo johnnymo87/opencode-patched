@@ -1,0 +1,60 @@
+diff --git a/packages/opencode/src/bus/global.ts b/packages/opencode/src/bus/global.ts
+index 3cfd45362..039ee5add 100644
+--- a/packages/opencode/src/bus/global.ts
++++ b/packages/opencode/src/bus/global.ts
+@@ -20,3 +20,12 @@ class GlobalBusEmitter extends EventEmitter<{
+ }
+ 
+ export const GlobalBus = new GlobalBusEmitter()
++// qjk4 M3.3: every `GET /global/event` SSE client attaches one
++// `GlobalBus.on("event", ...)` listener (handlers/global.ts) and the per-instance
++// `/event` disposed sub-stream attaches one more. A serve that owns many
++// sessions/TUIs (load concentrated on one serve via HRW sharding) blows past
++// Node's default cap of 10, emitting a MaxListenersExceededWarning that is both
++// noise and a false-positive that could mask a real listener leak. The
++// disposed-listener-per-client pattern is legitimate fan-out, not a leak, so
++// uncap it (0 = unlimited) rather than picking an arbitrary finite ceiling.
++GlobalBus.setMaxListeners(0)
+diff --git a/packages/opencode/test/bus/global.test.ts b/packages/opencode/test/bus/global.test.ts
+new file mode 100644
+index 000000000..022f74ea5
+--- /dev/null
++++ b/packages/opencode/test/bus/global.test.ts
+@@ -0,0 +1,37 @@
++import { afterEach, expect, test } from "bun:test"
++import { GlobalBus } from "@/bus/global"
++
++// qjk4 M3.3: GlobalBus must allow unlimited "event" listeners.
++//
++// Every `GET /global/event` SSE client registers one `GlobalBus.on("event", ...)`
++// listener (server/routes/instance/httpapi/handlers/global.ts), and the
++// per-instance `/event` disposed sub-stream registers one more. A serve that
++// owns many sessions/TUIs (e.g. a swarm coordinator + workers colocated via HRW
++// sharding, or all the box's busy coding sessions concentrated on one serve)
++// therefore attaches well over Node's default cap of 10 "event" listeners. Left
++// at the default, Node emits a `MaxListenersExceededWarning` and — worse — that
++// false-positive can mask a genuine listener leak elsewhere. setMaxListeners(0)
++// = unlimited (bead workstation-qjk4).
++
++afterEach(() => {
++  GlobalBus.removeAllListeners("event")
++})
++
++test("GlobalBus allows unlimited event listeners (setMaxListeners(0))", () => {
++  expect(GlobalBus.getMaxListeners()).toBe(0)
++})
++
++test("attaching 20 event listeners emits no MaxListenersExceededWarning", () => {
++  const warnings: Error[] = []
++  const onWarning = (w: Error) => {
++    if (w.name === "MaxListenersExceededWarning") warnings.push(w)
++  }
++  process.on("warning", onWarning)
++  try {
++    const handlers = Array.from({ length: 20 }, () => () => {})
++    for (const h of handlers) GlobalBus.on("event", h)
++    expect(warnings).toHaveLength(0)
++  } finally {
++    process.off("warning", onWarning)
++  }
++})

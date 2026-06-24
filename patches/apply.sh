@@ -202,6 +202,7 @@ PATCHES=(
   event-cold-start-directory
   project-copy-debounce
   step-end-diff-bound
+  globalbus-maxlisteners
 )
 
 for name in "${PATCHES[@]}"; do
