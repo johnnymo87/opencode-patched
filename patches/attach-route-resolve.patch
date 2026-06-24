@@ -85,18 +85,19 @@ index 668eebc13..9f523484d 100644
                                            fetch={input.fetch}
                                            headers={input.headers}
 diff --git a/packages/tui/src/context/sdk.tsx b/packages/tui/src/context/sdk.tsx
-index 93180c6e2..19c9fbab8 100644
+index 93180c6e2..e7452ae68 100644
 --- a/packages/tui/src/context/sdk.tsx
 +++ b/packages/tui/src/context/sdk.tsx
-@@ -2,6 +2,7 @@ import { createOpencodeClient } from "@opencode-ai/sdk/v2"
+@@ -2,6 +2,8 @@ import { createOpencodeClient } from "@opencode-ai/sdk/v2"
  import type { GlobalEvent } from "@opencode-ai/sdk/v2"
  import { Flag } from "@opencode-ai/core/flag/flag"
  import { createSimpleContext } from "./helper"
 +import { resolveServeUrl } from "../util/route"
++import { runSseAttempt } from "../util/sse"
  import { batch, onCleanup, onMount } from "solid-js"
  
  export type EventSource = {
-@@ -12,6 +13,7 @@ export const { use: useSDK, provider: SDKProvider } = createSimpleContext({
+@@ -12,6 +14,7 @@ export const { use: useSDK, provider: SDKProvider } = createSimpleContext({
    name: "SDK",
    init: (props: {
      url: string
@@ -104,7 +105,7 @@ index 93180c6e2..19c9fbab8 100644
      directory?: string
      fetch?: typeof fetch
      headers?: RequestInit["headers"]
-@@ -20,9 +22,14 @@ export const { use: useSDK, provider: SDKProvider } = createSimpleContext({
+@@ -20,9 +23,14 @@ export const { use: useSDK, provider: SDKProvider } = createSimpleContext({
      const abort = new AbortController()
      let sse: AbortController | undefined
  
@@ -120,68 +121,72 @@ index 93180c6e2..19c9fbab8 100644
          signal: abort.signal,
          directory: props.directory,
          fetch: props.fetch,
-@@ -88,20 +95,48 @@ export const { use: useSDK, provider: SDKProvider } = createSimpleContext({
+@@ -88,22 +96,50 @@ export const { use: useSDK, provider: SDKProvider } = createSimpleContext({
          while (true) {
            if (abort.signal.aborted || ctrl.signal.aborted) break
  
 -          const events = await sdk.global.event({
 -            signal: ctrl.signal,
 -            sseMaxRetryAttempts: 0,
--          })
--
++          // Each (re)connect runs as a discrete attempt with its OWN
++          // AbortController (runSseAttempt), torn down before the next one
++          // opens. Sharing one long-lived controller across reconnects (as the
++          // first cut did) leaked one ESTABLISHED connection per reconnect up
++          // to the per-origin pool cap and pinned a serve's event loop — and
++          // calling resolveServeUrl with the long-lived signal accumulated an
++          // AbortSignal.any listener per iteration (bead workstation-lyj0).
++          await runSseAttempt<GlobalEvent>({
++            parentSignal: ctrl.signal,
++            // Follow a session that migrated serves (pool-health reshuffle /
++            // idle-migration). Re-resolve the owning serve from pigeon /route
++            // before each (re)connect and rebuild the whole client if it moved,
++            // so REST/control submits follow too (a non-owner serve can reject a
++            // prompt under serve-lease enforcement). Any /route failure degrades
++            // to the current url, so this is never worse than reconnecting in
++            // place. The per-attempt `signal` keeps resolveServeUrl's bounded
++            // AbortSignal.any listener short-lived.
++            open: async (signal) => {
++              if (props.sessionID) {
++                const next = await resolveServeUrl({
++                  sessionID: props.sessionID,
++                  fallback: currentUrl,
++                  signal,
++                })
++                if (next !== currentUrl) {
++                  currentUrl = next
++                  sdk = createSDK()
++                }
++              }
++              return sdk.global.event({
++                signal,
++                sseMaxRetryAttempts: 0,
++              })
++            },
++            onOpen: async () => {
++              if (Flag.OPENCODE_EXPERIMENTAL_WORKSPACES) {
++                // Start syncing workspaces, it's important to do this after
++                // we've started listening to events
++                await sdk.sync.start().catch(() => {})
++              }
++            },
++            onEvent: handleEvent,
+           })
+ 
 -          if (Flag.OPENCODE_EXPERIMENTAL_WORKSPACES) {
 -            // Start syncing workspaces, it's important to do this after
 -            // we've started listening to events
 -            await sdk.sync.start().catch(() => {})
-+          // Follow a session that migrated serves (pool-health reshuffle /
-+          // idle-migration). Re-resolve the owning serve from pigeon /route
-+          // before each (re)connect and rebuild the whole client if it moved,
-+          // so REST/control submits follow too (a non-owner serve can reject a
-+          // prompt under serve-lease enforcement). Any /route failure degrades
-+          // to the current url, so this is never worse than reconnecting in
-+          // place.
-+          if (props.sessionID) {
-+            const next = await resolveServeUrl({
-+              sessionID: props.sessionID,
-+              fallback: currentUrl,
-+              signal: ctrl.signal,
-+            })
-+            if (next !== currentUrl) {
-+              currentUrl = next
-+              sdk = createSDK()
-+            }
-           }
- 
+-          }
+-
 -          for await (const event of events.stream) {
 -            if (ctrl.signal.aborted) break
 -            handleEvent(event)
-+          try {
-+            const events = await sdk.global.event({
-+              signal: ctrl.signal,
-+              sseMaxRetryAttempts: 0,
-+            })
-+
-+            if (Flag.OPENCODE_EXPERIMENTAL_WORKSPACES) {
-+              // Start syncing workspaces, it's important to do this after
-+              // we've started listening to events
-+              await sdk.sync.start().catch(() => {})
-+            }
-+
-+            for await (const event of events.stream) {
-+              if (ctrl.signal.aborted) break
-+              handleEvent(event)
-+            }
-+          } catch {
-+            // SSE connect/stream error: a non-2xx (409/410/421/503), a refused
-+            // connection, or a mid-stream network drop. These all signal the
-+            // owning serve moved or went unhealthy (pool rediscover triggers).
-+            // Swallow and fall through to backoff + re-resolve + reconnect
-+            // instead of letting the error escape and kill the loop (which is
-+            // what upstream does — a thrown error permanently stops SSE).
-           }
- 
+-          }
+-
            if (timer) clearTimeout(timer)
-@@ -145,7 +180,9 @@ export const { use: useSDK, provider: SDKProvider } = createSimpleContext({
+           if (queue.length > 0) flush()
+           attempt += 1
+@@ -145,7 +181,9 @@ export const { use: useSDK, provider: SDKProvider } = createSimpleContext({
        directory: props.directory,
        event: emitter,
        fetch: props.fetch ?? fetch,
@@ -376,4 +381,205 @@ index 000000000..f2a80130c
 +    fetch: fakeFetch,
 +  })
 +  expect(result).toBe("http://127.0.0.1:4096")
++})
+diff --git a/packages/tui/src/util/sse.ts b/packages/tui/src/util/sse.ts
+new file mode 100644
+index 000000000..bad573530
+--- /dev/null
++++ b/packages/tui/src/util/sse.ts
+@@ -0,0 +1,58 @@
++/**
++ * Run ONE SSE connect+pump attempt with guaranteed teardown.
++ *
++ * `open(signal)` opens an event stream bound to a FRESH per-attempt
++ * AbortController; every event is pumped to `onEvent`; and — no matter how the
++ * attempt ends (stream completes, throws mid-stream, or `parentSignal` aborts)
++ * — that controller is aborted in a `finally`. Aborting forces the underlying
++ * fetch/connection closed instead of leaving it ESTABLISHED in the client's
++ * keep-alive pool.
++ *
++ * Why this matters: the previous reconnect loop shared ONE long-lived
++ * AbortController across every reconnect and never closed a finished attempt's
++ * stream, so each reconnect leaked one ESTABLISHED connection up to the
++ * per-origin pool cap (256). 18 idle `opencode attach` TUIs that all fell back
++ * to the default serve thereby pinned a single serve's event loop with ~4600
++ * connections (bead workstation-lyj0).
++ *
++ * The parent->attempt abort bridge is registered AND removed every call
++ * (balanced), so repeated calls against one long-lived `parentSignal` never
++ * accumulate listeners — the prior `AbortSignal.any(...)`-per-iteration form
++ * added a listener it never removed, tripping Node's
++ * MaxListenersExceededWarning.
++ *
++ * Never throws: connect/iterate errors are swallowed so the caller's reconnect
++ * loop continues (matches the prior inline behavior).
++ */
++export async function runSseAttempt<T>(opts: {
++  open: (signal: AbortSignal) => Promise<{ stream: AsyncIterable<T> }>
++  onEvent: (event: T) => void
++  parentSignal: AbortSignal
++  onOpen?: () => void | Promise<void>
++}): Promise<void> {
++  const { open, onEvent, parentSignal, onOpen } = opts
++
++  const attempt = new AbortController()
++  const onParentAbort = () => attempt.abort()
++
++  if (parentSignal.aborted) {
++    attempt.abort()
++  } else {
++    parentSignal.addEventListener("abort", onParentAbort, { once: true })
++  }
++
++  try {
++    const events = await open(attempt.signal)
++    await onOpen?.()
++    for await (const event of events.stream) {
++      if (attempt.signal.aborted) break
++      onEvent(event)
++    }
++  } catch {
++    // Connect/stream error (non-2xx, refused connection, mid-stream drop):
++    // swallow and let the caller back off + reconnect.
++  } finally {
++    attempt.abort()
++    parentSignal.removeEventListener("abort", onParentAbort)
++  }
++}
+diff --git a/packages/tui/test/util/sse.test.ts b/packages/tui/test/util/sse.test.ts
+new file mode 100644
+index 000000000..1e861a7c1
+--- /dev/null
++++ b/packages/tui/test/util/sse.test.ts
+@@ -0,0 +1,131 @@
++import { expect, test } from "bun:test"
++import { runSseAttempt } from "../../src/util/sse"
++
++// An async-iterable backed by an array, optionally throwing mid-stream to
++// simulate a dropped SSE connection.
++function streamOf<T>(items: T[], opts: { throwAfter?: number } = {}): AsyncIterable<T> {
++  return {
++    async *[Symbol.asyncIterator]() {
++      let i = 0
++      for (const item of items) {
++        yield item
++        i++
++        if (opts.throwAfter !== undefined && i === opts.throwAfter) {
++          throw new Error("simulated stream drop")
++        }
++      }
++    },
++  }
++}
++
++test("runSseAttempt pumps every event then aborts the attempt signal when the stream ends", async () => {
++  let captured: AbortSignal | undefined
++  const events: number[] = []
++
++  await runSseAttempt<number>({
++    parentSignal: new AbortController().signal,
++    open: async (signal) => {
++      captured = signal
++      return { stream: streamOf([1, 2, 3]) }
++    },
++    onEvent: (e) => events.push(e),
++  })
++
++  expect(events).toEqual([1, 2, 3])
++  // The per-attempt controller is aborted in finally so the underlying
++  // fetch/connection is torn down instead of lingering ESTABLISHED.
++  expect(captured?.aborted).toBe(true)
++})
++
++test("runSseAttempt swallows a mid-stream error and still aborts the attempt", async () => {
++  let captured: AbortSignal | undefined
++  const events: number[] = []
++
++  // Must not throw out of runSseAttempt — the caller's reconnect loop relies on
++  // it returning so it can back off and reconnect.
++  await runSseAttempt<number>({
++    parentSignal: new AbortController().signal,
++    open: async (signal) => {
++      captured = signal
++      return { stream: streamOf([1, 2], { throwAfter: 2 }) }
++    },
++    onEvent: (e) => events.push(e),
++  })
++
++  expect(events).toEqual([1, 2])
++  expect(captured?.aborted).toBe(true)
++})
++
++test("runSseAttempt stops pumping and aborts when the parent signal aborts mid-stream", async () => {
++  const parent = new AbortController()
++  let captured: AbortSignal | undefined
++  const events: number[] = []
++
++  const stream: AsyncIterable<number> = {
++    async *[Symbol.asyncIterator]() {
++      for (let i = 1; i <= 100; i++) {
++        if (captured?.aborted) return
++        yield i
++      }
++    },
++  }
++
++  await runSseAttempt<number>({
++    parentSignal: parent.signal,
++    open: async (signal) => {
++      captured = signal
++      return { stream }
++    },
++    onEvent: (e) => {
++      events.push(e)
++      if (e === 3) parent.abort()
++    },
++  })
++
++  expect(events).toEqual([1, 2, 3])
++  expect(captured?.aborted).toBe(true)
++})
++
++test("runSseAttempt calls onOpen after the stream opens", async () => {
++  const order: string[] = []
++  await runSseAttempt<number>({
++    parentSignal: new AbortController().signal,
++    open: async () => {
++      order.push("open")
++      return { stream: streamOf([1]) }
++    },
++    onOpen: () => {
++      order.push("onOpen")
++    },
++    onEvent: () => order.push("event"),
++  })
++  expect(order).toEqual(["open", "onOpen", "event"])
++})
++
++test("runSseAttempt balances parent-signal listeners across repeated attempts (no accumulation)", async () => {
++  // The original bug accumulated one un-removed AbortSignal.any listener on the
++  // long-lived signal per reconnect, tripping MaxListenersExceededWarning. The
++  // bridge must add AND remove its listener every attempt.
++  let adds = 0
++  let removes = 0
++  const fakeParent = {
++    aborted: false,
++    addEventListener: () => {
++      adds++
++    },
++    removeEventListener: () => {
++      removes++
++    },
++  } as unknown as AbortSignal
++
++  for (let i = 0; i < 5; i++) {
++    await runSseAttempt<number>({
++      parentSignal: fakeParent,
++      open: async () => ({ stream: streamOf([1]) }),
++      onEvent: () => {},
++    })
++  }
++
++  expect(adds).toBe(5)
++  expect(removes).toBe(5)
 +})

@@ -60,6 +60,22 @@
 #                                               context/sdk.tsx so the TUI follows a session that
 #                                               migrates serves (idle-migration / pool-health reshuffle)
 #                                               and survives 409/410/421/503/connection-refused drops.
+#                                               LEAK FIX (bead workstation-lyj0): the first cut shared ONE
+#                                               long-lived AbortController across every reconnect and never
+#                                               closed a finished attempt's stream, so each reconnect leaked
+#                                               one ESTABLISHED connection up to the per-origin pool cap (256);
+#                                               18 idle attach TUIs that all fell back to the default serve
+#                                               thereby pinned a single serve's event loop with ~4600 conns.
+#                                               It also called resolveServeUrl with that long-lived signal,
+#                                               accumulating one un-removed AbortSignal.any listener per
+#                                               reconnect (MaxListenersExceededWarning). Fix: new
+#                                               packages/tui/src/util/sse.ts runSseAttempt() runs each
+#                                               (re)connect as a discrete attempt with its OWN controller,
+#                                               aborted in finally (force-closes the connection before the
+#                                               next opens), with a balanced add/remove parent->attempt abort
+#                                               bridge; resolveServeUrl + sdk.global.event now take the
+#                                               short-lived per-attempt signal. Unit-tested in
+#                                               packages/tui/test/util/sse.test.ts.
 #  11. event-cold-start-directory.patch (local) - fix the cold-start live-delivery race on GET /event
 #                                               (bead workstation-yl00). Builds on event-session-scope:
 #                                               when ?session_ids= is present, session-scoped events are
