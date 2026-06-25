@@ -1,0 +1,173 @@
+diff --git a/packages/tui/src/context/sync.tsx b/packages/tui/src/context/sync.tsx
+index 4882c1392..acf3f007d 100644
+--- a/packages/tui/src/context/sync.tsx
++++ b/packages/tui/src/context/sync.tsx
+@@ -28,7 +28,7 @@ import { useTuiStartup } from "./runtime"
+ import { createSimpleContext } from "./helper"
+ import { useExit } from "./exit"
+ import { useArgs } from "./args"
+-import { batch, onMount } from "solid-js"
++import { batch, onMount, onCleanup } from "solid-js"
+ import path from "path"
+ import { useKV } from "./kv"
+ 
+@@ -133,6 +133,13 @@ export const {
+     const project = useProject()
+     const sdk = useSDK()
+ 
++    let disposedTimeout: ReturnType<typeof setTimeout> | undefined
++    onCleanup(() => {
++      if (disposedTimeout) {
++        clearTimeout(disposedTimeout)
++      }
++    })
++
+     const fullSyncedSessions = new Set<string>()
+     const syncingSessions = new Map<string, Promise<void>>()
+     const hydratingSessions = new Map<string, { messages: Set<string>; parts: Set<string> }>()
+@@ -161,9 +168,20 @@ export const {
+ 
+     event.subscribe((event, { workspace }) => {
+       switch (event.type) {
+-        case "server.instance.disposed":
+-          void bootstrap()
++        case "server.instance.disposed": {
++          const targetDir = event.properties?.directory
++          const currentDir = project.instance.directory()
++          const currentWorkspace = project.workspace.current()
++          if ((!targetDir || targetDir === currentDir) && (!workspace || workspace === currentWorkspace)) {
++            if (disposedTimeout) {
++              clearTimeout(disposedTimeout)
++            }
++            disposedTimeout = setTimeout(() => {
++              void bootstrap()
++            }, 250)
++          }
+           break
++        }
+         case "permission.replied": {
+           const requests = store.permission[event.properties.sessionID]
+           if (!requests) break
+diff --git a/packages/tui/test/cli/cmd/tui/disposed.test.tsx b/packages/tui/test/cli/cmd/tui/disposed.test.tsx
+new file mode 100644
+index 000000000..857118ec6
+--- /dev/null
++++ b/packages/tui/test/cli/cmd/tui/disposed.test.tsx
+@@ -0,0 +1,90 @@
++/** @jsxImportSource @opentui/solid */
++import { describe, expect, test } from "bun:test"
++import { tmpdir } from "../../../fixture/fixture"
++import { mount, wait } from "./sync-fixture"
++import type { GlobalEvent } from "@opencode-ai/sdk/v2"
++
++describe("tui sync disposed filter and debounce", () => {
++  test("server.instance.disposed events are filtered and debounced", async () => {
++    await using tmp = await tmpdir()
++    await Bun.write(`${tmp.path}/kv.json`, "{}")
++    const { app, emit, project, sync, session } = await mount(undefined, tmp.path)
++
++    try {
++      const currentDir = project.instance.directory()
++      const currentWorkspace = project.workspace.current()
++      const baseline = session.length
++
++      // (a) a disposed event for a DIFFERENT directory does NOT trigger bootstrap
++      emit({
++        directory: "/tmp/different-dir",
++        project: "proj_test",
++        workspace: currentWorkspace,
++        payload: {
++          id: "evt_disposed_different",
++          type: "server.instance.disposed",
++          properties: { directory: "/tmp/different-dir" },
++        },
++      })
++
++      // Wait to verify no bootstrap is triggered
++      await Bun.sleep(400)
++      expect(session.length).toBe(baseline)
++
++      // (b) a disposed event for THIS directory DOES (after debounce)
++      emit({
++        directory: currentDir,
++        project: "proj_test",
++        workspace: currentWorkspace,
++        payload: {
++          id: "evt_disposed_this",
++          type: "server.instance.disposed",
++          properties: { directory: currentDir },
++        },
++      })
++
++      // Wait for the debounced bootstrap to run
++      await wait(() => session.length === baseline + 1)
++
++      // (c) a rapid burst coalesces into ONE bootstrap
++      const beforeBurst = session.length
++      emit({
++        directory: currentDir,
++        project: "proj_test",
++        workspace: currentWorkspace,
++        payload: {
++          id: "evt_disposed_burst1",
++          type: "server.instance.disposed",
++          properties: { directory: currentDir },
++        },
++      })
++      emit({
++        directory: currentDir,
++        project: "proj_test",
++        workspace: currentWorkspace,
++        payload: {
++          id: "evt_disposed_burst2",
++          type: "server.instance.disposed",
++          properties: { directory: currentDir },
++        },
++      })
++      emit({
++        directory: currentDir,
++        project: "proj_test",
++        workspace: currentWorkspace,
++        payload: {
++          id: "evt_disposed_burst3",
++          type: "server.instance.disposed",
++          properties: { directory: currentDir },
++        },
++      })
++
++      // Wait and verify only 1 additional bootstrap ran
++      await Bun.sleep(400)
++      expect(session.length).toBe(beforeBurst + 1)
++
++    } finally {
++      app.renderer.destroy()
++    }
++  })
++})
+diff --git a/packages/tui/test/cli/cmd/tui/sync-fixture.tsx b/packages/tui/test/cli/cmd/tui/sync-fixture.tsx
+index a212f5be1..5b7872ee3 100644
+--- a/packages/tui/test/cli/cmd/tui/sync-fixture.tsx
++++ b/packages/tui/test/cli/cmd/tui/sync-fixture.tsx
+@@ -6,6 +6,7 @@ import { KVProvider, useKV } from "../../../../src/context/kv"
+ import { ProjectProvider, useProject } from "../../../../src/context/project"
+ import { SDKProvider } from "../../../../src/context/sdk"
+ import { SyncProvider, useSync } from "../../../../src/context/sync"
++import { ExitProvider } from "../../../../src/context/exit"
+ import { createEventSource, createFetch, type FetchHandler, directory } from "../../../fixture/tui-sdk"
+ import { TestTuiContexts } from "../../../fixture/tui-environment"
+ export { createEventSource, createFetch, directory, eventSource, json, worktree } from "../../../fixture/tui-sdk"
+@@ -48,9 +49,11 @@ export async function mount(override?: FetchHandler, state?: string) {
+         <KVProvider>
+           <SDKProvider url="http://test" directory={directory} fetch={calls.fetch} events={events.source}>
+             <ProjectProvider>
+-              <SyncProvider>
+-                <Probe />
+-              </SyncProvider>
++              <ExitProvider exit={() => {}}>
++                <SyncProvider>
++                  <Probe />
++                </SyncProvider>
++              </ExitProvider>
+             </ProjectProvider>
+           </SDKProvider>
+         </KVProvider>

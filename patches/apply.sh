@@ -136,6 +136,12 @@
 #                                               touches snapshot/index.ts + its new test; disjoint from all
 #                                               other patches. DOES NOT address the distinct, uncharacterized
 #                                               flat-RSS read-only-subagent spin variant (#32965) — deferred.
+#  14. bootstrap-disposed-filter.patch (local) - prevent connection and CPU-amplification storms by
+#                                               filtering and debouncing server.instance.disposed event
+#                                               handling in the TUI (bead workstation-y69t). Re-runs of
+#                                               bootstrap() are only triggered when the event's directory
+#                                               matches this TUI's workspace and directory, and qualifying
+#                                               disposals within 250ms are coalesced into a single run.
 #
 # DROPPED on the v1.17 line (see workstation docs/plans/2026-06-11-opencode-1.17-cutover-runbook.md):
 #   - prompt-loop-cache.patch (#25367) + cache-aligned-compaction.patch (#25100):
@@ -199,6 +205,7 @@ PATCHES=(
   createnext-readback
   serve-lease
   attach-route-resolve
+  bootstrap-disposed-filter
   event-cold-start-directory
   project-copy-debounce
   step-end-diff-bound
