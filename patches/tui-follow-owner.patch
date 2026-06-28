@@ -1,0 +1,437 @@
+diff --git a/packages/tui/src/context/sdk.tsx b/packages/tui/src/context/sdk.tsx
+index e7452ae685..08b50e9d19 100644
+--- a/packages/tui/src/context/sdk.tsx
++++ b/packages/tui/src/context/sdk.tsx
+@@ -2,7 +2,7 @@ import { createOpencodeClient } from "@opencode-ai/sdk/v2"
+ import type { GlobalEvent } from "@opencode-ai/sdk/v2"
+ import { Flag } from "@opencode-ai/core/flag/flag"
+ import { createSimpleContext } from "./helper"
+-import { resolveServeUrl } from "../util/route"
++import { evaluateOwnerDrift, INITIAL_OWNER_DRIFT_STATE, resolveServeUrl, type OwnerDriftState } from "../util/route"
+ import { runSseAttempt } from "../util/sse"
+ import { batch, onCleanup, onMount } from "solid-js"
+ 
+@@ -10,6 +10,17 @@ export type EventSource = {
+   subscribe: (handler: (event: GlobalEvent) => void) => Promise<() => void>
+ }
+ 
++// How often a live `/global/event` attempt re-checks pigeon `/route` to detect a
++// session that migrated serves (bead workstation-yl00). A confirmed change (see
++// evaluateOwnerDrift) reconnects the firehose to the new owning serve. Tunable
++// via env for live verification; default 5s keeps /route load negligible (one
++// cheap GET per attached TUI per interval).
++const OWNER_DRIFT_POLL_INTERVAL_MS = (() => {
++  const env = typeof process !== "undefined" ? process.env?.OPENCODE_OWNER_POLL_INTERVAL_MS : undefined
++  const n = env ? Number(env) : Number.NaN
++  return Number.isFinite(n) && n > 0 ? n : 5000
++})()
++
+ export const { use: useSDK, provider: SDKProvider } = createSimpleContext({
+   name: "SDK",
+   init: (props: {
+@@ -93,6 +104,10 @@ export const { use: useSDK, provider: SDKProvider } = createSimpleContext({
+       sse = ctrl
+       ;(async () => {
+         let attempt = 0
++        // Owner-drift tracker for the CURRENT attempt's poller (bead
++        // workstation-yl00). Reset at the start of every attempt in open(),
++        // since `currentUrl` (its baseline) may have just changed.
++        let driftState: OwnerDriftState = INITIAL_OWNER_DRIFT_STATE
+         while (true) {
+           if (abort.signal.aborted || ctrl.signal.aborted) break
+ 
+@@ -103,7 +118,7 @@ export const { use: useSDK, provider: SDKProvider } = createSimpleContext({
+           // to the per-origin pool cap and pinned a serve's event loop — and
+           // calling resolveServeUrl with the long-lived signal accumulated an
+           // AbortSignal.any listener per iteration (bead workstation-lyj0).
+-          await runSseAttempt<GlobalEvent>({
++          const result = await runSseAttempt<GlobalEvent>({
+             parentSignal: ctrl.signal,
+             // Follow a session that migrated serves (pool-health reshuffle /
+             // idle-migration). Re-resolve the owning serve from pigeon /route
+@@ -125,6 +140,7 @@ export const { use: useSDK, provider: SDKProvider } = createSimpleContext({
+                   sdk = createSDK()
+                 }
+               }
++              driftState = INITIAL_OWNER_DRIFT_STATE
+               return sdk.global.event({
+                 signal,
+                 sseMaxRetryAttempts: 0,
+@@ -138,13 +154,42 @@ export const { use: useSDK, provider: SDKProvider } = createSimpleContext({
+               }
+             },
+             onEvent: handleEvent,
++            // open() only re-resolves /route on (re)connect, but a healthy
++            // attempt never ends on its own, so a mid-stream migration would go
++            // unnoticed until a drop. Poll /route while connected and end the
++            // attempt on a CONFIRMED owner change so we reconnect to the new
++            // owner (bead workstation-yl00). Gated on a session id; no-op for a
++            // global TUI with no specific session to follow.
++            poll: props.sessionID
++              ? {
++                  intervalMs: OWNER_DRIFT_POLL_INTERVAL_MS,
++                  check: async (signal) => {
++                    const resolved = await resolveServeUrl({
++                      sessionID: props.sessionID!,
++                      fallback: currentUrl,
++                      signal,
++                    })
++                    const next = evaluateOwnerDrift(driftState, currentUrl, resolved)
++                    driftState = next.state
++                    return next.reconnect
++                  },
++                }
++              : undefined,
+           })
+ 
+           if (timer) clearTimeout(timer)
+           if (queue.length > 0) flush()
++          if (abort.signal.aborted || ctrl.signal.aborted) break
++
++          if (result.drifted) {
++            // Deliberate migration follow, not an error drop: reconnect to the
++            // new owner immediately (reset backoff) so live delivery resumes
++            // without the exponential delay reserved for failing serves.
++            attempt = 0
++            continue
++          }
++
+           attempt += 1
+-          if (abort.signal.aborted || ctrl.signal.aborted) break
+-
+           // Exponential backoff
+           const backoff = Math.min(retryDelay * 2 ** (attempt - 1), maxRetryDelay)
+           await new Promise((resolve) => setTimeout(resolve, backoff))
+diff --git a/packages/tui/src/util/route.ts b/packages/tui/src/util/route.ts
+index 841e51dbbd..bf1ccf8fd1 100644
+--- a/packages/tui/src/util/route.ts
++++ b/packages/tui/src/util/route.ts
+@@ -80,3 +80,54 @@ export async function resolveServeUrl(opts: {
+     return fallback
+   }
+ }
++
++/**
++ * Owner-drift tracking state for a single live SSE attempt (bead workstation-yl00).
++ * `candidate` is the new owning-serve url seen on the most recent poll(s) and
++ * `count` how many consecutive polls have now agreed on it.
++ */
++export type OwnerDriftState = {
++  candidate: string | undefined
++  count: number
++}
++
++export const INITIAL_OWNER_DRIFT_STATE: OwnerDriftState = { candidate: undefined, count: 0 }
++
++/**
++ * Decide whether a freshly-resolved owning-serve url should trigger an SSE
++ * reconnect, given the prior drift-tracking state. PURE (no network, no clock).
++ *
++ * The TUI subscribes to a per-process `/global/event` firehose pinned (at attach
++ * time) to whatever serve pigeon `/route` named then. A session can later MIGRATE
++ * to another serve (serve-lease idle-migration / pool reshuffle); its turns then
++ * emit only on the NEW serve's bus and the pinned TUI goes silent until re-attach.
++ * Polling `/route` and reconnecting on a confirmed owner change makes the stream
++ * follow the session.
++ *
++ * `resolved` is the output of resolveServeUrl, which already degrades to the
++ * current url (its `fallback`) on ANY /route failure. So `resolved === current`
++ * (or empty) means "no confirmed change" — covering pigeon-down, non-2xx, garbage
++ * body, AND a genuine no-migration — and resets the tracker. We therefore NEVER
++ * reconnect on a flake.
++ *
++ * A *different* resolved url is only acted on after it appears on `confirmations`
++ * consecutive polls (default 2), so a single flapping /route answer cannot cause
++ * reconnect thrash. A flap back to the current url, or to a third url, resets the
++ * count. After a reconnect fires, the tracker resets so we don't immediately
++ * re-fire against the same (now stale) `current`.
++ */
++export function evaluateOwnerDrift(
++  state: OwnerDriftState,
++  current: string,
++  resolved: string,
++  confirmations = 2,
++): { state: OwnerDriftState; reconnect: boolean } {
++  if (!resolved || resolved === current) {
++    return { state: INITIAL_OWNER_DRIFT_STATE, reconnect: false }
++  }
++  const count = state.candidate === resolved ? state.count + 1 : 1
++  if (count >= confirmations) {
++    return { state: INITIAL_OWNER_DRIFT_STATE, reconnect: true }
++  }
++  return { state: { candidate: resolved, count }, reconnect: false }
++}
+diff --git a/packages/tui/src/util/sse.ts b/packages/tui/src/util/sse.ts
+index bad573530a..6b7c358838 100644
+--- a/packages/tui/src/util/sse.ts
++++ b/packages/tui/src/util/sse.ts
+@@ -23,14 +23,27 @@
+  *
+  * Never throws: connect/iterate errors are swallowed so the caller's reconnect
+  * loop continues (matches the prior inline behavior).
++ *
++ * `poll` (optional, bead workstation-yl00) runs a concurrent owner-drift check
++ * every `intervalMs` against the attempt's OWN per-attempt signal. When `check`
++ * returns true the attempt is ended early (its controller aborted, like a drop)
++ * and the result reports `drifted: true` so the caller can reconnect IMMEDIATELY
++ * to the new owning serve instead of applying error backoff. A throwing or false
++ * `check` never ends the attempt. The poller reuses the existing per-attempt
++ * controller — it does NOT chain a new AbortSignal.any off the long-lived parent,
++ * which is what leaked listeners in the pre-lyj0 form.
+  */
+ export async function runSseAttempt<T>(opts: {
+   open: (signal: AbortSignal) => Promise<{ stream: AsyncIterable<T> }>
+   onEvent: (event: T) => void
+   parentSignal: AbortSignal
+   onOpen?: () => void | Promise<void>
+-}): Promise<void> {
+-  const { open, onEvent, parentSignal, onOpen } = opts
++  poll?: {
++    intervalMs: number
++    check: (signal: AbortSignal) => Promise<boolean>
++  }
++}): Promise<{ drifted: boolean }> {
++  const { open, onEvent, parentSignal, onOpen, poll } = opts
+ 
+   const attempt = new AbortController()
+   const onParentAbort = () => attempt.abort()
+@@ -41,9 +54,42 @@ export async function runSseAttempt<T>(opts: {
+     parentSignal.addEventListener("abort", onParentAbort, { once: true })
+   }
+ 
++  let drifted = false
++  let pollTimer: ReturnType<typeof setTimeout> | undefined
++  const stopPoll = () => {
++    if (pollTimer !== undefined) {
++      clearTimeout(pollTimer)
++      pollTimer = undefined
++    }
++  }
++  const schedulePoll = () => {
++    if (!poll || attempt.signal.aborted) return
++    pollTimer = setTimeout(async () => {
++      pollTimer = undefined
++      if (attempt.signal.aborted) return
++      let reconnect = false
++      try {
++        reconnect = await poll.check(attempt.signal)
++      } catch {
++        // A failing owner check (pigeon down/flaky) must NEVER reconnect.
++        reconnect = false
++      }
++      if (attempt.signal.aborted) return
++      if (reconnect) {
++        // The session migrated serves — end this attempt so the caller's loop
++        // re-resolves /route and reconnects to the new owner.
++        drifted = true
++        attempt.abort()
++        return
++      }
++      schedulePoll()
++    }, poll.intervalMs)
++  }
++
+   try {
+     const events = await open(attempt.signal)
+     await onOpen?.()
++    schedulePoll()
+     for await (const event of events.stream) {
+       if (attempt.signal.aborted) break
+       onEvent(event)
+@@ -52,7 +98,10 @@ export async function runSseAttempt<T>(opts: {
+     // Connect/stream error (non-2xx, refused connection, mid-stream drop):
+     // swallow and let the caller back off + reconnect.
+   } finally {
++    stopPoll()
+     attempt.abort()
+     parentSignal.removeEventListener("abort", onParentAbort)
+   }
++
++  return { drifted }
+ }
+diff --git a/packages/tui/test/util/route.test.ts b/packages/tui/test/util/route.test.ts
+index f2a80130cd..2dec3443ee 100644
+--- a/packages/tui/test/util/route.test.ts
++++ b/packages/tui/test/util/route.test.ts
+@@ -1,5 +1,5 @@
+ import { expect, test } from "bun:test"
+-import { parseServeUrl, resolveServeUrl } from "../../src/util/route"
++import { evaluateOwnerDrift, INITIAL_OWNER_DRIFT_STATE, parseServeUrl, resolveServeUrl } from "../../src/util/route"
+ 
+ // parseServeUrl: pure extraction of .apiBase from a pigeon `GET /route` body,
+ // degrading to the fallback on anything unexpected. Mirrors the bash
+@@ -89,3 +89,66 @@ test("resolveServeUrl falls back when fetch throws (connection refused)", async
+   })
+   expect(result).toBe("http://127.0.0.1:4096")
+ })
++
++// evaluateOwnerDrift: the PURE owner-migration decision (bead workstation-yl00).
++// A long-lived /global/event SSE attempt must FOLLOW a session that migrates
++// serves. resolveServeUrl already degrades to the current url (its `fallback`)
++// on ANY /route failure, so `resolved === current` means "no confirmed change"
++// and must NEVER reconnect. A *different* resolved url is only acted on after it
++// repeats on `confirmations` consecutive polls (default 2), so a single flapping
++// /route answer can't cause reconnect thrash.
++
++const A = "http://127.0.0.1:4096"
++const B = "http://127.0.0.1:4097"
++const C = "http://127.0.0.1:4098"
++
++test("evaluateOwnerDrift: resolved === current is no drift and resets the tracker", () => {
++  const r = evaluateOwnerDrift({ candidate: B, count: 1 }, A, A)
++  expect(r.reconnect).toBe(false)
++  expect(r.state).toEqual(INITIAL_OWNER_DRIFT_STATE)
++})
++
++test("evaluateOwnerDrift: an empty resolved url never reconnects (degrade-hard)", () => {
++  const r = evaluateOwnerDrift(INITIAL_OWNER_DRIFT_STATE, A, "")
++  expect(r.reconnect).toBe(false)
++  expect(r.state).toEqual(INITIAL_OWNER_DRIFT_STATE)
++})
++
++test("evaluateOwnerDrift: a single different url does not reconnect (needs confirmation)", () => {
++  const r = evaluateOwnerDrift(INITIAL_OWNER_DRIFT_STATE, A, B)
++  expect(r.reconnect).toBe(false)
++  expect(r.state).toEqual({ candidate: B, count: 1 })
++})
++
++test("evaluateOwnerDrift: the same different url twice in a row reconnects (confirm=2)", () => {
++  const first = evaluateOwnerDrift(INITIAL_OWNER_DRIFT_STATE, A, B)
++  expect(first.reconnect).toBe(false)
++  const second = evaluateOwnerDrift(first.state, A, B)
++  expect(second.reconnect).toBe(true)
++  // tracker resets after firing so we don't immediately re-fire
++  expect(second.state).toEqual(INITIAL_OWNER_DRIFT_STATE)
++})
++
++test("evaluateOwnerDrift: a flap back to current between polls resets (no reconnect)", () => {
++  const first = evaluateOwnerDrift(INITIAL_OWNER_DRIFT_STATE, A, B)
++  const flap = evaluateOwnerDrift(first.state, A, A)
++  expect(flap.reconnect).toBe(false)
++  expect(flap.state).toEqual(INITIAL_OWNER_DRIFT_STATE)
++  // a later single B is again just one observation, not two-in-a-row
++  const after = evaluateOwnerDrift(flap.state, A, B)
++  expect(after.reconnect).toBe(false)
++  expect(after.state).toEqual({ candidate: B, count: 1 })
++})
++
++test("evaluateOwnerDrift: two different candidates in a row do not confirm each other", () => {
++  const first = evaluateOwnerDrift(INITIAL_OWNER_DRIFT_STATE, A, B)
++  const second = evaluateOwnerDrift(first.state, A, C)
++  expect(second.reconnect).toBe(false)
++  expect(second.state).toEqual({ candidate: C, count: 1 })
++})
++
++test("evaluateOwnerDrift: confirmations=1 reconnects on the first different url", () => {
++  const r = evaluateOwnerDrift(INITIAL_OWNER_DRIFT_STATE, A, B, 1)
++  expect(r.reconnect).toBe(true)
++  expect(r.state).toEqual(INITIAL_OWNER_DRIFT_STATE)
++})
+diff --git a/packages/tui/test/util/sse.test.ts b/packages/tui/test/util/sse.test.ts
+index 1e861a7c19..b812237e6a 100644
+--- a/packages/tui/test/util/sse.test.ts
++++ b/packages/tui/test/util/sse.test.ts
+@@ -129,3 +129,103 @@ test("runSseAttempt balances parent-signal listeners across repeated attempts (n
+   expect(adds).toBe(5)
+   expect(removes).toBe(5)
+ })
++
++// An async-iterable that yields nothing and only RETURNS once its bound signal
++// aborts — models a live /global/event stream sitting idle between heartbeats.
++function blockUntilAborted(signal: AbortSignal): AsyncIterable<number> {
++  return {
++    async *[Symbol.asyncIterator]() {
++      await new Promise<void>((resolve) => {
++        if (signal.aborted) return resolve()
++        signal.addEventListener("abort", () => resolve(), { once: true })
++      })
++    },
++  }
++}
++
++// poll: the owner-drift follower (bead workstation-yl00). A long-lived attempt
++// must be endable from a concurrent poll so the caller reconnects to the new
++// owning serve. The attempt's OWN per-attempt controller is reused (no new
++// AbortSignal.any chained off the long-lived parent — that was the lyj0 leak).
++
++test("runSseAttempt poll ends the attempt and reports drift when check returns true", async () => {
++  let captured: AbortSignal | undefined
++  let calls = 0
++
++  const result = await runSseAttempt<number>({
++    parentSignal: new AbortController().signal,
++    open: async (signal) => {
++      captured = signal
++      return { stream: blockUntilAborted(signal) }
++    },
++    onEvent: () => {},
++    poll: {
++      intervalMs: 1,
++      check: async () => {
++        calls += 1
++        return calls >= 2 // false once, then drift
++      },
++    },
++  })
++
++  expect(calls).toBeGreaterThanOrEqual(2)
++  expect(captured?.aborted).toBe(true)
++  expect(result?.drifted).toBe(true)
++})
++
++test("runSseAttempt poll keeps polling while check returns false; ends via parent (no drift)", async () => {
++  const parent = new AbortController()
++  let calls = 0
++
++  // End the attempt from the parent after a few poll cycles.
++  setTimeout(() => parent.abort(), 30)
++
++  const result = await runSseAttempt<number>({
++    parentSignal: parent.signal,
++    open: async (signal) => ({ stream: blockUntilAborted(signal) }),
++    onEvent: () => {},
++    poll: {
++      intervalMs: 1,
++      check: async () => {
++        calls += 1
++        return false
++      },
++    },
++  })
++
++  expect(calls).toBeGreaterThan(1) // it kept polling
++  expect(result?.drifted).toBe(false) // parent-abort end, not a drift
++})
++
++test("runSseAttempt poll swallows a throwing check and does NOT reconnect", async () => {
++  const parent = new AbortController()
++  let calls = 0
++  setTimeout(() => parent.abort(), 30)
++
++  const result = await runSseAttempt<number>({
++    parentSignal: parent.signal,
++    open: async (signal) => ({ stream: blockUntilAborted(signal) }),
++    onEvent: () => {},
++    poll: {
++      intervalMs: 1,
++      check: async () => {
++        calls += 1
++        throw new Error("pigeon /route blew up")
++      },
++    },
++  })
++
++  expect(calls).toBeGreaterThan(1) // a throw must not stop the poller
++  expect(result?.drifted).toBe(false) // a throw must never trigger reconnect
++})
++
++test("runSseAttempt without a poll still pumps events and reports no drift", async () => {
++  const events: number[] = []
++  const result = await runSseAttempt<number>({
++    parentSignal: new AbortController().signal,
++    open: async () => ({ stream: streamOf([1, 2, 3]) }),
++    onEvent: (e) => events.push(e),
++  })
++  expect(events).toEqual([1, 2, 3])
++  expect(result?.drifted).toBe(false)
++})

@@ -142,6 +142,33 @@
 #                                               bootstrap() are only triggered when the event's directory
 #                                               matches this TUI's workspace and directory, and qualifying
 #                                               disposals within 250ms are coalesced into a single run.
+#  15. tui-follow-owner.patch    (local)      - make the attached TUI's live event stream FOLLOW a session
+#                                               that migrates serves mid-stream (bead workstation-yl00).
+#                                               The TUI subscribes to a per-PROCESS /global/event firehose
+#                                               (context/sdk.tsx) pinned, at attach time, to whatever serve
+#                                               pigeon /route named then. attach-route-resolve only re-
+#                                               resolves /route at the START of an SSE attempt, and a healthy
+#                                               /global/event attempt never ends on its own (10s heartbeats),
+#                                               so a session that migrates to another serve (serve-lease idle-
+#                                               migration / pool reshuffle) emits its later turns only on the
+#                                               NEW serve's bus while the TUI stays silently pinned to the old
+#                                               one — frozen until manual re-attach. Fix: (a) a PURE
+#                                               evaluateOwnerDrift() in util/route.ts (confirm-twice, degrade-
+#                                               hard: resolveServeUrl already collapses any /route failure to
+#                                               the current url, so only a successful, repeated, DIFFERENT
+#                                               owner triggers anything); (b) runSseAttempt() (util/sse.ts)
+#                                               gains an optional `poll` that re-checks /route every
+#                                               OWNER_DRIFT_POLL_INTERVAL_MS (env OPENCODE_OWNER_POLL_INTERVAL_MS,
+#                                               default 5000) against the attempt's OWN per-attempt signal —
+#                                               no new AbortSignal.any off the long-lived parent (avoids the
+#                                               lyj0 listener leak) — and on a confirmed change ends the
+#                                               attempt reporting `drifted:true`; (c) startSSE (context/
+#                                               sdk.tsx) reconnects IMMEDIATELY (resets backoff) on a drift so
+#                                               open()'s existing re-resolve points the firehose + REST client
+#                                               at the new owner. Gated on a session id (no-op for a global
+#                                               TUI). MUST apply after attach-route-resolve (it extends that
+#                                               patch's route.ts/sse.ts/sdk.tsx). Unit-tested in
+#                                               packages/tui/test/util/{route,sse}.test.ts.
 #
 # DROPPED on the v1.17 line (see workstation docs/plans/2026-06-11-opencode-1.17-cutover-runbook.md):
 #   - prompt-loop-cache.patch (#25367) + cache-aligned-compaction.patch (#25100):
@@ -210,6 +237,7 @@ PATCHES=(
   project-copy-debounce
   step-end-diff-bound
   globalbus-maxlisteners
+  tui-follow-owner
 )
 
 for name in "${PATCHES[@]}"; do
