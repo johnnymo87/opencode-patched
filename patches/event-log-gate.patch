@@ -1,0 +1,174 @@
+diff --git a/packages/core/src/event.ts b/packages/core/src/event.ts
+index 7a33eedc40..90c689acd8 100644
+--- a/packages/core/src/event.ts
++++ b/packages/core/src/event.ts
+@@ -4,6 +4,7 @@ import { Cause, Context, Effect, Layer, Option, PubSub, Schema, Stream } from "e
+ import { and, asc, eq, gt } from "drizzle-orm"
+ import { Database } from "./database/database"
+ import { EventSequenceTable, EventTable } from "./event/sql"
++import { truthy } from "./flag/flag"
+ import { Location } from "./location"
+ import { externalID, type ExternalID, NonNegativeInt, withStatics } from "./schema"
+ import { Identifier } from "./util/identifier"
+@@ -88,6 +89,15 @@ type SyncDefinition = Definition & {
+   readonly encode: (data: unknown) => unknown
+   readonly decode: (data: unknown) => unknown
+ }
++// event-log-gate.patch: whether to persist rows into the durable event log
++// (EventTable). Read lazily (not via the eagerly-computed Flag object) so
++// tests and embedders can toggle it after module load. Mirrors upstream's
++// enabledByExperimental semantics for OPENCODE_EXPERIMENTAL_WORKSPACES.
++const eventLogEnabled = () =>
++  process.env["OPENCODE_EXPERIMENTAL_WORKSPACES"] === undefined
++    ? truthy("OPENCODE_EXPERIMENTAL")
++    : truthy("OPENCODE_EXPERIMENTAL_WORKSPACES")
++
+ const syncRegistry = new Map<string, SyncDefinition>()
+ 
+ // Synchronized events cross a JSON boundary, so their data schemas must encode and decode without services.
+@@ -317,19 +327,35 @@ export const layerWith = (options?: LayerOptions) =>
+                               }),
+                             )
+                           }
+-                          const stored = yield* db
+-                            .select({ aggregateID: EventTable.aggregate_id, seq: EventTable.seq })
+-                            .from(EventTable)
+-                            .where(eq(EventTable.id, event.id))
+-                            .get()
+-                            .pipe(Effect.orDie)
+-                          if (stored)
+-                            yield* Effect.die(
+-                              new InvalidSyncEventError({
+-                                type: event.type,
+-                                message: `Event ${event.id} already exists at aggregate ${stored.aggregateID} sequence ${stored.seq}`,
+-                              }),
+-                            )
++                          // event-log-gate.patch: the durable event log is only
++                          // consumed by the remote-workspace sync paths
++                          // (/sync/history, /sync/replay, workspace warp). When
++                          // workspaces are off it is write-only and unbounded —
++                          // full message snapshots per update grew opencode.db
++                          // by gigabytes (O(n^2) per session) and added a
++                          // synchronous INSERT + dup-check SELECT to every
++                          // durable event commit on the main thread. Skip the
++                          // log unless OPENCODE_EXPERIMENTAL_WORKSPACES is on
++                          // (mirrors upstream's later gate in sync/index.ts,
++                          // commit b0017bf1b9). EventSequenceTable is still
++                          // maintained unconditionally: seq counters drive
++                          // ordering/idempotency and are one tiny row per
++                          // aggregate.
++                          if (eventLogEnabled()) {
++                            const stored = yield* db
++                              .select({ aggregateID: EventTable.aggregate_id, seq: EventTable.seq })
++                              .from(EventTable)
++                              .where(eq(EventTable.id, event.id))
++                              .get()
++                              .pipe(Effect.orDie)
++                            if (stored)
++                              yield* Effect.die(
++                                new InvalidSyncEventError({
++                                  type: event.type,
++                                  message: `Event ${event.id} already exists at aggregate ${stored.aggregateID} sequence ${stored.seq}`,
++                                }),
++                              )
++                          }
+                           for (const guard of commitGuards) {
+                             yield* guard(event)
+                           }
+@@ -349,19 +375,21 @@ export const layerWith = (options?: LayerOptions) =>
+                             })
+                             .run()
+                             .pipe(Effect.orDie)
+-                          yield* db
+-                            .insert(EventTable)
+-                            .values([
+-                              {
+-                                id: event.id,
+-                                aggregate_id: aggregateID,
+-                                seq,
+-                                type: versionedType(definition.type, sync.version),
+-                                data: encoded,
+-                              },
+-                            ])
+-                            .run()
+-                            .pipe(Effect.orDie)
++                          if (eventLogEnabled()) {
++                            yield* db
++                              .insert(EventTable)
++                              .values([
++                                {
++                                  id: event.id,
++                                  aggregate_id: aggregateID,
++                                  seq,
++                                  type: versionedType(definition.type, sync.version),
++                                  data: encoded,
++                                },
++                              ])
++                              .run()
++                              .pipe(Effect.orDie)
++                          }
+                           return { aggregateID, seq }
+                         }),
+                       { behavior: "immediate" },
+diff --git a/packages/core/test/event.test.ts b/packages/core/test/event.test.ts
+index cd8ba69253..d979b343ce 100644
+--- a/packages/core/test/event.test.ts
++++ b/packages/core/test/event.test.ts
+@@ -11,6 +11,13 @@ import { eq } from "drizzle-orm"
+ import { location } from "./fixture/location"
+ import { testEffect } from "./lib/effect"
+ 
++// event-log-gate.patch: this suite exercises the durable event log + replay
++// semantics, which are now gated behind OPENCODE_EXPERIMENTAL_WORKSPACES.
++// The gate reads the env lazily, so setting it here covers every test below.
++// The flag-OFF behavior has its own dedicated test ("skips event log
++// persistence when workspaces are off").
++process.env["OPENCODE_EXPERIMENTAL_WORKSPACES"] = "1"
++
+ const locationLayer = Layer.succeed(
+   Location.Service,
+   Location.Service.of(
+@@ -326,6 +333,43 @@ describe("EventV2", () => {
+     }),
+   )
+ 
++  // event-log-gate.patch: with workspaces off (the default), durable event
++  // commits must still bump the aggregate sequence (ordering/idempotency)
++  // but must NOT persist rows into the unbounded event log.
++  it.effect("skips event log persistence when workspaces are off", () =>
++    Effect.gen(function* () {
++      const events = yield* EventV2.Service
++      const { db } = yield* Database.Service
++      const prev = process.env["OPENCODE_EXPERIMENTAL_WORKSPACES"]
++      delete process.env["OPENCODE_EXPERIMENTAL_WORKSPACES"]
++      try {
++        const event = yield* events.publish(SyncMessage, { id: "gated", text: "hello" })
++        expect(event.seq).toBe(0)
++
++        const rows = yield* db
++          .select()
++          .from(EventTable)
++          .where(eq(EventTable.aggregate_id, "gated"))
++          .all()
++          .pipe(Effect.orDie)
++        expect(rows).toEqual([])
++
++        const seqRow = yield* db
++          .select({ seq: EventSequenceTable.seq })
++          .from(EventSequenceTable)
++          .where(eq(EventSequenceTable.aggregate_id, "gated"))
++          .get()
++          .pipe(Effect.orDie)
++        expect(seqRow?.seq).toBe(0)
++
++        const second = yield* events.publish(SyncMessage, { id: "gated", text: "again" })
++        expect(second.seq).toBe(1)
++      } finally {
++        process.env["OPENCODE_EXPERIMENTAL_WORKSPACES"] = prev ?? "1"
++      }
++    }),
++  )
++
+   it.effect("keeps live-only listener defects fail-fast", () =>
+     Effect.gen(function* () {
+       const events = yield* EventV2.Service

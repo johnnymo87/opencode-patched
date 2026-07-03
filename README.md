@@ -190,6 +190,7 @@ Each patch is owned by a specific repo. Do not edit a patch in the wrong repo.
 | `retry-cap.patch` | **this repo** (`patches/retry-cap.patch`) | local / original, no upstream PR |
 | `vim.patch` | **this repo** (`patches/vim.patch`) | PR #12679 |
 | `sqlite-foreign-key-wrap.patch` | **this repo** (`patches/sqlite-foreign-key-wrap.patch`) | local / original, no upstream PR |
+| `event-log-gate.patch` | **this repo** (`patches/event-log-gate.patch`) | backport of upstream commit `b0017bf1b9` gating; drop on cutover to an upstream release that includes it |
 
 When an upstream PR is merged, the corresponding patch can be dropped. (The big
 `caching.patch` formerly lived in the sibling repo `opencode-cached`; it was dropped

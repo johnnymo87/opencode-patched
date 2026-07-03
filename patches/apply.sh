@@ -169,6 +169,25 @@
 #                                               TUI). MUST apply after attach-route-resolve (it extends that
 #                                               patch's route.ts/sse.ts/sdk.tsx). Unit-tested in
 #                                               packages/tui/test/util/{route,sse}.test.ts.
+#  16. event-log-gate.patch      (local)      - gate the durable event LOG (event table inserts in
+#                                               core/src/event.ts commitSyncEvent) behind
+#                                               Flag.OPENCODE_EXPERIMENTAL_WORKSPACES (bead
+#                                               workstation-bm1i). In v1.17.7 every durable event
+#                                               commit unconditionally INSERTs a full event row
+#                                               (message.updated.1 = complete message snapshot ->
+#                                               O(n^2) bytes per long session; 2.8GB of a 4.3GB
+#                                               opencode.db on devbox) plus a dup-check SELECT,
+#                                               all synchronously inside the main-thread commit
+#                                               transaction. The only readers in v1.17.7 are the
+#                                               remote-workspace sync paths (/sync/history,
+#                                               /sync/replay, workspace warp) and the UNEXPOSED
+#                                               V2Session.events — nothing reads the log when
+#                                               workspaces are off. EventSequenceTable (seq
+#                                               counters, one tiny row per aggregate) is still
+#                                               maintained unconditionally. Mirrors upstream's own
+#                                               later gate (commit b0017bf1b9, sync/index.ts).
+#                                               SUNSET: drop on cutover to an upstream that ships
+#                                               b0017bf1b9 or successor gating.
 #
 # DROPPED on the v1.17 line (see workstation docs/plans/2026-06-11-opencode-1.17-cutover-runbook.md):
 #   - prompt-loop-cache.patch (#25367) + cache-aligned-compaction.patch (#25100):
@@ -238,6 +257,7 @@ PATCHES=(
   step-end-diff-bound
   globalbus-maxlisteners
   tui-follow-owner
+  event-log-gate
 )
 
 for name in "${PATCHES[@]}"; do
