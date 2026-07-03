@@ -188,6 +188,32 @@
 #                                               later gate (commit b0017bf1b9, sync/index.ts).
 #                                               SUNSET: drop on cutover to an upstream that ships
 #                                               b0017bf1b9 or successor gating.
+#  17. compaction-bounded-load.patch (local)   - bound the prompt loop's per-iteration message load
+#                                               to the compaction window (bead workstation-g3iy).
+#                                               v1.17's loop calls filterCompactedEffect every
+#                                               iteration; upstream materializes the ENTIRE session
+#                                               history (stream() pages all messages + parts, JSON-
+#                                               decodes everything) and only then lets
+#                                               filterCompacted discard everything before the last
+#                                               completed compaction boundary. A 17k-message session
+#                                               = multi-minute synchronous main-thread JS per touch:
+#                                               observed freezing devbox serve-0 (94% usermode CPU,
+#                                               flat read_bytes, GC helpers idle) until the canary
+#                                               SIGKILLed it. Fix: extract the newest-first walk into
+#                                               an incremental compactedWalk() closure and make
+#                                               filterCompactedEffect page 50-at-a-time, feeding the
+#                                               walk and STOPPING pagination the moment the walk hits
+#                                               the boundary — O(window) instead of O(history);
+#                                               output provably identical (the walk's break depends
+#                                               only on the newest-first prefix; the reorder phase
+#                                               only sees the collected prefix). filterCompacted
+#                                               (eager, Iterable) keeps its exact signature/behavior
+#                                               for existing callers. Optional {pageSize,onPage} test
+#                                               seams. Tests: messages-pagination.test.ts (boundary
+#                                               stops paging; no-compaction loads all). MUST apply
+#                                               after tool-fix (same file, disjoint regions).
+#                                               SUNSET: drop if upstream bounds the loop load or
+#                                               revives prompt-loop-cache (#25367).
 #
 # DROPPED on the v1.17 line (see workstation docs/plans/2026-06-11-opencode-1.17-cutover-runbook.md):
 #   - prompt-loop-cache.patch (#25367) + cache-aligned-compaction.patch (#25100):
@@ -258,6 +284,7 @@ PATCHES=(
   globalbus-maxlisteners
   tui-follow-owner
   event-log-gate
+  compaction-bounded-load
 )
 
 for name in "${PATCHES[@]}"; do

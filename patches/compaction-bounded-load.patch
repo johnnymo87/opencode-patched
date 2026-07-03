@@ -1,0 +1,168 @@
+diff --git a/packages/opencode/src/session/message-v2.ts b/packages/opencode/src/session/message-v2.ts
+index 5a059fc4a4..59aeb3c122 100644
+--- a/packages/opencode/src/session/message-v2.ts
++++ b/packages/opencode/src/session/message-v2.ts
+@@ -550,29 +550,56 @@ export const get = Effect.fn("MessageV2.get")(function* (input: { sessionID: Ses
+   }
+ })
+ 
+-export function filterCompacted(msgs: Iterable<WithParts>) {
++// compaction-bounded-load.patch: the newest-first walk that collects messages
++// until the last completed compaction boundary. Extracted into an incremental
++// closure so filterCompactedEffect can feed it page by page and STOP PAGING as
++// soon as the walk terminates — the prompt loop calls this every iteration,
++// and eagerly materializing a mega-session's full history (17k messages) froze
++// a serve main loop for minutes (bead workstation-g3iy). feed() returns true
++// once the walk is done; the result only ever contains the pre-break prefix,
++// so output is identical to walking the full history.
++function compactedWalk() {
+   const result = [] as WithParts[]
+   const completed = new Set<string>()
+   let retain: MessageID | undefined
+-  for (const msg of msgs) {
++  let done = false
++  const feed = (msg: WithParts): boolean => {
++    if (done) return true
+     result.push(msg)
+     if (retain) {
+-      if (msg.info.id === retain) break
+-      continue
++      if (msg.info.id === retain) done = true
++      return done
+     }
+     if (msg.info.role === "user" && completed.has(msg.info.id)) {
+       const part = msg.parts.find((item): item is CompactionPart => item.type === "compaction")
+-      if (!part) continue
+-      if (!part.tail_start_id) break
++      if (!part) return false
++      if (!part.tail_start_id) {
++        done = true
++        return true
++      }
+       retain = part.tail_start_id
+-      if (msg.info.id === retain) break
+-      continue
++      if (msg.info.id === retain) done = true
++      return done
+     }
+-    if (msg.info.role === "user" && completed.has(msg.info.id) && msg.parts.some((part) => part.type === "compaction"))
+-      break
+     if (msg.info.role === "assistant" && msg.info.summary && msg.info.finish && !msg.info.error)
+       completed.add(msg.info.parentID)
++    return false
+   }
++  return { feed, result }
++}
++
++export function filterCompacted(msgs: Iterable<WithParts>) {
++  const walk = compactedWalk()
++  for (const msg of msgs) {
++    if (walk.feed(msg)) break
++  }
++  return finalizeCompacted(walk.result)
++}
++
++// The reorder phase of filterCompacted ([compaction-user, summary, ...tail...,
++// rest]); operates purely on the walk's collected prefix. NOTE: mutates and
++// returns its argument's ordering, mirroring the original inline code.
++function finalizeCompacted(result: WithParts[]) {
+   result.reverse()
+   const compactionIndex = result.findLastIndex(
+     (msg) =>
+@@ -603,8 +630,33 @@ export function filterCompacted(msgs: Iterable<WithParts>) {
+   return result
+ }
+ 
+-export const filterCompactedEffect = Effect.fnUntraced(function* (sessionID: SessionID) {
+-  return filterCompacted(yield* stream(sessionID))
++// compaction-bounded-load.patch: page newest-first and feed the walk
++// incrementally, stopping at the compaction boundary instead of materializing
++// the entire session history (O(window) instead of O(history) per prompt-loop
++// iteration). `pageSize`/`onPage` are test seams.
++export const filterCompactedEffect = Effect.fnUntraced(function* (
++  sessionID: SessionID,
++  options?: { pageSize?: number; onPage?: () => void },
++) {
++  const size = options?.pageSize ?? 50
++  const walk = compactedWalk()
++  let before: string | undefined
++  paging: while (true) {
++    const next = yield* page({ sessionID, limit: size, before }).pipe(
++      Effect.catchIf(NotFoundError.isInstance, () =>
++        Effect.succeed({ items: [] as WithParts[], more: false, cursor: undefined }),
++      ),
++    )
++    options?.onPage?.()
++    if (next.items.length === 0) break
++    for (let i = next.items.length - 1; i >= 0; i--) {
++      const item = next.items[i]
++      if (item && walk.feed(item)) break paging
++    }
++    if (!next.more || !next.cursor) break
++    before = next.cursor
++  }
++  return finalizeCompacted(walk.result)
+ })
+ 
+ // filterCompacted reorders messages for model consumption
+diff --git a/packages/opencode/test/session/messages-pagination.test.ts b/packages/opencode/test/session/messages-pagination.test.ts
+index c0b65b5e57..8454145b24 100644
+--- a/packages/opencode/test/session/messages-pagination.test.ts
++++ b/packages/opencode/test/session/messages-pagination.test.ts
+@@ -1054,3 +1054,56 @@ describe("MessageV2 consistency", () => {
+     ),
+   )
+ })
++
++// compaction-bounded-load.patch: the prompt loop calls filterCompactedEffect
++// every iteration; it must stop PAGING at the compaction boundary instead of
++// materializing the entire history first (a 17k-message session froze a serve
++// main loop for minutes; bead workstation-g3iy).
++describe("MessageV2.filterCompactedEffect", () => {
++  it.instance("matches eager filterCompacted without paging past the compaction boundary", () =>
++    withSession(({ sessionID }) =>
++      Effect.gen(function* () {
++        // 120 pre-compaction messages that the loop must never load
++        // (backdated: fill() defaults to Date.now()+i which would sort these
++        // AFTER the window messages under page()'s time_created ordering)
++        yield* fill(sessionID, 120, (i: number) => Date.now() - 600_000 + i)
++        // completed compaction: u1 carries the compaction part whose
++        // tail_start_id points at itself (minimal retained tail); a1 is the
++        // finished summary
++        const u1 = yield* addUser(sessionID, "compaction request")
++        yield* addAssistant(sessionID, u1, { summary: true, finish: "end_turn" })
++        yield* addCompactionPart(sessionID, u1, u1)
++        const u2 = yield* addUser(sessionID, "new question")
++        yield* addAssistant(sessionID, u2)
++
++        const eager = MessageV2.filterCompacted(yield* MessageV2.stream(sessionID))
++        let pages = 0
++        const lazy = yield* MessageV2.filterCompactedEffect(sessionID, {
++          pageSize: 10,
++          onPage: () => pages++,
++        })
++
++        expect(lazy.map((m) => m.info.id)).toEqual(eager.map((m) => m.info.id))
++        // the 4 window messages fit in the first 10-message page; the 120
++        // older messages must never be fetched
++        expect(pages).toBeGreaterThanOrEqual(1)
++        expect(pages).toBeLessThanOrEqual(2)
++      }),
++    ),
++  )
++
++  it.instance("loads full history when the session has no compaction", () =>
++    withSession(({ sessionID }) =>
++      Effect.gen(function* () {
++        const ids = yield* fill(sessionID, 25)
++        let pages = 0
++        const lazy = yield* MessageV2.filterCompactedEffect(sessionID, {
++          pageSize: 10,
++          onPage: () => pages++,
++        })
++        expect(lazy.map((m) => m.info.id)).toEqual(ids)
++        expect(pages).toBeGreaterThanOrEqual(3)
++      }),
++    ),
++  )
++})
