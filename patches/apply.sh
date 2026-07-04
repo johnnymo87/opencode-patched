@@ -232,6 +232,29 @@
 #                                               queries matched the profile exactly. SUNSET: drop on
 #                                               cutover to an upstream >= v1.17.13 (ships this shape
 #                                               natively in Integration.list).
+#  19. available-cache.patch (local)          - herd-collapse cache for CatalogV2 provider/model
+#                                               availability (bead workstation-g3iy, layer 2).
+#                                               Even with integration-list-batch, every /api/model
+#                                               call recomputes the full availability projection —
+#                                               ~5,331 projectModel() constructions + sort = ~300ms
+#                                               of synchronous JS per call. A TUI SSE reconnect herd
+#                                               after a serve restart (every attached TUI refetching
+#                                               bootstrap, with retry amplification as the serve
+#                                               slows: observed 349 /api/provider+model calls in one
+#                                               storm) stacks minutes of blocking JS -> the wedge
+#                                               persists. Fix in catalog.ts: provider.available() and
+#                                               model.available() serve from
+#                                               Effect.cachedInvalidateWithTTL values; every catalog
+#                                               rebuild (State finalize, via a TDZ-safe hook) and
+#                                               every Integration.Event.Updated (connection changes)
+#                                               invalidates; AVAILABLE_CACHE_TTL=30s is only a
+#                                               backstop for out-of-band changes (e.g. process.env
+#                                               mutation). Herd cost collapses to one recompute per
+#                                               invalidation. MUST apply with (order-independent of)
+#                                               integration-list-batch; only touches catalog.ts +
+#                                               catalog.test.ts. SUNSET: revisit on upstream cutover;
+#                                               upstream >= v1.17.13 still recomputes per call as of
+#                                               2026-07-04.
 #
 # DROPPED on the v1.17 line (see workstation docs/plans/2026-06-11-opencode-1.17-cutover-runbook.md):
 #   - prompt-loop-cache.patch (#25367) + cache-aligned-compaction.patch (#25100):
@@ -304,6 +327,7 @@ PATCHES=(
   event-log-gate
   compaction-bounded-load
   integration-list-batch
+  available-cache
 )
 
 for name in "${PATCHES[@]}"; do

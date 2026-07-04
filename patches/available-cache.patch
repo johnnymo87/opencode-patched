@@ -1,0 +1,181 @@
+diff --git a/packages/core/src/catalog.ts b/packages/core/src/catalog.ts
+index 4156db5c36..830c60c8f6 100644
+--- a/packages/core/src/catalog.ts
++++ b/packages/core/src/catalog.ts
+@@ -1,6 +1,6 @@
+ export * as Catalog from "./catalog"
+ 
+-import { Array, Context, Effect, Layer, Option, Order, pipe, Schema, Scope, Stream } from "effect"
++import { Array, Context, Duration, Effect, Layer, Option, Order, pipe, Schema, Scope, Stream } from "effect"
+ import { castDraft, enableMapSet, type Draft } from "immer"
+ import { ModelV2 } from "./model"
+ import { ModelRequest } from "./model-request"
+@@ -132,6 +132,10 @@ export const layer = Layer.effect(
+       delete item.request.body.baseURL
+     }
+ 
++    // Assigned after the caches exist below; finalize() runs only on rebuilds,
++    // which happen after layer construction completes.
++    let invalidateAvailableHook: Effect.Effect<void> = Effect.void
++
+     const state = State.create<Data, Editor>({
+       initial: () => ({ providers: new Map() }),
+       editor: (draft) => {
+@@ -195,6 +199,7 @@ export const layer = Layer.effect(
+             }
+           }
+         }
++        yield* Effect.suspend(() => invalidateAvailableHook)
+         yield* events.publish(Event.Updated, {})
+       }),
+     })
+@@ -210,6 +215,54 @@ export const layer = Layer.effect(
+       Effect.forkIn(scope, { startImmediately: true }),
+     )
+ 
++    // workstation-g3iy: /api/provider + /api/model recompute these projections
++    // on every TUI bootstrap fetch. After a serve restart, an SSE reconnect
++    // herd (every attached TUI refetching, with retry amplification as the
++    // serve slows) used to recompute the full ~5k-model projection (~300ms of
++    // synchronous JS each) hundreds of times, wedging the event loop for
++    // minutes. Collapse bursts onto a cached value: every catalog rebuild
++    // (finalize) and integration connection change invalidates it, with a TTL
++    // backstop for out-of-band changes (e.g. process.env mutation).
++    const allProviders = () => Array.fromIterable(state.get().providers.values()).map((record) => record.provider)
++    const allModels = () =>
++      pipe(
++        Array.fromIterable(state.get().providers.values()),
++        Array.flatMap((record) => {
++          return Array.fromIterable(record.models.values()).map((model) => projectModel(model, record.provider))
++        }),
++        Array.sortWith((item) => item.time.released.epochMilliseconds, Order.flip(Order.Number)),
++      )
++    const computeProviderAvailable = Effect.gen(function* () {
++      const active = new Map((yield* integrations.list()).map((integration) => [integration.id, integration]))
++      const connections = yield* integrations.connection.list()
++      return allProviders().filter((provider) =>
++        available(
++          provider,
++          active.get(Integration.ID.make(provider.id)),
++          connections.has(Integration.ID.make(provider.id)),
++        ),
++      )
++    })
++    const [providerAvailableCached, invalidateProviderAvailable] = yield* Effect.cachedInvalidateWithTTL(
++      computeProviderAvailable,
++      AVAILABLE_CACHE_TTL,
++    )
++    const computeModelAvailable = Effect.gen(function* () {
++      const providers = new Set((yield* providerAvailableCached).map((provider) => provider.id))
++      return allModels().filter((model) => providers.has(model.providerID) && model.enabled)
++    })
++    const [modelAvailableCached, invalidateModelAvailable] = yield* Effect.cachedInvalidateWithTTL(
++      computeModelAvailable,
++      AVAILABLE_CACHE_TTL,
++    )
++    const invalidateAvailable = Effect.all([invalidateProviderAvailable, invalidateModelAvailable]).pipe(Effect.asVoid)
++    invalidateAvailableHook = invalidateAvailable
++
++    yield* events.subscribe(Integration.Event.Updated).pipe(
++      Stream.runForEach(() => invalidateAvailable),
++      Effect.forkIn(scope, { startImmediately: true }),
++    )
++
+     const result: Interface = {
+       transform: state.transform,
+ 
+@@ -224,15 +277,7 @@ export const layer = Layer.effect(
+         }),
+ 
+         available: Effect.fn("CatalogV2.provider.available")(function* () {
+-          const active = new Map((yield* integrations.list()).map((integration) => [integration.id, integration]))
+-          const connections = yield* integrations.connection.list()
+-          return (yield* result.provider.all()).filter((provider) =>
+-            available(
+-              provider,
+-              active.get(Integration.ID.make(provider.id)),
+-              connections.has(Integration.ID.make(provider.id)),
+-            ),
+-          )
++          return yield* providerAvailableCached
+         }),
+       },
+ 
+@@ -255,8 +300,7 @@ export const layer = Layer.effect(
+         }),
+ 
+         available: Effect.fn("CatalogV2.model.available")(function* () {
+-          const providers = new Set((yield* result.provider.available()).map((provider) => provider.id))
+-          return (yield* result.model.all()).filter((model) => providers.has(model.providerID) && model.enabled)
++          return yield* modelAvailableCached
+         }),
+ 
+         default: Effect.fn("CatalogV2.model.default")(function* () {
+@@ -334,6 +378,11 @@ export const layer = Layer.effect(
+ 
+ const SMALL_MODEL_RE = /\b(nano|flash|lite|mini|haiku|small|fast)\b/
+ 
++// TTL backstop for the cached provider/model availability projections; real
++// invalidation happens on every catalog rebuild and integration connection
++// change (workstation-g3iy).
++const AVAILABLE_CACHE_TTL = Duration.seconds(30)
++
+ export const locationLayer = layer.pipe(
+   Layer.provideMerge(Integration.locationLayer),
+   Layer.provideMerge(PluginV2.locationLayer),
+diff --git a/packages/core/test/catalog.test.ts b/packages/core/test/catalog.test.ts
+index 77a18e79ae..4353c5ce38 100644
+--- a/packages/core/test/catalog.test.ts
++++ b/packages/core/test/catalog.test.ts
+@@ -87,6 +87,51 @@ describe("CatalogV2", () => {
+     }).pipe(Effect.provide(layer))
+   })
+ 
++  it.effect("collapses availability bursts onto one credential read until the catalog changes", () => {
++    const counts = { all: 0 }
++    const layer = Catalog.locationLayer.pipe(
++      Layer.fresh,
++      Layer.provideMerge(EventV2.defaultLayer),
++      Layer.provideMerge(locationLayer),
++      Layer.provideMerge(
++        Layer.mock(Credential.Service)({
++          all: () =>
++            Effect.sync(() => {
++              counts.all++
++              return []
++            }),
++          list: () => Effect.succeed([]),
++        }),
++      ),
++    )
++
++    return Effect.gen(function* () {
++      const catalog = yield* Catalog.Service
++      const transform = yield* catalog.transform()
++      yield* transform((editor) => editor.provider.update(ProviderV2.ID.make("test"), () => {}))
++
++      counts.all = 0
++      // A bootstrap herd: many provider/model availability reads in a burst.
++      // Pre-cache this cost one credentials read per integration per call and
++      // wedged the serve under TUI reconnect herds (workstation-g3iy).
++      for (let i = 0; i < 25; i++) {
++        yield* catalog.provider.available()
++        yield* catalog.model.available()
++      }
++      expect(counts.all).toBeLessThanOrEqual(2)
++
++      // A catalog rebuild invalidates the cache: the next burst recomputes once.
++      yield* transform((editor) => editor.provider.update(ProviderV2.ID.make("other"), () => {}))
++      const after = counts.all
++      for (let i = 0; i < 25; i++) {
++        yield* catalog.provider.available()
++        yield* catalog.model.available()
++      }
++      expect(counts.all).toBeGreaterThan(after)
++      expect(counts.all).toBeLessThanOrEqual(after + 2)
++    }).pipe(Effect.provide(layer))
++  })
++
+   it.effect("projects environment connections without a catalog plugin", () =>
+     Effect.acquireUseRelease(
+       Effect.sync(() => {
