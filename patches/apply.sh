@@ -214,6 +214,24 @@
 #                                               after tool-fix (same file, disjoint regions).
 #                                               SUNSET: drop if upstream bounds the loop load or
 #                                               revives prompt-loop-cache (#25367).
+#  18. integration-list-batch.patch (local)   - backport of the upstream v1.17.13 Integration.list
+#                                               shape (bead workstation-g3iy): one bulk
+#                                               credentials.all() grouped by integrationID instead
+#                                               of one credentials.list() drizzle SELECT per
+#                                               integration. With ~150 models.dev integrations every
+#                                               provider.available() cost ~150 individually-built
+#                                               drizzle queries; /api/provider + /api/model run
+#                                               available() on every TUI bootstrap fetch, so a TUI
+#                                               SSE reconnect herd after a serve restart multiplied
+#                                               into 100k+ query builds (observed: 237k in 75s from
+#                                               ~16 clients) flooding the tick queue -> bun's O(n^2)
+#                                               Array.shift drain -> serve event loop dead 5-13 min
+#                                               (the devbox "wedge"). Query counts measured via a
+#                                               bun:sqlite Database.prototype.query counter injected
+#                                               over BUN_INSPECT; ~1,536 available() calls x 151
+#                                               queries matched the profile exactly. SUNSET: drop on
+#                                               cutover to an upstream >= v1.17.13 (ships this shape
+#                                               natively in Integration.list).
 #
 # DROPPED on the v1.17 line (see workstation docs/plans/2026-06-11-opencode-1.17-cutover-runbook.md):
 #   - prompt-loop-cache.patch (#25367) + cache-aligned-compaction.patch (#25100):
@@ -285,6 +303,7 @@ PATCHES=(
   tui-follow-owner
   event-log-gate
   compaction-bounded-load
+  integration-list-batch
 )
 
 for name in "${PATCHES[@]}"; do
