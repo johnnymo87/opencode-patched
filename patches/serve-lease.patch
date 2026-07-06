@@ -1,5 +1,5 @@
 diff --git a/packages/core/src/flag/flag.ts b/packages/core/src/flag/flag.ts
-index a0eb78a13e..5be4e463a9 100644
+index a0eb78a..5be4e46 100644
 --- a/packages/core/src/flag/flag.ts
 +++ b/packages/core/src/flag/flag.ts
 @@ -45,6 +45,20 @@ export const Flag = {
@@ -25,7 +25,7 @@ index a0eb78a13e..5be4e463a9 100644
    OPENCODE_EXPERIMENTAL_WORKSPACES: enabledByExperimental("OPENCODE_EXPERIMENTAL_WORKSPACES"),
 diff --git a/packages/core/src/serve/routing-lease.ts b/packages/core/src/serve/routing-lease.ts
 new file mode 100644
-index 0000000000..92a91af610
+index 0000000..92a91af
 --- /dev/null
 +++ b/packages/core/src/serve/routing-lease.ts
 @@ -0,0 +1,478 @@
@@ -509,7 +509,7 @@ index 0000000000..92a91af610
 +}
 diff --git a/packages/core/test/serve/routing-lease.test.ts b/packages/core/test/serve/routing-lease.test.ts
 new file mode 100644
-index 0000000000..0820da0b80
+index 0000000..0820da0
 --- /dev/null
 +++ b/packages/core/test/serve/routing-lease.test.ts
 @@ -0,0 +1,636 @@
@@ -1150,7 +1150,7 @@ index 0000000000..0820da0b80
 +  });
 +});
 diff --git a/packages/opencode/src/cli/cmd/serve.ts b/packages/opencode/src/cli/cmd/serve.ts
-index c0f62b3ca0..1c5d191195 100644
+index c0f62b3..1c5d191 100644
 --- a/packages/opencode/src/cli/cmd/serve.ts
 +++ b/packages/opencode/src/cli/cmd/serve.ts
 @@ -1,4 +1,7 @@
@@ -1240,7 +1240,7 @@ index c0f62b3ca0..1c5d191195 100644
  })
 diff --git a/packages/opencode/src/serve/heartbeat.ts b/packages/opencode/src/serve/heartbeat.ts
 new file mode 100644
-index 0000000000..02caab6b69
+index 0000000..02caab6
 --- /dev/null
 +++ b/packages/opencode/src/serve/heartbeat.ts
 @@ -0,0 +1,186 @@
@@ -1431,7 +1431,7 @@ index 0000000000..02caab6b69
 +  }
 +}
 diff --git a/packages/opencode/src/session/prompt.ts b/packages/opencode/src/session/prompt.ts
-index b3f85c813f..e46481c717 100644
+index 6734a1f..646ba4c 100644
 --- a/packages/opencode/src/session/prompt.ts
 +++ b/packages/opencode/src/session/prompt.ts
 @@ -42,13 +42,15 @@ import { Truncate } from "@/tool/truncate"
@@ -1448,10 +1448,10 @@ index b3f85c813f..e46481c717 100644
  import { Database } from "@opencode-ai/core/database/database"
 +import { Flag } from "@opencode-ai/core/flag/flag"
 +import { getSharedRoutingLease, getSelfIdentity, type AcquireResult } from "@opencode-ai/core/serve/routing-lease"
- import { SessionEvent } from "@opencode-ai/core/session/event"
- import { SessionMessage } from "@opencode-ai/core/session/message"
  import { ModelV2 } from "@opencode-ai/core/model"
-@@ -83,6 +85,25 @@ function isOrphanedInterruptedTool(part: SessionV1.ToolPart) {
+ import { ProviderV2 } from "@opencode-ai/core/provider"
+ import { eq } from "drizzle-orm"
+@@ -99,6 +101,25 @@ function isOrphanedInterruptedTool(part: SessionV1.ToolPart) {
    return part.state.status === "error" && part.state.metadata?.interrupted === true
  }
  
@@ -1477,7 +1477,7 @@ index b3f85c813f..e46481c717 100644
  export interface Interface {
    readonly cancel: (sessionID: SessionID) => Effect.Effect<void>
    readonly prompt: (input: PromptInput) => Effect.Effect<SessionV1.WithParts, Image.Error>
-@@ -1131,6 +1152,17 @@ export const layer = Layer.effect(
+@@ -1078,6 +1099,17 @@ const layer = Layer.effect(
        throw new Error("Impossible")
      })
  
@@ -1495,7 +1495,7 @@ index b3f85c813f..e46481c717 100644
      const runLoop: (sessionID: SessionID) => Effect.Effect<SessionV1.WithParts> = Effect.fn("SessionPrompt.run")(
        function* (sessionID: SessionID) {
          const ctx = yield* InstanceState.context
-@@ -1139,6 +1171,7 @@ export const layer = Layer.effect(
+@@ -1086,6 +1118,7 @@ const layer = Layer.effect(
          const session = yield* sessions.get(sessionID).pipe(Effect.orDie)
  
          while (true) {
@@ -1503,7 +1503,7 @@ index b3f85c813f..e46481c717 100644
            yield* status.set(sessionID, { type: "busy" })
            yield* Effect.logInfo("loop", { "session.id": sessionID, step })
  
-@@ -1401,10 +1434,93 @@ export const layer = Layer.effect(
+@@ -1339,10 +1372,93 @@ const layer = Layer.effect(
        },
      )
  
@@ -1599,7 +1599,7 @@ index b3f85c813f..e46481c717 100644
  
      const shell: (input: ShellInput) => Effect.Effect<SessionV1.WithParts, Session.BusyError> = Effect.fn(
 diff --git a/packages/opencode/test/cli/serve/serve-process.test.ts b/packages/opencode/test/cli/serve/serve-process.test.ts
-index 6dbea372b2..20e2783561 100644
+index 6dbea37..20e2783 100644
 --- a/packages/opencode/test/cli/serve/serve-process.test.ts
 +++ b/packages/opencode/test/cli/serve/serve-process.test.ts
 @@ -9,6 +9,54 @@ import { describe, expect } from "bun:test"
@@ -1876,26 +1876,26 @@ index 6dbea372b2..20e2783561 100644
 +  )
  })
 diff --git a/packages/opencode/test/session/prompt.test.ts b/packages/opencode/test/session/prompt.test.ts
-index 08828018a4..2b3b2f0820 100644
+index 491ad06..fbb24b2 100644
 --- a/packages/opencode/test/session/prompt.test.ts
 +++ b/packages/opencode/test/session/prompt.test.ts
-@@ -1,12 +1,15 @@
- import { NodeFileSystem } from "@effect/platform-node"
+@@ -1,3 +1,6 @@
 +import { Flag } from "@opencode-ai/core/flag/flag"
 +import { setSelfIdentity, __resetSharedRoutingLease } from "@opencode-ai/core/serve/routing-lease"
 +import os from "os"
  import { ConfigV1 } from "@opencode-ai/core/v1/config/config"
  import { SessionV1 } from "@opencode-ai/core/v1/session"
  import { Database } from "@opencode-ai/core/database/database"
+@@ -5,8 +8,8 @@ import { LayerNode } from "@opencode-ai/core/effect/layer-node"
+ import { SessionProjector } from "@opencode-ai/core/session/projector"
  import { eq } from "drizzle-orm"
  import { EventV2Bridge } from "@/event-v2-bridge"
- import { FetchHttpClient } from "effect/unstable/http"
 -import { expect } from "bun:test"
 -import { Cause, Deferred, Duration, Effect, Exit, Fiber, Layer } from "effect"
 +import { expect, describe, it as bunIt } from "bun:test"
 +import { Cause, Deferred, Duration, Effect, Exit, Fiber, Layer, Ref } from "effect"
  import path from "path"
- import { fileURLToPath, pathToFileURL } from "url"
+ import { fileURLToPath } from "url"
  import { NamedError } from "@opencode-ai/core/util/error"
 @@ -34,7 +37,7 @@ import { SessionCompaction } from "../../src/session/compaction"
  import { SessionSummary } from "../../src/session/summary"
@@ -1906,7 +1906,7 @@ index 08828018a4..2b3b2f0820 100644
  import { SessionRevert } from "../../src/session/revert"
  import { SessionRunState } from "../../src/session/run-state"
  import { MessageID, PartID, SessionID } from "../../src/session/schema"
-@@ -2324,3 +2327,548 @@ noLLMServer.instance(
+@@ -2400,3 +2403,548 @@ noLLMServer.instance(
      }),
    30_000,
  )

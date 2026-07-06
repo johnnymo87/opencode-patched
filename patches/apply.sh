@@ -2,9 +2,10 @@
 # Apply local patches to opencode source for the v1.17 release line.
 # Usage: ./apply.sh <path-to-opencode-source>
 #
-# TARGET UPSTREAM: opencode v1.17.7
+# TARGET UPSTREAM: opencode v1.17.13
 #
-# PATCH SET (v1.17 line, rebased 2026-06-11 from the v1.15 line):
+# PATCH SET (v1.17 line; rebased 2026-06-11 from the v1.15 line, rolled forward
+# from v1.17.7 to v1.17.13 on 2026-07-06):
 #   1. gemini-empty-parts.patch   (PR #28669) - pad empty Gemini/Vertex parts arrays
 #                                               (gemini.ts lowerMessages + transform.ts normalizeMessages)
 #   2. tool-fix.patch             (PR #16751) - synthetic step-start boundaries (tool_use/result mismatch)
@@ -214,25 +215,7 @@
 #                                               after tool-fix (same file, disjoint regions).
 #                                               SUNSET: drop if upstream bounds the loop load or
 #                                               revives prompt-loop-cache (#25367).
-#  18. integration-list-batch.patch (local)   - backport of the upstream v1.17.13 Integration.list
-#                                               shape (bead workstation-g3iy): one bulk
-#                                               credentials.all() grouped by integrationID instead
-#                                               of one credentials.list() drizzle SELECT per
-#                                               integration. With ~150 models.dev integrations every
-#                                               provider.available() cost ~150 individually-built
-#                                               drizzle queries; /api/provider + /api/model run
-#                                               available() on every TUI bootstrap fetch, so a TUI
-#                                               SSE reconnect herd after a serve restart multiplied
-#                                               into 100k+ query builds (observed: 237k in 75s from
-#                                               ~16 clients) flooding the tick queue -> bun's O(n^2)
-#                                               Array.shift drain -> serve event loop dead 5-13 min
-#                                               (the devbox "wedge"). Query counts measured via a
-#                                               bun:sqlite Database.prototype.query counter injected
-#                                               over BUN_INSPECT; ~1,536 available() calls x 151
-#                                               queries matched the profile exactly. SUNSET: drop on
-#                                               cutover to an upstream >= v1.17.13 (ships this shape
-#                                               natively in Integration.list).
-#  19. available-cache.patch (local)          - herd-collapse cache for CatalogV2 provider/model
+#  18. available-cache.patch (local)          - herd-collapse cache for CatalogV2 provider/model
 #                                               availability (bead workstation-g3iy, layer 2).
 #                                               Even with integration-list-batch, every /api/model
 #                                               call recomputes the full availability projection —
@@ -257,6 +240,15 @@
 #                                               2026-07-04.
 #
 # DROPPED on the v1.17 line (see workstation docs/plans/2026-06-11-opencode-1.17-cutover-runbook.md):
+#   - integration-list-batch.patch: DROPPED on the v1.17.13 roll-forward (2026-07-06).
+#     UPSTREAMED — v1.17.13 Integration.list now does the bulk shape natively:
+#     `Map.groupBy(yield* credentials.all(), (c) => c.integrationID)` then one
+#     project() per integration, instead of a credentials.list() SELECT per
+#     integration. This was the "layer 1" half of the workstation-g3iy wedge fix;
+#     it becomes upstream exactly at v1.17.13 (the sunset target called out in
+#     bead workstation-hbc3). Layer 2 (available-cache) is still needed: upstream
+#     >= v1.17.13 still recomputes the full ~5k-model availability projection per
+#     /api/model call.
 #   - prompt-loop-cache.patch (#25367) + cache-aligned-compaction.patch (#25100):
 #     cost-cache optimizations that touch the rewritten event-sourced prompt.ts/compaction.ts.
 #     Not redundant-by-upstreaming (1.17 still full-reloads each loop iteration), but dropped
@@ -326,7 +318,6 @@ PATCHES=(
   tui-follow-owner
   event-log-gate
   compaction-bounded-load
-  integration-list-batch
   available-cache
 )
 

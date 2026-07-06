@@ -1,19 +1,19 @@
 diff --git a/packages/core/src/event.ts b/packages/core/src/event.ts
-index 7a33eedc40..90c689acd8 100644
+index c92ac0a..f3732ad 100644
 --- a/packages/core/src/event.ts
 +++ b/packages/core/src/event.ts
-@@ -4,6 +4,7 @@ import { Cause, Context, Effect, Layer, Option, PubSub, Schema, Stream } from "e
- import { and, asc, eq, gt } from "drizzle-orm"
+@@ -6,6 +6,7 @@ import type { Data, Definition, Payload } from "@opencode-ai/schema/event"
+ import { and, asc, eq, gt, inArray } from "drizzle-orm"
  import { Database } from "./database/database"
  import { EventSequenceTable, EventTable } from "./event/sql"
 +import { truthy } from "./flag/flag"
  import { Location } from "./location"
- import { externalID, type ExternalID, NonNegativeInt, withStatics } from "./schema"
- import { Identifier } from "./util/identifier"
-@@ -88,6 +89,15 @@ type SyncDefinition = Definition & {
-   readonly encode: (data: unknown) => unknown
-   readonly decode: (data: unknown) => unknown
- }
+ import { makeGlobalNode } from "./effect/app-node"
+ import { isDeepStrictEqual } from "node:util"
+@@ -115,6 +116,15 @@ export class SubscriberOverflowError extends Schema.TaggedErrorClass<SubscriberO
+ export const define = Event.define
+ export const versionedType = Event.versionedType
+ 
 +// event-log-gate.patch: whether to persist rows into the durable event log
 +// (EventTable). Read lazily (not via the eagerly-computed Flag object) so
 +// tests and embedders can toggle it after module load. Mirrors upstream's
@@ -23,10 +23,10 @@ index 7a33eedc40..90c689acd8 100644
 +    ? truthy("OPENCODE_EXPERIMENTAL")
 +    : truthy("OPENCODE_EXPERIMENTAL_WORKSPACES")
 +
- const syncRegistry = new Map<string, SyncDefinition>()
- 
- // Synchronized events cross a JSON boundary, so their data schemas must encode and decode without services.
-@@ -317,19 +327,35 @@ export const layerWith = (options?: LayerOptions) =>
+ export interface PublishOptions {
+   readonly id?: ID
+   readonly metadata?: Record<string, unknown>
+@@ -300,19 +310,35 @@ export const layerWith = (options?: LayerOptions) =>
                                }),
                              )
                            }
@@ -38,7 +38,7 @@ index 7a33eedc40..90c689acd8 100644
 -                            .pipe(Effect.orDie)
 -                          if (stored)
 -                            yield* Effect.die(
--                              new InvalidSyncEventError({
+-                              new InvalidDurableEventError({
 -                                type: event.type,
 -                                message: `Event ${event.id} already exists at aggregate ${stored.aggregateID} sequence ${stored.seq}`,
 -                              }),
@@ -66,16 +66,16 @@ index 7a33eedc40..90c689acd8 100644
 +                              .pipe(Effect.orDie)
 +                            if (stored)
 +                              yield* Effect.die(
-+                                new InvalidSyncEventError({
++                                new InvalidDurableEventError({
 +                                  type: event.type,
 +                                  message: `Event ${event.id} already exists at aggregate ${stored.aggregateID} sequence ${stored.seq}`,
 +                                }),
 +                              )
 +                          }
-                           for (const guard of commitGuards) {
-                             yield* guard(event)
-                           }
-@@ -349,19 +375,21 @@ export const layerWith = (options?: LayerOptions) =>
+                           const committed = {
+                             ...event,
+                             durable: { aggregateID, seq, version: durable.version },
+@@ -333,19 +359,21 @@ export const layerWith = (options?: LayerOptions) =>
                              })
                              .run()
                              .pipe(Effect.orDie)
@@ -86,7 +86,7 @@ index 7a33eedc40..90c689acd8 100644
 -                                id: event.id,
 -                                aggregate_id: aggregateID,
 -                                seq,
--                                type: versionedType(definition.type, sync.version),
+-                                type: versionedType(definition.type, durable.version),
 -                                data: encoded,
 -                              },
 -                            ])
@@ -100,7 +100,7 @@ index 7a33eedc40..90c689acd8 100644
 +                                  id: event.id,
 +                                  aggregate_id: aggregateID,
 +                                  seq,
-+                                  type: versionedType(definition.type, sync.version),
++                                  type: versionedType(definition.type, durable.version),
 +                                  data: encoded,
 +                                },
 +                              ])
@@ -111,10 +111,10 @@ index 7a33eedc40..90c689acd8 100644
                          }),
                        { behavior: "immediate" },
 diff --git a/packages/core/test/event.test.ts b/packages/core/test/event.test.ts
-index cd8ba69253..d979b343ce 100644
+index e4329a2..840a590 100644
 --- a/packages/core/test/event.test.ts
 +++ b/packages/core/test/event.test.ts
-@@ -11,6 +11,13 @@ import { eq } from "drizzle-orm"
+@@ -16,6 +16,13 @@ import { eq } from "drizzle-orm"
  import { location } from "./fixture/location"
  import { testEffect } from "./lib/effect"
  
@@ -128,7 +128,7 @@ index cd8ba69253..d979b343ce 100644
  const locationLayer = Layer.succeed(
    Location.Service,
    Location.Service.of(
-@@ -326,6 +333,43 @@ describe("EventV2", () => {
+@@ -370,6 +377,43 @@ describe("EventV2", () => {
      }),
    )
  

@@ -1,9 +1,9 @@
 diff --git a/packages/core/src/session/projector.ts b/packages/core/src/session/projector.ts
-index caf63de78..26f08b83a 100644
+index afa60df..d85755a 100644
 --- a/packages/core/src/session/projector.ts
 +++ b/packages/core/src/session/projector.ts
-@@ -24,6 +24,33 @@ const encodeMessage = Schema.encodeSync(SessionMessage.Message)
- class PromptAlreadyProjected extends Error {}
+@@ -23,6 +23,33 @@ const encodeMessage = Schema.encodeSync(SessionMessage.Message)
+ 
  export class SessionAlreadyProjected extends Error {}
  
 +function foreign(err: unknown): boolean {
@@ -36,7 +36,7 @@ index caf63de78..26f08b83a 100644
  type Usage = {
    cost: number
    tokens: {
-@@ -272,7 +299,13 @@ export const layer = Layer.effectDiscard(
+@@ -270,7 +297,13 @@ const layer = Layer.effectDiscard(
            .values({ id, session_id: sessionID, time_created, data })
            .onConflictDoUpdate({ target: MessageTable.id, set: { data } })
            .run()
@@ -51,7 +51,7 @@ index caf63de78..26f08b83a 100644
        }),
      )
      yield* events.project(SessionV1.Event.MessageRemoved, (event) =>
-@@ -323,7 +356,13 @@ export const layer = Layer.effectDiscard(
+@@ -321,7 +354,13 @@ const layer = Layer.effectDiscard(
            .values({ id, message_id: messageID, session_id: sessionID, time_created: event.data.time, data })
            .onConflictDoUpdate({ target: PartTable.id, set: { data } })
            .run()

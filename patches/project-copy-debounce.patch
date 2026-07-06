@@ -1,5 +1,5 @@
 diff --git a/packages/core/src/project/copy.ts b/packages/core/src/project/copy.ts
-index 0e3246b3b..653e21e5c 100644
+index 5b2f956..80f1f8a 100644
 --- a/packages/core/src/project/copy.ts
 +++ b/packages/core/src/project/copy.ts
 @@ -1,6 +1,6 @@
@@ -10,7 +10,7 @@ index 0e3246b3b..653e21e5c 100644
  import path from "path"
  import { AbsolutePath } from "../schema"
  import { FSUtil } from "../fs-util"
-@@ -94,6 +94,30 @@ export type Error =
+@@ -83,6 +83,30 @@ export type Error =
    | StrategyUnavailableError
    | Git.WorktreeError
  
@@ -41,7 +41,7 @@ index 0e3246b3b..653e21e5c 100644
  export interface Strategy {
    readonly id: StrategyID
    readonly create: (input: {
-@@ -123,7 +147,27 @@ export interface Interface {
+@@ -107,7 +131,27 @@ export interface Interface {
  
  export class Service extends Context.Service<Service, Interface>()("@opencode/ProjectCopy") {}
  
@@ -67,9 +67,9 @@ index 0e3246b3b..653e21e5c 100644
  export const refreshAfterBoot = Effect.gen(function* () {
 +  if (process.env[REFRESH_ON_BOOT_ENV] !== "1") return
    const location = yield* Location.Service
-   const boot = yield* PluginBoot.Service
    const copies = yield* Service
-@@ -230,12 +274,12 @@ export const layer = Layer.effect(
+   yield* Effect.gen(function* () {
+@@ -212,12 +256,12 @@ const layer = Layer.effect(
        )
      })
  
@@ -84,7 +84,7 @@ index 0e3246b3b..653e21e5c 100644
        )
        const sourceDirectories = checked
          .filter((item) => item.strategy === undefined && item.exists)
-@@ -254,7 +298,7 @@ export const layer = Layer.effect(
+@@ -236,7 +280,7 @@ const layer = Layer.effect(
                ),
              ),
            ),
@@ -93,7 +93,7 @@ index 0e3246b3b..653e21e5c 100644
        ).pipe(
          Effect.map((sets) => new Map(sets.flat(2).map((item) => [item.directory, item] as const)).values().toArray()),
        )
-@@ -287,6 +331,27 @@ export const layer = Layer.effect(
+@@ -269,6 +313,27 @@ const layer = Layer.effect(
        return changes
      })
  
@@ -122,27 +122,27 @@ index 0e3246b3b..653e21e5c 100644
        register,
        create,
 diff --git a/packages/core/test/project-copy.test.ts b/packages/core/test/project-copy.test.ts
-index 47f2176c3..0b3f91211 100644
+index d37f630..d04c5dd 100644
 --- a/packages/core/test/project-copy.test.ts
 +++ b/packages/core/test/project-copy.test.ts
-@@ -3,13 +3,15 @@ import { $ } from "bun"
+@@ -3,7 +3,7 @@ import { $ } from "bun"
  import fs from "fs/promises"
  import path from "path"
  import { eq } from "drizzle-orm"
--import { Effect, Fiber, Layer, Stream } from "effect"
+-import { Effect, Fiber, Stream } from "effect"
 +import { Deferred, Effect, Fiber, Layer, Stream } from "effect"
+ import { AppNodeBuilder } from "@opencode-ai/core/effect/app-node-builder"
+ import { LayerNode } from "@opencode-ai/core/effect/layer-node"
  import { AbsolutePath } from "@opencode-ai/core/schema"
- import { FSUtil } from "@opencode-ai/core/fs-util"
- import { Git } from "@opencode-ai/core/git"
+@@ -11,6 +11,7 @@ import { Git } from "@opencode-ai/core/git"
  import { Database } from "@opencode-ai/core/database/database"
  import { EventV2 } from "@opencode-ai/core/event"
  import { Project } from "@opencode-ai/core/project"
 +import { Location } from "@opencode-ai/core/location"
-+import { PluginBoot } from "@opencode-ai/core/plugin/boot"
  import { ProjectDirectoryTable, ProjectTable } from "@opencode-ai/core/project/sql"
  import { ProjectCopy } from "@opencode-ai/core/project/copy"
  import { ProjectDirectories } from "@opencode-ai/core/project/directories"
-@@ -404,4 +406,210 @@ describe("ProjectCopy", () => {
+@@ -397,4 +398,207 @@ describe("ProjectCopy", () => {
        expect(yield* stored(input.projectID)).not.toContainEqual({ directory: missing, strategy: null })
      }),
    )
@@ -299,15 +299,12 @@ index 47f2176c3..0b3f91211 100644
 +    )
 +
 +  const bootLayers = (input: { projectID: Project.ID; sourceDirectory: AbsolutePath }) =>
-+    Layer.mergeAll(
-+      Layer.mock(Location.Service, {
-+        directory: input.sourceDirectory,
-+        workspaceID: undefined,
-+        project: { id: input.projectID, directory: input.sourceDirectory },
-+        vcs: undefined,
-+      }),
-+      Layer.mock(PluginBoot.Service, { wait: () => Effect.void }),
-+    )
++    Layer.mock(Location.Service, {
++      directory: input.sourceDirectory,
++      workspaceID: undefined,
++      project: { id: input.projectID, directory: input.sourceDirectory },
++      vcs: undefined,
++    })
 +
 +  it.live("refreshAfterBoot is a no-op when OPENCODE_PROJECT_COPY_REFRESH_ON_BOOT is unset (default off)", () =>
 +    Effect.gen(function* () {
