@@ -10,9 +10,14 @@ permissions:
   contents: read
   issues: write
 
+concurrency:
+  group: check-sunset
+  cancel-in-progress: true
+
 jobs:
   check-upstream:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - name: Check issue #17883 (cache thinking-skip) status
         id: check_thinking_skip

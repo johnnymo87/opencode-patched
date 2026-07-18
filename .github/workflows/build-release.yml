@@ -26,9 +26,17 @@ permissions:
   contents: write
   issues: write
 
+# Prevent concurrent duplicate builds of the SAME version from racing on release
+# creation. cancel-in-progress:false so an in-flight release publish is never
+# killed mid-way; a duplicate dispatch queues behind the running one instead.
+concurrency:
+  group: build-release-${{ inputs.version }}
+  cancel-in-progress: false
+
 jobs:
   build-linux:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - name: Checkout opencode-patched
         uses: actions/checkout@v4
@@ -95,6 +103,7 @@ jobs:
 
   build-macos:
     runs-on: macos-latest
+    timeout-minutes: 30
     steps:
       - name: Checkout opencode-patched
         uses: actions/checkout@v4
@@ -191,6 +200,7 @@ jobs:
   release:
     needs: [build-linux, build-macos]
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -215,6 +225,10 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           path: ./artifacts
+          # Only pull the FINAL release assets (opencode-*). Any intermediate
+          # artifacts (e.g. unsigned-darwin-*) are excluded so merge-multiple
+          # can never clobber a signed binary with an unsigned one.
+          pattern: opencode-*
           merge-multiple: true
 
       - name: Generate checksums
@@ -305,6 +319,9 @@ jobs:
             artifacts/opencode-darwin-arm64.zip
             artifacts/opencode-darwin-x64.zip
             artifacts/checksums.sha256
+          # Fail loudly if any expected asset is missing rather than publishing a
+          # release silently short a platform (default is warn-and-continue).
+          fail_on_unmatched_files: true
           draft: false
           prerelease: false
         env:
@@ -314,6 +331,7 @@ jobs:
     needs: [build-linux, build-macos, release]
     if: failure()
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - name: Create issue on failure
         uses: actions/github-script@v7
@@ -327,6 +345,12 @@ jobs:
             The automated build for OpenCode v${version} with local patches failed.
 
             **Workflow Run**: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+
+            > **Automatic builds for v${version} are PAUSED while this issue is open.**
+            > The scheduled \`sync-upstream\` workflow treats an open \`build-failure\`
+            > issue for this version as a circuit breaker and will not re-trigger the
+            > build every 8h. **Close this issue after fixing the patches to re-enable
+            > auto-builds**, or manually dispatch \`build-release.yml\` to retry now.
 
             ### Possible Causes
 
@@ -370,7 +394,7 @@ jobs:
                 owner: context.repo.owner,
                 repo: context.repo.repo,
                 issue_number: existingIssue.number,
-                body: `Another build failure occurred. See: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}`
+                body: `Another build failure occurred. See: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}\n\n_Automatic builds for v${version} remain paused while this issue is open (sync-upstream circuit breaker). Close it after fixing the patches to re-enable auto-builds._`
               });
             } else {
               await github.rest.issues.create({

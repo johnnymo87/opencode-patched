@@ -23,19 +23,24 @@ on:
 permissions:
   contents: read
   actions: write
+  issues: read
+
+# Overlapping sync runs are pointless (the check is stateless and idempotent);
+# cancel a stale run if a new fire or manual dispatch starts.
+concurrency:
+  group: sync-upstream
+  cancel-in-progress: true
 
 jobs:
   check-new-release:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     outputs:
       should_build: ${{ steps.check.outputs.should_build }}
       version: ${{ steps.check.outputs.version }}
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-
+      # No checkout: every step below uses `gh` with an explicit --repo and reads
+      # nothing from the working tree.
       - name: Check for new upstream opencode release
         id: check
         run: |
@@ -60,8 +65,27 @@ jobs:
                | grep -qE "v${VERSION}-patched(\.[0-9]+)?\b"; then
             echo "A v${VERSION}-patched release already exists, skipping"
             echo "should_build=false" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          # Circuit breaker: if a build for this exact version already failed and
+          # its build-failure issue is still OPEN, the patches are known-broken
+          # for v${VERSION}. Do NOT re-trigger the doomed build every 8h -- wait
+          # for a human to fix the patches and CLOSE the issue (which re-arms this
+          # check), or to manually dispatch build-release.yml.
+          #
+          # Exact-title jq match (not --search: the search index is eventually
+          # consistent; the REST list is not, and exact match sidesteps any
+          # tokenization/glob concerns).
+          BROKEN=$(gh issue list --repo ${{ github.repository }} \
+                     --label build-failure --state open --limit 100 \
+                     --json title \
+                     --jq "[.[] | select(.title == \"Build failed for v${VERSION}\")] | length")
+          if [ "${BROKEN:-0}" -gt 0 ]; then
+            echo "v${VERSION} has an OPEN build-failure issue -- known broken, skipping auto-trigger until it is closed"
+            echo "should_build=false" >> $GITHUB_OUTPUT
           else
-            echo "No v${VERSION}-patched release exists, will build"
+            echo "No v${VERSION}-patched release and no open build-failure issue, will build"
             echo "should_build=true" >> $GITHUB_OUTPUT
           fi
         env:
@@ -71,6 +95,7 @@ jobs:
     needs: check-new-release
     if: needs.check-new-release.outputs.should_build == 'true'
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - name: Trigger build workflow
         run: |
