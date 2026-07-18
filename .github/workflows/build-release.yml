@@ -12,6 +12,11 @@ on:
         required: false
         type: string
         default: ''
+      dry_run:
+        description: 'Validation only: build + macOS sign/smoke-test, but SKIP the release publish and the failure-issue. Use to validate workflow changes without touching releases.'
+        required: false
+        type: boolean
+        default: false
   workflow_call:
     inputs:
       version:
@@ -21,14 +26,26 @@ on:
         required: false
         type: string
         default: ''
+      dry_run:
+        required: false
+        type: boolean
+        default: false
 
 permissions:
   contents: write
   issues: write
 
+# Prevent concurrent duplicate builds of the SAME version from racing on release
+# creation. cancel-in-progress:false so an in-flight release publish is never
+# killed mid-way; a duplicate dispatch queues behind the running one instead.
+concurrency:
+  group: build-release-${{ inputs.version }}
+  cancel-in-progress: false
+
 jobs:
   build-linux:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - name: Checkout opencode-patched
         uses: actions/checkout@v4
@@ -66,6 +83,42 @@ jobs:
           ls -lh dist/
         env:
           OPENCODE_VERSION: ${{ inputs.version }}
+          # bun cross-compiles the darwin binaries here on Linux. Disable bun's
+          # internal Mach-O signer (broken in bun 1.3.12, see the build-macos job)
+          # so the darwin binaries carry NO signature slot. They are ad-hoc signed
+          # on a real macOS runner in build-macos. Remove once bun >1.3.12 ships.
+          BUN_NO_CODESIGN_MACHO_BINARY: "1"
+
+      # The darwin binaries are produced here (bun compile is a pure cross-compile,
+      # no macOS toolchain). Hand them UNSIGNED to the macOS job, which only signs
+      # + smoke-tests -- avoiding a full duplicate build on the 10x-billed runner.
+      # tar preserves the executable bit through upload/download (upload-artifact
+      # would otherwise drop it).
+      - name: Package unsigned macOS arm64 binary
+        run: |
+          cd opencode-src/packages/opencode/dist/opencode-darwin-arm64
+          tar czf /tmp/unsigned-darwin-arm64.tar.gz .
+          echo "Created: $(ls -lh /tmp/unsigned-darwin-arm64.tar.gz)"
+
+      - name: Package unsigned macOS x64 binary
+        run: |
+          cd opencode-src/packages/opencode/dist/opencode-darwin-x64
+          tar czf /tmp/unsigned-darwin-x64.tar.gz .
+          echo "Created: $(ls -lh /tmp/unsigned-darwin-x64.tar.gz)"
+
+      - name: Upload unsigned macOS arm64 intermediate
+        uses: actions/upload-artifact@v4
+        with:
+          name: unsigned-darwin-arm64
+          path: /tmp/unsigned-darwin-arm64.tar.gz
+          retention-days: 1
+
+      - name: Upload unsigned macOS x64 intermediate
+        uses: actions/upload-artifact@v4
+        with:
+          name: unsigned-darwin-x64
+          path: /tmp/unsigned-darwin-x64.tar.gz
+          retention-days: 1
 
       - name: Extract Linux arm64 binary
         run: |
@@ -93,84 +146,82 @@ jobs:
           path: /tmp/opencode-linux-x64.tar.gz
           retention-days: 1
 
+  # macOS is billed at 10x, so we do NOT rebuild here. The darwin binaries are
+  # cross-compiled once in build-linux; this job only does what genuinely needs
+  # a real macOS host: ad-hoc codesign + a launch smoke test. That drops the
+  # macOS leg from a full bun install+build (~3 min -> ~30 billed min) to
+  # sign+test (~1 min -> ~10 billed min). Because it `needs: build-linux`, a
+  # patch-apply failure never reaches (and never bills) the macOS runner.
   build-macos:
+    needs: build-linux
     runs-on: macos-latest
+    timeout-minutes: 15
     steps:
-      - name: Checkout opencode-patched
-        uses: actions/checkout@v4
-
-      - name: Setup Bun
-        uses: oven-sh/setup-bun@v2
+      - name: Download unsigned macOS arm64 intermediate
+        uses: actions/download-artifact@v4
         with:
-          bun-version: latest
+          name: unsigned-darwin-arm64
+          path: /tmp/dl-arm64
 
-      - name: Clone upstream opencode
+      - name: Download unsigned macOS x64 intermediate
+        uses: actions/download-artifact@v4
+        with:
+          name: unsigned-darwin-x64
+          path: /tmp/dl-x64
+
+      - name: Unpack darwin binaries
         run: |
-          git clone --depth 1 --branch v${{ inputs.version }} \
-            https://github.com/anomalyco/opencode.git opencode-src
-          cd opencode-src
-          echo "Cloned opencode v${{ inputs.version }}"
-          git log -1 --oneline
+          mkdir -p dist/opencode-darwin-arm64 dist/opencode-darwin-x64
+          tar xzf /tmp/dl-arm64/unsigned-darwin-arm64.tar.gz -C dist/opencode-darwin-arm64
+          tar xzf /tmp/dl-x64/unsigned-darwin-x64.tar.gz   -C dist/opencode-darwin-x64
+          # Fail closed if either binary is missing/non-executable before we sign.
+          for arch in arm64 x64; do
+            bin="dist/opencode-darwin-${arch}/bin/opencode"
+            test -x "${bin}" || { echo "❌ missing or non-executable: ${bin}"; exit 1; }
+          done
 
-      - name: Apply patches
-        run: |
-          cd opencode-src
-          ../patches/apply.sh .
-
-      - name: Install dependencies
-        run: |
-          cd opencode-src
-          bun install
-
-      - name: Build CLI
-        run: |
-          cd opencode-src/packages/opencode
-          bun run script/build.ts --all
-
-          echo ""
-          echo "Build completed. Artifacts:"
-          ls -lh dist/
-        env:
-          OPENCODE_VERSION: ${{ inputs.version }}
-          # Bun 1.3.12 has a regression (oven-sh/bun#29120, fixed in #29272)
-          # where its built-in Mach-O codesigner writes an LC_CODE_SIGNATURE
-          # with datasize smaller than the SuperBlob it actually stamps. macOS
-          # kernels (Sequoia 15.4+) SIGKILL the resulting binary on launch,
-          # and subsequent `codesign --sign -` calls fail with "invalid or
-          # unsupported format for signature".
-          #
-          # Disable Bun's internal signer so the output has no LC_CODE_SIGNATURE
-          # slot at all, then ad-hoc sign it ourselves below. Remove this env
-          # var once Bun >1.3.12 ships.
-          BUN_NO_CODESIGN_MACHO_BINARY: "1"
-
-      # Ad-hoc sign the freshly-built Mach-O binaries. Without a valid
-      # signature, macOS (Apple Silicon, Sequoia 15.4+) SIGKILLs the binary
-      # on launch with exit 9. We do this ourselves because Bun's internal
-      # signer is disabled via BUN_NO_CODESIGN_MACHO_BINARY above.
+      # Ad-hoc sign the cross-compiled Mach-O binaries. Without a valid
+      # signature, macOS (Apple Silicon, Sequoia 15.4+) SIGKILLs the binary on
+      # launch with exit 9. The binaries were built in build-linux with
+      # BUN_NO_CODESIGN_MACHO_BINARY=1 (no signature slot), so this is a clean
+      # ad-hoc sign, not a re-sign of Bun's broken 1.3.12 signature.
       - name: Ad-hoc codesign macOS binaries
         run: |
           for arch in arm64 x64; do
-            bin="opencode-src/packages/opencode/dist/opencode-darwin-${arch}/bin/opencode"
+            bin="dist/opencode-darwin-${arch}/bin/opencode"
             echo "Signing ${bin}"
             codesign --force --sign - "${bin}"
             codesign -dv "${bin}" 2>&1 | grep -E "^(Executable|Signature|Format|CodeDirectory)"
           done
 
+      # Hard coverage gate: a cross-built + ad-hoc-signed darwin-arm64 binary that
+      # won't launch FAILS the build here (loud) rather than shipping (silent).
       - name: Smoke test signed arm64 binary
         run: |
-          bin="opencode-src/packages/opencode/dist/opencode-darwin-arm64/bin/opencode"
+          bin="dist/opencode-darwin-arm64/bin/opencode"
           "${bin}" --version
 
-      - name: Extract macOS arm64 binary
+      # Best-effort x64 smoke test via Rosetta 2 on the arm64 runner. Non-fatal:
+      # x64 was never smoke-tested before this change, so a Rosetta hiccup must
+      # not regress the release. The arm64 test above remains the hard gate.
+      - name: Smoke test signed x64 binary (Rosetta, best-effort)
+        continue-on-error: true
         run: |
-          cd opencode-src/packages/opencode/dist/opencode-darwin-arm64
+          sudo softwareupdate --install-rosetta --agree-to-license || {
+            echo "Rosetta unavailable; skipping x64 smoke test"; exit 0;
+          }
+          bin="dist/opencode-darwin-x64/bin/opencode"
+          arch -x86_64 "${bin}" --version
+
+      - name: Package signed macOS arm64 binary
+        run: |
+          cd dist/opencode-darwin-arm64
           zip -r /tmp/opencode-darwin-arm64.zip .
           echo "Created: $(ls -lh /tmp/opencode-darwin-arm64.zip)"
 
-      - name: Extract macOS x64 binary
+      - name: Package signed macOS x64 binary
         run: |
-          cd opencode-src/packages/opencode/dist/opencode-darwin-x64
+          cd dist/opencode-darwin-x64
           zip -r /tmp/opencode-darwin-x64.zip .
           echo "Created: $(ls -lh /tmp/opencode-darwin-x64.zip)"
 
@@ -190,7 +241,10 @@ jobs:
 
   release:
     needs: [build-linux, build-macos]
+    # dry_run validates build + macOS sign/smoke only; never publish a release.
+    if: ${{ !inputs.dry_run }}
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -215,6 +269,10 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           path: ./artifacts
+          # Only pull the FINAL release assets (opencode-*). Any intermediate
+          # artifacts (e.g. unsigned-darwin-*) are excluded so merge-multiple
+          # can never clobber a signed binary with an unsigned one.
+          pattern: opencode-*
           merge-multiple: true
 
       - name: Generate checksums
@@ -305,6 +363,9 @@ jobs:
             artifacts/opencode-darwin-arm64.zip
             artifacts/opencode-darwin-x64.zip
             artifacts/checksums.sha256
+          # Fail loudly if any expected asset is missing rather than publishing a
+          # release silently short a platform (default is warn-and-continue).
+          fail_on_unmatched_files: true
           draft: false
           prerelease: false
         env:
@@ -312,8 +373,11 @@ jobs:
 
   notify-on-failure:
     needs: [build-linux, build-macos, release]
-    if: failure()
+    # Skip on dry_run so validation runs never open a spurious build-failure issue
+    # (which would trip the sync-upstream circuit breaker for a real version).
+    if: ${{ failure() && !inputs.dry_run }}
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - name: Create issue on failure
         uses: actions/github-script@v7
@@ -327,6 +391,12 @@ jobs:
             The automated build for OpenCode v${version} with local patches failed.
 
             **Workflow Run**: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+
+            > **Automatic builds for v${version} are PAUSED while this issue is open.**
+            > The scheduled \`sync-upstream\` workflow treats an open \`build-failure\`
+            > issue for this version as a circuit breaker and will not re-trigger the
+            > build every 8h. **Close this issue after fixing the patches to re-enable
+            > auto-builds**, or manually dispatch \`build-release.yml\` to retry now.
 
             ### Possible Causes
 
@@ -370,7 +440,7 @@ jobs:
                 owner: context.repo.owner,
                 repo: context.repo.repo,
                 issue_number: existingIssue.number,
-                body: `Another build failure occurred. See: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}`
+                body: `Another build failure occurred. See: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}\n\n_Automatic builds for v${version} remain paused while this issue is open (sync-upstream circuit breaker). Close it after fixing the patches to re-enable auto-builds._`
               });
             } else {
               await github.rest.issues.create({
