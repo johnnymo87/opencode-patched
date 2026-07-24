@@ -266,6 +266,12 @@
 #                                               session-scoped door routes. Run by the build-release.yml
 #                                               "Phase 8 contract tests" step (build-release ran no tests
 #                                               before, so the tripwire would be inert without it).
+#  22. session-mcp-routes.patch (local)       - Phase 10 server + SDK surface for session-scoped MCP routes
+#                                               (bead workstation-mlve.11). Adds GET /session/:sessionID/mcp,
+#                                               POST /session/:sessionID/mcp/:name/connect, and
+#                                               POST /session/:sessionID/mcp/:name/disconnect so the front door
+#                                               can owner-route MCP status/toggle requests by session. Response
+#                                               is process-global (sessionID is a routing key). Includes SDK gen.
 #
 # DROPPED on the v1.17 line (see workstation docs/plans/2026-06-11-opencode-1.17-cutover-runbook.md):
 #   - integration-list-batch.patch: DROPPED on the v1.17.13 roll-forward (2026-07-06).
@@ -349,6 +355,7 @@ PATCHES=(
   session-door-routes
   tui-door-attach
   tui-door-tests
+  session-mcp-routes
 )
 
 for name in "${PATCHES[@]}"; do

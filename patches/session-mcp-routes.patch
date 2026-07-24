@@ -1,0 +1,404 @@
+diff --git a/packages/opencode/src/server/routes/instance/httpapi/groups/session.ts b/packages/opencode/src/server/routes/instance/httpapi/groups/session.ts
+index 10f8016..ca7e625 100644
+--- a/packages/opencode/src/server/routes/instance/httpapi/groups/session.ts
++++ b/packages/opencode/src/server/routes/instance/httpapi/groups/session.ts
+@@ -22,7 +22,8 @@ import {
+   WorkspaceRoutingQuery,
+   WorkspaceRoutingQueryFields,
+ } from "../middleware/workspace-routing"
+-import { ApiNotFoundError, PermissionNotFoundError, QuestionNotFoundError, SessionBusyError } from "../errors"
++import { ApiNotFoundError, McpServerNotFoundError, PermissionNotFoundError, QuestionNotFoundError, SessionBusyError } from "../errors"
++import { StatusMap as McpStatusMap } from "./mcp"
+ import { described } from "./metadata"
+ import { QueryBoolean } from "./query"
+ import { ProviderV2 } from "@opencode-ai/core/provider"
+@@ -123,6 +124,13 @@ export const SessionPaths = {
+   questionsList: `${root}/:sessionID/questions`,
+   questionReply: `${root}/:sessionID/questions/:questionID/reply`,
+   questionReject: `${root}/:sessionID/questions/:questionID/reject`,
++  // Session-scoped MCP routes (bead workstation-mlve.11, Phase 10). These live
++  // under /session/:sessionID/mcp… so the front door can owner-route them for free
++  // to the serve running this session's agent loop. The response/effect is
++  // PROCESS-global, not session-scoped — the sessionID exists solely as a routing key.
++  mcpStatus: `${root}/:sessionID/mcp`,
++  mcpConnect: `${root}/:sessionID/mcp/:name/connect`,
++  mcpDisconnect: `${root}/:sessionID/mcp/:name/disconnect`,
+   deleteMessage: `${root}/:sessionID/message/:messageID`,
+   deletePart: `${root}/:sessionID/message/:messageID/part/:partID`,
+   updatePart: `${root}/:sessionID/message/:messageID/part/:partID`,
+@@ -479,6 +487,42 @@ export const SessionApi = HttpApi.make("session")
+             description: "Reject a question request, addressable by session for front-door routing.",
+           }),
+         ),
++        HttpApiEndpoint.get("mcpStatus", SessionPaths.mcpStatus, {
++          params: { sessionID: SessionID },
++          query: WorkspaceRoutingQuery,
++          success: described(McpStatusMap, "MCP server status"),
++          error: [ApiNotFoundError],
++        }).annotateMerge(
++          OpenApi.annotations({
++            identifier: "session.mcp.status",
++            summary: "Get MCP status",
++            description: "Get the status of all Model Context Protocol (MCP) servers (process-global, addressable by session for front-door routing).",
++          }),
++        ),
++        HttpApiEndpoint.post("mcpConnect", SessionPaths.mcpConnect, {
++          params: { sessionID: SessionID, name: Schema.String },
++          query: WorkspaceRoutingQuery,
++          success: described(Schema.Boolean, "MCP server connected successfully"),
++          error: [ApiNotFoundError, McpServerNotFoundError],
++        }).annotateMerge(
++          OpenApi.annotations({
++            identifier: "session.mcp.connect",
++            summary: "Connect MCP server",
++            description: "Connect an MCP server (process-global, addressable by session for front-door routing).",
++          }),
++        ),
++        HttpApiEndpoint.post("mcpDisconnect", SessionPaths.mcpDisconnect, {
++          params: { sessionID: SessionID, name: Schema.String },
++          query: WorkspaceRoutingQuery,
++          success: described(Schema.Boolean, "MCP server disconnected successfully"),
++          error: [ApiNotFoundError, McpServerNotFoundError],
++        }).annotateMerge(
++          OpenApi.annotations({
++            identifier: "session.mcp.disconnect",
++            summary: "Disconnect MCP server",
++            description: "Disconnect an MCP server (process-global, addressable by session for front-door routing).",
++          }),
++        ),
+         HttpApiEndpoint.delete("deleteMessage", SessionPaths.deleteMessage, {
+           params: { sessionID: SessionID, messageID: MessageID },
+           query: WorkspaceRoutingQuery,
+diff --git a/packages/opencode/src/server/routes/instance/httpapi/handlers/session.ts b/packages/opencode/src/server/routes/instance/httpapi/handlers/session.ts
+index 354b7ed..17454a5 100644
+--- a/packages/opencode/src/server/routes/instance/httpapi/handlers/session.ts
++++ b/packages/opencode/src/server/routes/instance/httpapi/handlers/session.ts
+@@ -1,5 +1,6 @@
+ import { PermissionV1 } from "@opencode-ai/core/v1/permission"
+ import { Agent } from "@/agent/agent"
++import { MCP } from "@/mcp"
+ import { SessionV1 } from "@opencode-ai/core/v1/session"
+ import { EventV2Bridge } from "@/event-v2-bridge"
+ import { Command } from "@/command"
+@@ -38,7 +39,7 @@ import {
+   SummarizePayload,
+   UpdatePayload,
+ } from "../groups/session"
+-import { PermissionNotFoundError, QuestionNotFoundError } from "../errors"
++import { McpServerNotFoundError, PermissionNotFoundError, QuestionNotFoundError } from "../errors"
+ import * as SessionError from "./session-errors"
+ 
+ const tryParseJson = (text: string) =>
+@@ -58,6 +59,7 @@ export const sessionHandlers = HttpApiBuilder.group(InstanceHttpApi, "session",
+     const agentSvc = yield* Agent.Service
+     const permissionSvc = yield* Permission.Service
+     const questionSvc = yield* Question.Service
++    const mcp = yield* MCP.Service
+     const statusSvc = yield* SessionStatus.Service
+     const todoSvc = yield* Todo.Service
+     const summary = yield* SessionSummary.Service
+@@ -436,6 +438,45 @@ export const sessionHandlers = HttpApiBuilder.group(InstanceHttpApi, "session",
+       return true
+     })
+ 
++    const mcpStatus = Effect.fn("SessionHttpApi.mcpStatus")(function* (ctx: {
++      params: { sessionID: SessionID }
++    }) {
++      yield* requireSession(ctx.params.sessionID)
++      return yield* mcp.status()
++    })
++
++    const mcpConnect = Effect.fn("SessionHttpApi.mcpConnect")(function* (ctx: {
++      params: { sessionID: SessionID; name: string }
++    }) {
++      yield* requireSession(ctx.params.sessionID)
++      yield* mcp
++        .connect(ctx.params.name)
++        .pipe(
++          Effect.catchTag("MCP.NotFoundError", (error) =>
++            Effect.fail(
++              new McpServerNotFoundError({ name: error.name, message: `MCP server not found: ${error.name}` }),
++            ),
++          ),
++        )
++      return true
++    })
++
++    const mcpDisconnect = Effect.fn("SessionHttpApi.mcpDisconnect")(function* (ctx: {
++      params: { sessionID: SessionID; name: string }
++    }) {
++      yield* requireSession(ctx.params.sessionID)
++      yield* mcp
++        .disconnect(ctx.params.name)
++        .pipe(
++          Effect.catchTag("MCP.NotFoundError", (error) =>
++            Effect.fail(
++              new McpServerNotFoundError({ name: error.name, message: `MCP server not found: ${error.name}` }),
++            ),
++          ),
++        )
++      return true
++    })
++
+     const deleteMessage = Effect.fn("SessionHttpApi.deleteMessage")(function* (ctx: {
+       params: { sessionID: SessionID; messageID: MessageID }
+     }) {
+@@ -498,6 +539,9 @@ export const sessionHandlers = HttpApiBuilder.group(InstanceHttpApi, "session",
+       .handle("questionsList", questionsList)
+       .handle("questionReply", questionReply)
+       .handle("questionReject", questionReject)
++      .handle("mcpStatus", mcpStatus)
++      .handle("mcpConnect", mcpConnect)
++      .handle("mcpDisconnect", mcpDisconnect)
+       .handle("deleteMessage", deleteMessage)
+       .handle("deletePart", deletePart)
+       .handle("updatePart", updatePart)
+diff --git a/packages/sdk/js/src/v2/gen/sdk.gen.ts b/packages/sdk/js/src/v2/gen/sdk.gen.ts
+index 0365a56..19d7632 100644
+--- a/packages/sdk/js/src/v2/gen/sdk.gen.ts
++++ b/packages/sdk/js/src/v2/gen/sdk.gen.ts
+@@ -201,6 +201,12 @@ import type {
+   SessionMessageResponses,
+   SessionMessagesErrors,
+   SessionMessagesResponses,
++  SessionMcpConnectErrors,
++  SessionMcpConnectResponses,
++  SessionMcpDisconnectErrors,
++  SessionMcpDisconnectResponses,
++  SessionMcpStatusErrors,
++  SessionMcpStatusResponses,
+   SessionPermissionsErrors,
+   SessionPermissionsResponses,
+   SessionPromptAsyncErrors,
+@@ -4484,6 +4490,114 @@ export class Session2 extends HeyApiClient {
+       ...params,
+     })
+   }
++
++  /**
++   * Get MCP status
++   *
++   * Get the status of all Model Context Protocol (MCP) servers (process-global, addressable by session for front-door routing).
++   */
++  public mcpStatus<ThrowOnError extends boolean = false>(
++    parameters: {
++      sessionID: string
++      directory?: string
++      workspace?: string
++    },
++    options?: Options<never, ThrowOnError>,
++  ) {
++    const params = buildClientParams(
++      [parameters],
++      [
++        {
++          args: [
++            { in: "path", key: "sessionID" },
++            { in: "query", key: "directory" },
++            { in: "query", key: "workspace" },
++          ],
++        },
++      ],
++    )
++    return (options?.client ?? this.client).get<SessionMcpStatusResponses, SessionMcpStatusErrors, ThrowOnError>({
++      url: "/session/{sessionID}/mcp",
++      ...options,
++      ...params,
++    })
++  }
++
++  /**
++   * Connect an MCP server
++   *
++   * Connect an MCP server (process-global, addressable by session for front-door routing).
++   */
++  public mcpConnect<ThrowOnError extends boolean = false>(
++    parameters: {
++      sessionID: string
++      name: string
++      directory?: string
++      workspace?: string
++    },
++    options?: Options<never, ThrowOnError>,
++  ) {
++    const params = buildClientParams(
++      [parameters],
++      [
++        {
++          args: [
++            { in: "path", key: "sessionID" },
++            { in: "path", key: "name" },
++            { in: "query", key: "directory" },
++            { in: "query", key: "workspace" },
++          ],
++        },
++      ],
++    )
++    return (options?.client ?? this.client).post<
++      SessionMcpConnectResponses,
++      SessionMcpConnectErrors,
++      ThrowOnError
++    >({
++      url: "/session/{sessionID}/mcp/{name}/connect",
++      ...options,
++      ...params,
++    })
++  }
++
++  /**
++   * Disconnect an MCP server
++   *
++   * Disconnect an MCP server (process-global, addressable by session for front-door routing).
++   */
++  public mcpDisconnect<ThrowOnError extends boolean = false>(
++    parameters: {
++      sessionID: string
++      name: string
++      directory?: string
++      workspace?: string
++    },
++    options?: Options<never, ThrowOnError>,
++  ) {
++    const params = buildClientParams(
++      [parameters],
++      [
++        {
++          args: [
++            { in: "path", key: "sessionID" },
++            { in: "path", key: "name" },
++            { in: "query", key: "directory" },
++            { in: "query", key: "workspace" },
++          ],
++        },
++      ],
++    )
++    return (options?.client ?? this.client).post<
++      SessionMcpDisconnectResponses,
++      SessionMcpDisconnectErrors,
++      ThrowOnError
++    >({
++      url: "/session/{sessionID}/mcp/{name}/disconnect",
++      ...options,
++      ...params,
++    })
++  }
+ }
+ 
+ export class Part extends HeyApiClient {
+diff --git a/packages/sdk/js/src/v2/gen/types.gen.ts b/packages/sdk/js/src/v2/gen/types.gen.ts
+index 0b7a8dc..6fd6b2a 100644
+--- a/packages/sdk/js/src/v2/gen/types.gen.ts
++++ b/packages/sdk/js/src/v2/gen/types.gen.ts
+@@ -10544,6 +10544,112 @@ export type SessionQuestionRejectResponses = {
+ 
+ export type SessionQuestionRejectResponse = SessionQuestionRejectResponses[keyof SessionQuestionRejectResponses]
+ 
++export type SessionMcpStatusData = {
++  body?: never
++  path: {
++    sessionID: string
++  }
++  query?: {
++    directory?: string
++    workspace?: string
++  }
++  url: "/session/{sessionID}/mcp"
++}
++
++export type SessionMcpStatusErrors = {
++  /**
++   * Bad request
++   */
++  400: BadRequestError
++  /**
++   * NotFoundError
++   */
++  404: NotFoundError
++}
++
++export type SessionMcpStatusError = SessionMcpStatusErrors[keyof SessionMcpStatusErrors]
++
++export type SessionMcpStatusResponses = {
++  /**
++   * MCP server status
++   */
++  200: {
++    [key: string]: McpStatus
++  }
++}
++
++export type SessionMcpStatusResponse = SessionMcpStatusResponses[keyof SessionMcpStatusResponses]
++
++export type SessionMcpConnectData = {
++  body?: never
++  path: {
++    sessionID: string
++    name: string
++  }
++  query?: {
++    directory?: string
++    workspace?: string
++  }
++  url: "/session/{sessionID}/mcp/{name}/connect"
++}
++
++export type SessionMcpConnectErrors = {
++  /**
++   * Bad request
++   */
++  400: BadRequestError
++  /**
++   * NotFoundError | McpServerNotFoundError
++   */
++  404: NotFoundError | McpServerNotFoundError
++}
++
++export type SessionMcpConnectError = SessionMcpConnectErrors[keyof SessionMcpConnectErrors]
++
++export type SessionMcpConnectResponses = {
++  /**
++   * MCP server connected successfully
++   */
++  200: boolean
++}
++
++export type SessionMcpConnectResponse = SessionMcpConnectResponses[keyof SessionMcpConnectResponses]
++
++export type SessionMcpDisconnectData = {
++  body?: never
++  path: {
++    sessionID: string
++    name: string
++  }
++  query?: {
++    directory?: string
++    workspace?: string
++  }
++  url: "/session/{sessionID}/mcp/{name}/disconnect"
++}
++
++export type SessionMcpDisconnectErrors = {
++  /**
++   * Bad request
++   */
++  400: BadRequestError
++  /**
++   * NotFoundError | McpServerNotFoundError
++   */
++  404: NotFoundError | McpServerNotFoundError
++}
++
++export type SessionMcpDisconnectError = SessionMcpDisconnectErrors[keyof SessionMcpDisconnectErrors]
++
++export type SessionMcpDisconnectResponses = {
++  /**
++   * MCP server disconnected successfully
++   */
++  200: boolean
++}
++
++export type SessionMcpDisconnectResponse = SessionMcpDisconnectResponses[keyof SessionMcpDisconnectResponses]
++
+ export type PartDeleteData = {
+   body?: never
+   path: {
