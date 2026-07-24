@@ -54,13 +54,13 @@ Call sites (old-layout refs) + server-route reality:
 ## Gate (from parent plan)
 A migrated session's attach TUI: (1) survives idle owner-migration hand-off with **no reconnect-delay inflation across repeated migrations** (NEW-A), (2) **answers a mid-turn permission prompt through the front-door URL** (NEW-P5-F1), and (3) **a subagent's permission/question prompt renders + is answerable** (NEW-B). Plus the door's existing gate (`audit/gate.sh`) still green with a real TUI on the door.
 
-## Open decisions (need answers before patching)
-- **D1** event `session_ids` transport: SDK regen vs raw-query bypass.
-- **D2** NEW-B child-sid inclusion + the dynamic re-subscribe trigger (how a post-attach child gets added).
-- **D3** question session-scoped route: new server patch vs door special-case.
-- **D4** the non-session-scopable mutating routes (mcp/auth/instance/oauth/workspace): door strategy — route-by-current-session, keep-direct, or broadcast.
-- **D5** supersede `tui-follow-owner` (+ self-resolve in `attach-route-resolve`) entirely vs keep as a non-door fallback.
-- Verify **`move-session`** route identity in real v1.17.13.
+## Decisions (user, 2026-07-22)
+- **D1 — RESOLVED: cleaner.** Extend the SDK v2 to add a `session_ids` param to `Event.subscribe()` (regen the generated `packages/sdk/js/src/v2/gen/*`), not a hand-built raw-query bypass in `sdk.tsx`.
+- **D2 — RESOLVED: polling.** NEW-B includes child sids in `session_ids`; discover children via a periodic `GET /session/{id}/children` **poll** (reconcile the subscription set on change), rather than an event-triggered re-subscribe. Never send an empty set. Switcher's other top-level sessions: fetch-on-demand via `sync.session.refresh()`.
+- **D3 — RESOLVED: new server route.** Add a session-scoped question route (new server patch mirroring `permissionRespond`), e.g. `POST /session/{sid}/questions/{questionID}` reply/reject; migrate the TUI to it. **No door special-case.**
+- **D4 — DIRECTION: broadcast (⚠️ needs per-route validation in fable).** For the non-session-scopable mutating routes the door fans out to all pool serves. CAUTION — broadcast is NOT uniformly correct and must be validated per route: `auth.set` (all serves need new auth → broadcast fits); `mcp.connect|disconnect` (per-process → broadcast connects on all K, wasteful but the owner ends up covered); `instance.dispose` (pool-wide reload — drastic but arguably intended for the auth-reload flow); **`provider.oauth.authorize|callback` is STATEFUL — authorize picks a serve and the callback MUST return to the SAME serve; naive broadcast breaks the pairing** (needs sticky, not broadcast); `experimental.workspace.*` (validate). Fable to stress each; the door fan-out response-aggregation semantics (first / all-ok / which body) also need definition.
+- **D5 — RESOLVED: supersede.** Fully replace `tui-follow-owner.patch` and remove the `resolveServeUrl` self-resolve from `attach-route-resolve.patch`. **No non-door path, no fallbacks** — the TUI attaches only to its base URL (the door); the door owns resolution + drop-leg-on-drift.
+- Still to verify: **`move-session`** route identity in real v1.17.13.
 
 ## Hazards
 - Zero-fuzz `git apply`; author on a real v1.17.13 clone; new TUI patches after `tui-follow-owner` in the array; W1/W2/W3 all edit the same `open()`/reconnect region (high conflict) — likely fold into / carefully anchor after `attach-route-resolve`+`tui-follow-owner`.
