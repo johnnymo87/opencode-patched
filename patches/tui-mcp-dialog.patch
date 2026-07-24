@@ -1,0 +1,241 @@
+diff --git a/packages/tui/src/component/dialog-mcp.tsx b/packages/tui/src/component/dialog-mcp.tsx
+index c48c0f8..2131aba 100644
+--- a/packages/tui/src/component/dialog-mcp.tsx
++++ b/packages/tui/src/component/dialog-mcp.tsx
+@@ -1,4 +1,4 @@
+-import { createMemo, createSignal } from "solid-js"
++import { createMemo, createSignal, onMount } from "solid-js"
+ import { useLocal } from "../context/local"
+ import { useSync } from "../context/sync"
+ import { map, pipe, entries, sortBy } from "remeda"
+@@ -6,6 +6,9 @@ import { DialogSelect, type DialogSelectRef, type DialogSelectOption } from "../
+ import { useTheme } from "../context/theme"
+ import { TextAttributes } from "@opentui/core"
+ import { useSDK } from "../context/sdk"
++import { useRoute } from "../context/route"
++import { useToast } from "../ui/toast"
++import { errorMessage } from "../util/error"
+ 
+ function Status(props: { enabled: boolean; loading: boolean }) {
+   const { theme } = useTheme()
+@@ -22,9 +25,41 @@ export function DialogMcp() {
+   const local = useLocal()
+   const sync = useSync()
+   const sdk = useSDK()
++  const route = useRoute()
++  const toast = useToast()
+   const [, setRef] = createSignal<DialogSelectRef<unknown>>()
+   const [loading, setLoading] = createSignal<string | null>(null)
+ 
++  const activeSessionID = () => (route.data.type === "session" ? route.data.sessionID : undefined)
++  const rootSessionID = () => sync.session.resolveRoot(activeSessionID())
++
++  onMount(async () => {
++    const sessionID = rootSessionID()
++    if (!sessionID) {
++      toast.show({
++        variant: "warning",
++        message: "MCP operations require an active session",
++      })
++      return
++    }
++    try {
++      const status = await sdk.client.session.mcpStatus({ sessionID })
++      if (status.data) {
++        sync.set("mcp", status.data)
++      } else {
++        toast.show({
++          variant: "error",
++          message: "Failed to fetch MCP status: no data returned",
++        })
++      }
++    } catch (error) {
++      toast.show({
++        variant: "error",
++        message: `Failed to fetch MCP status: ${errorMessage(error)}`,
++      })
++    }
++  })
++
+   const options = createMemo(() => {
+     // Track sync data and loading state to trigger re-render when they change
+     const mcpData = sync.data.mcp
+@@ -56,14 +91,23 @@ export function DialogMcp() {
+         try {
+           await local.mcp.toggle(option.value)
+           // Refresh MCP status from server
+-          const status = await sdk.client.mcp.status()
+-          if (status.data) {
+-            sync.set("mcp", status.data)
+-          } else {
+-            console.error("Failed to refresh MCP status: no data returned")
++          const sessionID = rootSessionID()
++          if (sessionID) {
++            const status = await sdk.client.session.mcpStatus({ sessionID })
++            if (status.data) {
++              sync.set("mcp", status.data)
++            } else {
++              toast.show({
++                variant: "error",
++                message: "Failed to refresh MCP status: no data returned",
++              })
++            }
+           }
+         } catch (error) {
+-          console.error("Failed to toggle MCP:", error)
++          toast.show({
++            variant: "error",
++            message: `Failed to toggle MCP: ${errorMessage(error)}`,
++          })
+         } finally {
+           setLoading(null)
+         }
+diff --git a/packages/tui/src/context/local.tsx b/packages/tui/src/context/local.tsx
+index a05d315..d61b8a7 100644
+--- a/packages/tui/src/context/local.tsx
++++ b/packages/tui/src/context/local.tsx
+@@ -508,13 +508,22 @@ export const { use: useLocal, provider: LocalProvider } = createSimpleContext({
+         return status?.status === "connected"
+       },
+       async toggle(name: string) {
++        const activeID = route.data.type === "session" ? route.data.sessionID : undefined
++        const sessionID = sync.session.resolveRoot(activeID)
++        if (!sessionID) {
++          toast.show({
++            variant: "warning",
++            message: "MCP operations require an active session",
++          })
++          return
++        }
+         const status = sync.data.mcp[name]
+         if (status?.status === "connected") {
+           // Disable: disconnect the MCP
+-          await sdk.client.mcp.disconnect({ name })
++          await sdk.client.session.mcpDisconnect({ sessionID, name })
+         } else {
+           // Enable/Retry: connect the MCP (handles disabled, failed, and other states)
+-          await sdk.client.mcp.connect({ name })
++          await sdk.client.session.mcpConnect({ sessionID, name })
+         }
+       },
+     }
+diff --git a/packages/tui/src/context/sync.tsx b/packages/tui/src/context/sync.tsx
+index 8a96ff6..da91e58 100644
+--- a/packages/tui/src/context/sync.tsx
++++ b/packages/tui/src/context/sync.tsx
+@@ -28,6 +28,7 @@ import { useTuiStartup } from "./runtime"
+ import { createSimpleContext } from "./helper"
+ import { useExit } from "./exit"
+ import { useArgs } from "./args"
++import { resolveRootSessionID } from "../util/session"
+ import { batch, onMount, onCleanup } from "solid-js"
+ import path from "path"
+ import { useKV } from "./kv"
+@@ -586,6 +587,9 @@ export const {
+           if (match.found) return store.session[match.index]
+           return undefined
+         },
++        resolveRoot(sessionID: string | undefined) {
++          return resolveRootSessionID(result.session, sessionID)
++        },
+         query() {
+           return sessionListQuery()
+         },
+diff --git a/packages/tui/src/util/session.ts b/packages/tui/src/util/session.ts
+index 94ccad2..36de387 100644
+--- a/packages/tui/src/util/session.ts
++++ b/packages/tui/src/util/session.ts
+@@ -1,3 +1,23 @@
+ export function isDefaultTitle(title: string) {
+   return /^(New session - |Child session - )\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/.test(title)
+ }
++
++export interface SessionStoreLike {
++  get: (id: string) => { id?: string; parentID?: string } | undefined
++}
++
++export function resolveRootSessionID(store: SessionStoreLike, sessionID: string | undefined): string | undefined {
++  if (!sessionID) return undefined
++  let curr: string | undefined = sessionID
++  const visited = new Set<string>()
++  while (curr && !visited.has(curr)) {
++    visited.add(curr)
++    const s = store.get(curr)
++    if (s?.parentID) {
++      curr = s.parentID
++    } else {
++      break
++    }
++  }
++  return curr
++}
+diff --git a/packages/tui/test/util/session.test.ts b/packages/tui/test/util/session.test.ts
+index faf8897..1f4620a 100644
+--- a/packages/tui/test/util/session.test.ts
++++ b/packages/tui/test/util/session.test.ts
+@@ -1,5 +1,5 @@
+ import { describe, expect, test } from "bun:test"
+-import { isDefaultTitle } from "../../src/util/session"
++import { isDefaultTitle, resolveRootSessionID } from "../../src/util/session"
+ 
+ describe("util.session", () => {
+   test("recognizes generated parent and child titles", () => {
+@@ -7,4 +7,58 @@ describe("util.session", () => {
+     expect(isDefaultTitle("Child session - 2026-06-06T12:34:56.789Z")).toBeTrue()
+     expect(isDefaultTitle("New session - custom")).toBeFalse()
+   })
++
++  describe("resolveRootSessionID", () => {
++    test("returns undefined for undefined sessionID", () => {
++      expect(resolveRootSessionID({ get: () => undefined }, undefined)).toBeUndefined()
++    })
++
++    test("returns root sessionID when session has no parentID", () => {
++      const store = {
++        get: (id: string) => (id === "root-1" ? { id: "root-1" } : undefined),
++      }
++      expect(resolveRootSessionID(store, "root-1")).toBe("root-1")
++    })
++
++    test("resolves 1-level child to root sessionID", () => {
++      const sessions: Record<string, { id: string; parentID?: string }> = {
++        "child-1": { id: "child-1", parentID: "root-1" },
++        "root-1": { id: "root-1" },
++      }
++      const store = { get: (id: string) => sessions[id] }
++      expect(resolveRootSessionID(store, "child-1")).toBe("root-1")
++    })
++
++    test("resolves multi-level nested subagent session to root sessionID", () => {
++      const sessions: Record<string, { id: string; parentID?: string }> = {
++        "subchild-1": { id: "subchild-1", parentID: "child-1" },
++        "child-1": { id: "child-1", parentID: "root-1" },
++        "root-1": { id: "root-1" },
++      }
++      const store = { get: (id: string) => sessions[id] }
++      expect(resolveRootSessionID(store, "subchild-1")).toBe("root-1")
++    })
++
++    test("falls back to parentID if parent session object is missing from store", () => {
++      const sessions: Record<string, { id: string; parentID?: string }> = {
++        "child-1": { id: "child-1", parentID: "root-missing" },
++      }
++      const store = { get: (id: string) => sessions[id] }
++      expect(resolveRootSessionID(store, "child-1")).toBe("root-missing")
++    })
++
++    test("falls back to given sessionID if session is missing from store", () => {
++      const store = { get: () => undefined }
++      expect(resolveRootSessionID(store, "unknown-session")).toBe("unknown-session")
++    })
++
++    test("handles circular parentID references gracefully", () => {
++      const sessions: Record<string, { id: string; parentID?: string }> = {
++        "s-1": { id: "s-1", parentID: "s-2" },
++        "s-2": { id: "s-2", parentID: "s-1" },
++      }
++      const store = { get: (id: string) => sessions[id] }
++      expect(resolveRootSessionID(store, "s-1")).toBeDefined()
++    })
++  })
+ })

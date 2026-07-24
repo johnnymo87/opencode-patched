@@ -272,6 +272,11 @@
 #                                               POST /session/:sessionID/mcp/:name/disconnect so the front door
 #                                               can owner-route MCP status/toggle requests by session. Response
 #                                               is process-global (sessionID is a routing key). Includes SDK gen.
+#  23. tui-mcp-dialog.patch     (local)      - Phase 10 TUI patch for session-scoped MCP routes
+#                                               (bead workstation-mlve.11). Adds fetch-on-dialog-open on mount,
+#                                               repoints toggle + post-toggle refresh to session-scoped SDK methods,
+#                                               resolves root session ID for child/subagent sessions, and leaves
+#                                               bootstrap status call global.
 #
 # DROPPED on the v1.17 line (see workstation docs/plans/2026-06-11-opencode-1.17-cutover-runbook.md):
 #   - integration-list-batch.patch: DROPPED on the v1.17.13 roll-forward (2026-07-06).
@@ -356,6 +361,7 @@ PATCHES=(
   tui-door-attach
   tui-door-tests
   session-mcp-routes
+  tui-mcp-dialog
 )
 
 for name in "${PATCHES[@]}"; do
