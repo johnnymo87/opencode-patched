@@ -10,7 +10,17 @@ Three patches landed in `patches/` (apply.sh updated; `tui-follow-owner.patch` R
 
 Verification: `patches/apply.sh` applies the full set zero-fuzz on a fresh `v1.17.13` clone (exit 0); the CI test commands pass on that clone. Not yet run: the server session_ids/route tests locally (blocked by bun 1.3.3 lacking `node:sqlite` in the routing-lease import graph — a local-env limitation; the server filter is covered by event-session-scope's tests where the runner's bun supports node:sqlite, and validated by types).
 
-Remaining: cut `v1.17.13-patched.1` (build-release.yml), bump `users/dev/home.base.nix` (patchedRevision + 4 hashes), coordinate the update cron. D4 door-side work stays in `workstation-mlve.11`.
+### Fable implementation review (2026-07-24) — findings + fixes
+Ran `adversarial-reviewer-fable` on the AUTHORED CODE (the plan was reviewed earlier; the code was not). Verdict: NO-GO for the full Phase 8→9 arc as-was; the deploy was held and `v1.17.13-patched.1` pin bump reverted (workstation `00735a1`). All load-bearing claims verified against the code. Fixed in the patches:
+- **CRITICAL-1 (session_ids unbounded vs door 32-cap):** `Session.children()` returns EVERY child row ever (bare `parent_id=?`, no liveness filter); the door caps `?session_ids=` at `MAX_SESSION_IDS=32` (400). A session that ever spawned >31 subagents would 400 the scoped subscribe forever → dead TUI (masked direct in Phase 8, detonates through the door in Phase 9). FIX: `pollChildren` bounds to newest-`time.updated` `MAX_CHILDREN=30` (root+30=31<32); L-1 inject-on-first-appearance only (no O(N)/poll churn).
+- **HIGH-1 (D6 not implemented):** the set was `f(attach root)`, fixed at boot; switching/forking to a session outside the set silently froze the view. FIX: a `createEffect` on `route.data` rebases `activeSessionID` + reconnects on in-TUI navigation (also upgrades a `--continue` global TUI to scoped once the session is known).
+- **HIGH-2 (deploy-window regression):** removing `tui-follow-owner` while attach is still DIRECT-to-serve (Phase 8) reintroduces the yl00 frozen-TUI bug on idle-migration (cloudbox = K=4 + routing DB, migrations active). RESOLUTION: co-land Phase 9 (repoint `oc-pool-attach`/`oc-auto-attach` `attach → $FRONTDOOR_URL`) so the door drops the leg on migration (D5's premise). Verified the door already supports it: generic `/session/:sid/*` owner-routing (`sid.ts`), scoped `/event?session_ids=` union-of-owners (children resolve to the parent's owner or degrade → excluded, `proxy.ts:656-687`), `/global/event`→410, bare `/event`→400.
+- **MEDIUM-1 (silent reconcile loss):** a swallowed pending-fetch failure reopened the no-replay hole. FIX: `reconcilePending` throws on `.error` → attempt ends → reconnect+retry (poll only detects set *changes*, so retry-via-reconnect is the only safe recovery).
+- **MEDIUM-4:** `KNOWN` comment at the envelope-wrap site (workspace dropped / directory synthesized — harmless while workspaces off).
+- Deferred to follow-up (low): MEDIUM-3 (a TUI-mount NEW-G test — current door-scope test asserts SDK URL mapping only), grandchildren scope note, door multi-sid observability/toast.
+All fixes re-verified: tui `tsgo` clean, sse/route + door-scope tests pass, `apply.sh` zero-fuzz on a fresh clone.
+
+Remaining: Phase 9 repoint (workstation `oc-pool-attach`/`oc-auto-attach`), then cut `v1.17.13-patched.2` + re-pin, deploy Phase 8+9 together, run the live gate. D4 door-side work stays in `workstation-mlve.11`.
 
 ---
 

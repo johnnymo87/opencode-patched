@@ -48,34 +48,35 @@ index 6e45774..e8009e5 100644
        return
      }
 diff --git a/packages/tui/src/context/sdk.tsx b/packages/tui/src/context/sdk.tsx
-index e7452ae..5aba881 100644
+index e7452ae..f0c35ad 100644
 --- a/packages/tui/src/context/sdk.tsx
 +++ b/packages/tui/src/context/sdk.tsx
-@@ -1,8 +1,7 @@
+@@ -1,15 +1,54 @@
  import { createOpencodeClient } from "@opencode-ai/sdk/v2"
 -import type { GlobalEvent } from "@opencode-ai/sdk/v2"
-+import type { Event, GlobalEvent } from "@opencode-ai/sdk/v2"
++import type { Event, GlobalEvent, Session } from "@opencode-ai/sdk/v2"
  import { Flag } from "@opencode-ai/core/flag/flag"
  import { createSimpleContext } from "./helper"
 -import { resolveServeUrl } from "../util/route"
++import { useRoute } from "./route"
  import { runSseAttempt } from "../util/sse"
- import { batch, onCleanup, onMount } from "solid-js"
+-import { batch, onCleanup, onMount } from "solid-js"
++import { batch, createEffect, onCleanup, onMount } from "solid-js"
  
-@@ -10,6 +9,38 @@ export type EventSource = {
+ export type EventSource = {
    subscribe: (handler: (event: GlobalEvent) => void) => Promise<() => void>
  }
  
 +// Phase 8 (bead workstation-mlve.3): the attached TUI rides the opaque front
 +// door and subscribes to a SESSION-SCOPED event stream
-+// (`/event?session_ids=<root ∪ live children>`) instead of the per-process
++// (`/event?session_ids=<active ∪ live children>`) instead of the per-process
 +// `/global/event` firehose. The door owns serve ownership: it resolves the
 +// owning serve, routes REST by session path, and drops the SSE leg on a
-+// confirmed owner migration — so the client NEVER self-resolves pigeon /route
-+// (that was attach-route-resolve + tui-follow-owner, now superseded). On any
-+// leg drop the client simply reconnects to the SAME door url and the door
++// confirmed owner migration — so the client NEVER self-resolves pigeon /route.
++// On any leg drop the client reconnects to the SAME door url and the door
 +// re-resolves the (possibly new) owner.
 +//
-+// How often (ms) the TUI polls GET /session/{root}/children to keep its
++// How often (ms) the TUI polls GET /session/{active}/children to keep its
 +// session_ids set current and reconcile child Session.Info into the store. A
 +// child (subagent) session born after attach emits its lifecycle/permission/
 +// question events under the CHILD session id, which the scoped filter drops
@@ -97,10 +98,22 @@ index e7452ae..5aba881 100644
 +  return Number.isFinite(n) && n > 0 ? n : 10000
 +})()
 +
++// CRITICAL: the front door caps a multi-session subscribe at MAX_SESSION_IDS=32
++// (400 "too many session_ids"), and Session.children() returns EVERY child row
++// ever (no liveness filter), so the set would otherwise grow unbounded and a
++// session that has spawned >cap subagents would 400 the scoped subscribe and go
++// permanently dead. Bound the children we track to the most-recently-active
++// MAX_CHILDREN so {active} ∪ children stays under the cap (bead workstation-mlve.3).
++const MAX_CHILDREN = 30
++
  export const { use: useSDK, provider: SDKProvider } = createSimpleContext({
    name: "SDK",
    init: (props: {
-@@ -23,22 +54,17 @@ export const { use: useSDK, provider: SDKProvider } = createSimpleContext({
+@@ -20,25 +59,21 @@ export const { use: useSDK, provider: SDKProvider } = createSimpleContext({
+     headers?: RequestInit["headers"]
+     events?: EventSource
+   }) => {
++    const route = useRoute()
      const abort = new AbortController()
      let sse: AbortController | undefined
  
@@ -133,14 +146,17 @@ index e7452ae..5aba881 100644
  
      const handlers = new Set<(event: GlobalEvent) => void>()
      const emitter = {
-@@ -87,66 +113,155 @@ export const { use: useSDK, provider: SDKProvider } = createSimpleContext({
+@@ -87,71 +122,201 @@ export const { use: useSDK, provider: SDKProvider } = createSimpleContext({
        flush()
      }
  
-+    // The live session_ids subscription set = {attach root} ∪ {live children}.
-+    // Never empty while attached (always carries the root), so the server never
-+    // blackholes this session's own events. Mutated by the children poll.
-+    let sessionIds: string[] = props.sessionID ? [props.sessionID] : []
++    // The active session whose stream we ride. Starts at the attach root and
++    // FOLLOWS in-TUI navigation (D6, see the createEffect below). The live
++    // session_ids set = {activeSessionID} ∪ {its live children}. Never empty
++    // while a session is active (always carries activeSessionID), so the server
++    // never blackholes its own events.
++    let activeSessionID = props.sessionID
++    let sessionIds: string[] = activeSessionID ? [activeSessionID] : []
 +
 +    const sameSet = (a: string[], b: string[]) => {
 +      if (a.length !== b.length) return false
@@ -152,6 +168,11 @@ index e7452ae..5aba881 100644
 +    // `GlobalEvent` envelope { directory, payload } the emitter/useEvent layer
 +    // expects (the `/global/event` firehose delivers that envelope; the scoped
 +    // `/event` stream delivers the bare payload).
++    // KNOWN (workspaces-off deployment): `workspace` is dropped and `directory`
++    // is the TUI's own directory. Harmless while OPENCODE_EXPERIMENTAL_WORKSPACES
++    // is off (all workspace comparisons are undefined===undefined and reducers
++    // read event.properties.directory, not this envelope metadata). Revisit if
++    // workspaces are ever enabled for a scoped/door TUI.
 +    const wrap = (payload: Event): GlobalEvent =>
 +      ({ directory: props.directory ?? "", payload }) as unknown as GlobalEvent
 +
@@ -164,44 +185,56 @@ index e7452ae..5aba881 100644
 +    // permission/question asked in the poll→reconnect gap is LOST, not late — the
 +    // subagent would hang. After every (re)open, fetch the pending permission +
 +    // question lists for the whole set and reconcile them so nothing is missed.
++    // Do NOT swallow fetch failures: a lost reconcile silently reopens exactly
++    // this hole. Throwing ends the attempt so the caller reconnects and retries
++    // the reconcile (with backoff) — the poll only detects set *changes*, never
++    // a missed pending, so retry-via-reconnect is the only safe recovery.
 +    const reconcilePending = async () => {
-+      if (!props.sessionID) return
++      if (!activeSessionID) return
 +      await Promise.all(
 +        sessionIds.map(async (sid) => {
-+          const [perms, quests] = await Promise.all([
-+            sdk.session
-+              .permissions({ sessionID: sid })
-+              .then((r) => r.data)
-+              .catch(() => undefined),
-+            sdk.session
-+              .questions({ sessionID: sid })
-+              .then((r) => r.data)
-+              .catch(() => undefined),
-+          ])
-+          if (perms) for (const p of perms) inject("permission.asked", p, `permission:${p.id}`)
-+          if (quests) for (const q of quests) inject("question.asked", q, `question:${q.id}`)
++          const perms = await sdk.session.permissions({ sessionID: sid })
++          if (perms.error) throw perms.error
++          const quests = await sdk.session.questions({ sessionID: sid })
++          if (quests.error) throw quests.error
++          if (perms.data) for (const p of perms.data) inject("permission.asked", p, `permission:${p.id}`)
++          if (quests.data) for (const q of quests.data) inject("question.asked", q, `question:${q.id}`)
 +        }),
 +      )
 +    }
 +
-+    // D2 poll: keep the session_ids set = {root} ∪ live children, and reconcile
-+    // each child Session.Info into the store (CRITICAL-3) so children() — which
-+    // the permission/question aggregation flatMaps over — actually contains the
-+    // child; otherwise a delivered child prompt still would not render. Returns
-+    // true when the set changed, ending the attempt so open() re-subscribes with
-+    // the new set (runSseAttempt reports this as `drifted` → reconnect now).
++    // D2 poll: keep the session_ids set = {active} ∪ live children (bounded to
++    // MAX_CHILDREN, newest-active first, so it never exceeds the door cap), and
++    // reconcile newly-appearing child Session.Info into the store (CRITICAL-3)
++    // so children() — which the permission/question aggregation flatMaps over —
++    // actually contains the child; otherwise a delivered child prompt would not
++    // render. Returns true when the set changed, ending the attempt so open()
++    // re-subscribes with the new set (runSseAttempt reports this as `drifted`).
 +    const pollChildren = async (signal: AbortSignal): Promise<boolean> => {
-+      if (!props.sessionID) return false
-+      let children: Array<{ id: string }> | undefined
++      const base = activeSessionID
++      if (!base) return false
++      let children: Session[] | undefined
 +      try {
-+        const res = await sdk.session.children({ sessionID: props.sessionID }, { signal })
-+        children = res.data as Array<{ id: string }> | undefined
++        const res = await sdk.session.children({ sessionID: base }, { signal })
++        children = res.data
 +      } catch {
 +        return false
 +      }
 +      if (!children) return false
-+      for (const child of children) inject("session.updated", { sessionID: child.id, info: child }, `session:${child.id}`)
-+      const next = [props.sessionID, ...children.map((c) => c.id)].filter((v, i, a) => a.indexOf(v) === i)
++      // Bound to the most-recently-active children (CRITICAL-1). A subagent that
++      // is actively prompting has recent time.updated, so newest-first is a good
++      // proxy for "still live"; an idle-long child that dropped out of the window
++      // isn't prompting anyway.
++      const bounded = [...children]
++        .sort((a, b) => (b.time?.updated ?? 0) - (a.time?.updated ?? 0))
++        .slice(0, MAX_CHILDREN)
++      // L-1: reconcile only children NOT already in the set (avoid O(N) synthetic
++      // events every poll); info updates for in-scope children arrive live.
++      const known = new Set(sessionIds)
++      for (const child of bounded) {
++        if (!known.has(child.id)) inject("session.updated", { sessionID: child.id, info: child }, `session:${child.id}`)
++      }
++      const next = [base, ...bounded.map((c) => c.id)].filter((v, i, a) => a.indexOf(v) === i)
 +      if (!sameSet(next, sessionIds)) {
 +        sessionIds = next
 +        return true
@@ -243,8 +276,7 @@ index e7452ae..5aba881 100644
 -            // place. The per-attempt `signal` keeps resolveServeUrl's bounded
 -            // AbortSignal.any listener short-lived.
              open: async (signal) => {
-+              openedAt = undefined
-               if (props.sessionID) {
+-              if (props.sessionID) {
 -                const next = await resolveServeUrl({
 -                  sessionID: props.sessionID,
 -                  fallback: currentUrl,
@@ -253,6 +285,8 @@ index e7452ae..5aba881 100644
 -                if (next !== currentUrl) {
 -                  currentUrl = next
 -                  sdk = createSDK()
++              openedAt = undefined
++              if (activeSessionID) {
 +                // Session-scoped stream through the door: only events for the
 +                // active session + its live children. Never an empty set. The
 +                // scoped `/event` stream yields bare payloads, so wrap each into
@@ -271,9 +305,9 @@ index e7452ae..5aba881 100644
 -                signal,
 -                sseMaxRetryAttempts: 0,
 -              })
-+              // Root/global TUI with no attached session: keep the firehose.
-+              // The scoped path requires a non-empty set; Phase 9 addresses a
-+              // root TUI pointed at the door.
++              // Root/global TUI with no active session: keep the firehose. The
++              // scoped path requires a non-empty set; a session becoming active
++              // (D6 effect) upgrades this to the scoped stream.
 +              return sdk.global.event({ signal, sseMaxRetryAttempts: 0 })
              },
              onOpen: async () => {
@@ -284,13 +318,14 @@ index e7452ae..5aba881 100644
 +                // Start syncing workspaces after we've started listening.
                  await sdk.sync.start().catch(() => {})
                }
-+              // Fetch-on-reconcile closes the no-replay gap (CRITICAL-1).
++              // Fetch-on-reconcile closes the no-replay gap (CRITICAL-1). May
++              // throw → attempt ends → reconnect + retry (see reconcilePending).
 +              await reconcilePending()
              },
              onEvent: handleEvent,
 +            // Poll children to follow subagent sessions born after attach and to
 +            // keep the scoped set current (D2/D6). No-op for a global TUI.
-+            poll: props.sessionID
++            poll: activeSessionID
 +              ? { intervalMs: CHILD_POLL_INTERVAL_MS, check: pollChildren }
 +              : undefined,
            })
@@ -322,6 +357,31 @@ index e7452ae..5aba881 100644
            await new Promise((resolve) => setTimeout(resolve, backoff))
          }
        })().catch(() => {})
+     }
+ 
++    // D6: follow in-TUI session switches / forks / new-session. The scoped set is
++    // f(active session); when the viewed session changes to one outside the
++    // current set, rebase on it and reconnect so its (and its children's) events
++    // flow. Without this, switching to an unrelated top-level session silently
++    // freezes the view (REST works, but every live event is filtered out server
++    // side). No-op in embedded mode (props.events supplies events directly).
++    if (!props.events) {
++      createEffect(() => {
++        const r = route.data
++        const sid =
++          r.type === "session" && typeof r.sessionID === "string" && r.sessionID && r.sessionID !== "dummy"
++            ? r.sessionID
++            : undefined
++        if (!sid || sid === activeSessionID) return
++        activeSessionID = sid
++        sessionIds = [sid]
++        startSSE()
++      })
++    }
++
+     onMount(async () => {
+       if (props.events) {
+         const unsub = await props.events.subscribe(handleEvent)
 diff --git a/packages/tui/src/context/sync.tsx b/packages/tui/src/context/sync.tsx
 index 8a96ff6..8737236 100644
 --- a/packages/tui/src/context/sync.tsx
