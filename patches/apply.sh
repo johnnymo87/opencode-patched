@@ -143,33 +143,12 @@
 #                                               bootstrap() are only triggered when the event's directory
 #                                               matches this TUI's workspace and directory, and qualifying
 #                                               disposals within 250ms are coalesced into a single run.
-#  15. tui-follow-owner.patch    (local)      - make the attached TUI's live event stream FOLLOW a session
-#                                               that migrates serves mid-stream (bead workstation-yl00).
-#                                               The TUI subscribes to a per-PROCESS /global/event firehose
-#                                               (context/sdk.tsx) pinned, at attach time, to whatever serve
-#                                               pigeon /route named then. attach-route-resolve only re-
-#                                               resolves /route at the START of an SSE attempt, and a healthy
-#                                               /global/event attempt never ends on its own (10s heartbeats),
-#                                               so a session that migrates to another serve (serve-lease idle-
-#                                               migration / pool reshuffle) emits its later turns only on the
-#                                               NEW serve's bus while the TUI stays silently pinned to the old
-#                                               one — frozen until manual re-attach. Fix: (a) a PURE
-#                                               evaluateOwnerDrift() in util/route.ts (confirm-twice, degrade-
-#                                               hard: resolveServeUrl already collapses any /route failure to
-#                                               the current url, so only a successful, repeated, DIFFERENT
-#                                               owner triggers anything); (b) runSseAttempt() (util/sse.ts)
-#                                               gains an optional `poll` that re-checks /route every
-#                                               OWNER_DRIFT_POLL_INTERVAL_MS (env OPENCODE_OWNER_POLL_INTERVAL_MS,
-#                                               default 5000) against the attempt's OWN per-attempt signal —
-#                                               no new AbortSignal.any off the long-lived parent (avoids the
-#                                               lyj0 listener leak) — and on a confirmed change ends the
-#                                               attempt reporting `drifted:true`; (c) startSSE (context/
-#                                               sdk.tsx) reconnects IMMEDIATELY (resets backoff) on a drift so
-#                                               open()'s existing re-resolve points the firehose + REST client
-#                                               at the new owner. Gated on a session id (no-op for a global
-#                                               TUI). MUST apply after attach-route-resolve (it extends that
-#                                               patch's route.ts/sse.ts/sdk.tsx). Unit-tested in
-#                                               packages/tui/test/util/{route,sse}.test.ts.
+#  15. tui-follow-owner.patch    REMOVED (2026-07-24, Phase 8) — SUPERSEDED by tui-door-attach.patch below.
+#                                               Its /route-drift self-resolve (evaluateOwnerDrift + poll) is
+#                                               obsolete once the TUI rides the opaque front door: the door
+#                                               owns ownership and drops the SSE leg on a confirmed owner
+#                                               migration, so the client never self-resolves pigeon /route.
+#                                               (bead workstation-mlve.3 / D5.)
 #  16. event-log-gate.patch      (local)      - gate the durable event LOG (event table inserts in
 #                                               core/src/event.ts commitSyncEvent) behind
 #                                               Flag.OPENCODE_EXPERIMENTAL_WORKSPACES (bead
@@ -238,6 +217,55 @@
 #                                               catalog.test.ts. SUNSET: revisit on upstream cutover;
 #                                               upstream >= v1.17.13 still recomputes per call as of
 #                                               2026-07-04.
+#  19. session-door-routes.patch (local)      - Phase 8 server + SDK surface for the front-door TUI
+#                                               (bead workstation-mlve.3). (a) event.subscribe group gains
+#                                               an optional ?session_ids= query field — REQUIRED because
+#                                               HttpApi rejects undeclared query params with 400, so a
+#                                               scoped subscribe would 400 without it (the handler already
+#                                               reads it raw via event-session-scope). (b) NEW session-
+#                                               scoped routes on the session group, so the front door can
+#                                               owner-route them by path (a child resolves to the parent's
+#                                               owner): GET /session/:id/permissions and GET
+#                                               /session/:id/questions (pending lists for the D2 fetch-on-
+#                                               reconnect reconcile) + POST /session/:id/questions/:qid/
+#                                               reply|reject (mirror the bare /question routes). (c) the
+#                                               existing session-scoped permissionRespond gains an optional
+#                                               `message` for reject-with-feedback parity. (d) regenerated
+#                                               packages/sdk/js/src/v2/gen/{sdk,types}.gen.ts via the tree's
+#                                               own generator (script/build.ts → hey-api). Server-only +
+#                                               generated SDK; disjoint from every other patch.
+#  20. tui-door-attach.patch     (local)      - Phase 8 TUI rewrite (bead workstation-mlve.3), SUPERSEDES
+#                                               tui-follow-owner. The attached TUI rides the opaque front
+#                                               door: (a) it subscribes to the SESSION-SCOPED
+#                                               /event?session_ids=<root ∪ live children> stream instead of
+#                                               the /global/event firehose (context/sdk.tsx), wrapping the
+#                                               bare payloads into the GlobalEvent envelope the useEvent
+#                                               layer expects; (b) it DROPS the client pigeon-/route self-
+#                                               resolve (resolveServeUrl/evaluateOwnerDrift) — the door owns
+#                                               ownership and drops the SSE leg on a confirmed migration, so
+#                                               the client just reconnects to the same door url (D5); (c) D2
+#                                               poll GET /session/:root/children (~5s) keeps the set current
+#                                               AND reconciles child Session.Info into the store so
+#                                               children() renders subagent prompts, with fetch-on-reconnect
+#                                               (GET pending permissions+questions) closing the no-replay
+#                                               race (a prompt asked in the poll/reconnect gap is lost, not
+#                                               late → subagent hang) — CRITICAL; (d) NEW-A resets the
+#                                               reconnect backoff only after a stream stays open ≥10s
+#                                               (OPENCODE_SSE_MIN_OPEN_MS) + adds jitter; (e) migrates
+#                                               permission/question replies to the session-scoped routes
+#                                               (permission.respond, session.questionReply/Reject) so the
+#                                               door can route them (W5); (f) attach.ts drops the /route
+#                                               self-resolve and defaults the url to OPENCODE_FRONTDOOR_URL.
+#                                               util/sse.ts keeps the runSseAttempt poll/drifted machinery
+#                                               (ported from the removed tui-follow-owner, repurposed for
+#                                               child-set changes). MUST apply after attach-route-resolve.
+#  21. tui-door-tests.patch      (local)      - NEW-G client contract tripwire (bead workstation-mlve.3):
+#                                               packages/sdk/js/test/door-scope.test.ts asserts the client
+#                                               subscribes to /event?session_ids= (never /global/event) and
+#                                               that permission/question replies + pending reads hit the
+#                                               session-scoped door routes. Run by the build-release.yml
+#                                               "Phase 8 contract tests" step (build-release ran no tests
+#                                               before, so the tripwire would be inert without it).
 #
 # DROPPED on the v1.17 line (see workstation docs/plans/2026-06-11-opencode-1.17-cutover-runbook.md):
 #   - integration-list-batch.patch: DROPPED on the v1.17.13 roll-forward (2026-07-06).
@@ -315,10 +343,12 @@ PATCHES=(
   project-copy-debounce
   step-end-diff-bound
   globalbus-maxlisteners
-  tui-follow-owner
   event-log-gate
   compaction-bounded-load
   available-cache
+  session-door-routes
+  tui-door-attach
+  tui-door-tests
 )
 
 for name in "${PATCHES[@]}"; do

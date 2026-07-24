@@ -1,6 +1,20 @@
 # Phase 8 — TUI through the front door (opencode-patched mini-plan)
 
-Status: **PLANNING** (investigation done 2026-07-22; awaiting design decisions + fable review before any patch).
+Status: **IMPLEMENTED** (2026-07-24). Patches authored + verified against a fresh v1.17.13 clone; awaiting release cut + workstation pin bump.
+
+## Implementation (2026-07-24)
+Three patches landed in `patches/` (apply.sh updated; `tui-follow-owner.patch` REMOVED/superseded per D5):
+- **`session-door-routes.patch`** (Bundle A, server + regenerated SDK): `event.subscribe` group gains the `?session_ids=` query field (else HttpApi 400s a scoped subscribe); NEW session-scoped routes `GET /session/:id/permissions`, `GET /session/:id/questions`, `POST /session/:id/questions/:qid/reply|reject`; `permissionRespond` gains optional `message` (reject-feedback parity); `packages/sdk/js/src/v2/gen/{sdk,types}.gen.ts` regenerated via the tree's own generator (`script/build.ts` → hey-api). Regen unblocked by a temporary non-literal-specifier trick for `node:sqlite` in routing-lease.ts (bun 1.3.3 can't resolve it at scan time; restored before diffing). `bun tsc` (sdk) green.
+- **`tui-door-attach.patch`** (Bundle B): rewrites `context/sdk.tsx` to subscribe to the scoped `/event?session_ids=<root ∪ live children>` (wrapping bare payloads into the GlobalEvent envelope useEvent expects); drops the pigeon `/route` self-resolve (D5); D2 child poll (`GET /session/:root/children`, ~5s) reconciles children into the store AND fetch-on-reconnect (`GET` pending permissions+questions) closes the no-replay race; NEW-A resets backoff only after ≥10s open + jitter; W5 migrates permission/question replies to session-scoped routes (`permission.respond`, `session.questionReply/Reject`); `attach.ts` drops self-resolve, defaults url to `OPENCODE_FRONTDOOR_URL`; `util/sse.ts` keeps the `runSseAttempt` poll/drifted machinery (ported from removed tui-follow-owner, repurposed for child-set changes). tui `tsgo` clean (only the pre-existing session.ts:917 createNext error remains, unrelated).
+- **`tui-door-tests.patch`** (Bundle C / NEW-G): `packages/sdk/js/test/door-scope.test.ts` asserts the client hits `/event?session_ids=` (never `/global/event`) and the session-scoped reply/pending routes. Wired into `build-release.yml` via a "Phase 8 contract tests (NEW-G)" step (build-release ran no tests before). Verified passing on a fresh clean apply (3/0 door-scope, 15/0 sse+route).
+
+Verification: `patches/apply.sh` applies the full set zero-fuzz on a fresh `v1.17.13` clone (exit 0); the CI test commands pass on that clone. Not yet run: the server session_ids/route tests locally (blocked by bun 1.3.3 lacking `node:sqlite` in the routing-lease import graph — a local-env limitation; the server filter is covered by event-session-scope's tests where the runner's bun supports node:sqlite, and validated by types).
+
+Remaining: cut `v1.17.13-patched.1` (build-release.yml), bump `users/dev/home.base.nix` (patchedRevision + 4 hashes), coordinate the update cron. D4 door-side work stays in `workstation-mlve.11`.
+
+---
+
+Status (historical): **PLANNING** (investigation done 2026-07-22; awaiting design decisions + fable review before any patch).
 Parent epic: workstation `docs/plans/2026-07-12-serve-reverse-proxy-plan.md` "Phase 8"; bead `workstation-mlve.3`.
 
 ## Goal

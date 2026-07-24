@@ -1,0 +1,71 @@
+diff --git a/packages/sdk/js/test/door-scope.test.ts b/packages/sdk/js/test/door-scope.test.ts
+new file mode 100644
+index 0000000..2587c52
+--- /dev/null
++++ b/packages/sdk/js/test/door-scope.test.ts
+@@ -0,0 +1,65 @@
++import { expect, test } from "bun:test"
++import { createOpencodeClient } from "../src/v2"
++
++// Phase 8 (bead workstation-mlve.3) client contract: the attached TUI rides the
++// opaque front door. It MUST subscribe to the session-scoped `/event?session_ids=`
++// stream (never the `/global/event` firehose) and reply to permissions/questions
++// through session-scoped routes the door can owner-route by path. This is the
++// NEW-G tripwire — if a future SDK regen drops `session_ids` or the session-scoped
++// routes, or the TUI reverts to the firehose, these assertions fail in CI.
++function capturingClient() {
++  const calls: { url: string; method: string }[] = []
++  const fetchImpl = (async (input: unknown, init?: RequestInit) => {
++    const req = input instanceof Request ? input : new Request(String(input), init)
++    calls.push({ url: req.url, method: req.method })
++    const isSse = new URL(req.url).pathname.endsWith("/event")
++    return new Response(isSse ? "" : "[]", {
++      status: 200,
++      headers: { "content-type": isSse ? "text/event-stream" : "application/json" },
++    })
++  }) as unknown as typeof fetch
++  const client = createOpencodeClient({ baseUrl: "http://door.local", fetch: fetchImpl })
++  return { client, calls }
++}
++
++test("attach subscribes to the session-scoped /event stream, not /global/event", async () => {
++  const { client, calls } = capturingClient()
++  // The SSE request is issued lazily when the stream is iterated (as the TUI's
++  // runSseAttempt does), so start consuming it to trigger the fetch.
++  const res = await client.event.subscribe({ session_ids: "ses_a,ses_b" }).catch(() => null)
++  if (res) {
++    try {
++      for await (const _ of res.stream) break
++    } catch {
++      // empty stream / abort — the fetch has already been recorded
++    }
++  }
++  const url = new URL(calls.at(-1)!.url)
++  expect(url.pathname).toBe("/event")
++  expect(url.pathname).not.toBe("/global/event")
++  expect(url.searchParams.get("session_ids")).toBe("ses_a,ses_b")
++})
++
++test("permission reply routes through the session-scoped door route", async () => {
++  const { client, calls } = capturingClient()
++  await client.permission.respond({ sessionID: "ses_a", permissionID: "per_1", response: "once" }).catch(() => {})
++  const call = calls.at(-1)!
++  expect(new URL(call.url).pathname).toBe("/session/ses_a/permissions/per_1")
++  expect(call.method).toBe("POST")
++})
++
++test("question reply/reject + pending reads are session-scoped", async () => {
++  const { client, calls } = capturingClient()
++
++  await client.session.questionReply({ sessionID: "ses_a", questionID: "que_1", answers: [] }).catch(() => {})
++  expect(new URL(calls.at(-1)!.url).pathname).toBe("/session/ses_a/questions/que_1/reply")
++
++  await client.session.questionReject({ sessionID: "ses_a", questionID: "que_1" }).catch(() => {})
++  expect(new URL(calls.at(-1)!.url).pathname).toBe("/session/ses_a/questions/que_1/reject")
++
++  await client.session.permissions({ sessionID: "ses_a" }).catch(() => {})
++  expect(new URL(calls.at(-1)!.url).pathname).toBe("/session/ses_a/permissions")
++
++  await client.session.questions({ sessionID: "ses_a" }).catch(() => {})
++  expect(new URL(calls.at(-1)!.url).pathname).toBe("/session/ses_a/questions")
++})

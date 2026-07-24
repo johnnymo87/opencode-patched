@@ -1,0 +1,648 @@
+diff --git a/packages/opencode/src/server/routes/instance/httpapi/groups/event.ts b/packages/opencode/src/server/routes/instance/httpapi/groups/event.ts
+index 6de2214..b94615f 100644
+--- a/packages/opencode/src/server/routes/instance/httpapi/groups/event.ts
++++ b/packages/opencode/src/server/routes/instance/httpapi/groups/event.ts
+@@ -2,17 +2,28 @@ import { Schema } from "effect"
+ import { HttpApi, HttpApiEndpoint, HttpApiGroup, HttpApiSchema, OpenApi } from "effect/unstable/httpapi"
+ import { Authorization } from "../middleware/authorization"
+ import { InstanceContextMiddleware } from "../middleware/instance-context"
+-import { WorkspaceRoutingMiddleware, WorkspaceRoutingQuery } from "../middleware/workspace-routing"
++import { WorkspaceRoutingMiddleware, WorkspaceRoutingQueryFields } from "../middleware/workspace-routing"
+ 
+ export const EventPaths = {
+   event: "/event",
+ } as const
+ 
++// The event stream accepts an optional comma-separated ?session_ids=a,b,c filter
++// (read raw from the search params by the handler, see handlers/event.ts). It
++// MUST be declared in the endpoint query schema — HttpApi rejects requests
++// carrying undeclared query params with 400, so a scoped subscribe would 400
++// without this field. Merged only into this endpoint (not the shared
++// WorkspaceRoutingQueryFields) so no other route's contract changes.
++const EventSubscribeQuery = Schema.Struct({
++  ...WorkspaceRoutingQueryFields,
++  session_ids: Schema.optional(Schema.String),
++})
++
+ export const EventApi = HttpApi.make("event").add(
+   HttpApiGroup.make("event")
+     .add(
+       HttpApiEndpoint.get("subscribe", EventPaths.event, {
+-        query: WorkspaceRoutingQuery,
++        query: EventSubscribeQuery,
+         success: Schema.String.pipe(HttpApiSchema.asText({ contentType: "text/event-stream" })),
+       }).annotateMerge(
+         OpenApi.annotations({
+diff --git a/packages/opencode/src/server/routes/instance/httpapi/groups/session.ts b/packages/opencode/src/server/routes/instance/httpapi/groups/session.ts
+index 959a303..10f8016 100644
+--- a/packages/opencode/src/server/routes/instance/httpapi/groups/session.ts
++++ b/packages/opencode/src/server/routes/instance/httpapi/groups/session.ts
+@@ -1,5 +1,7 @@
+ import { PermissionV1 } from "@opencode-ai/core/v1/permission"
+ import { Permission } from "@/permission"
++import { Question } from "@/question"
++import { QuestionID } from "@/question/schema"
+ import { SessionV1 } from "@opencode-ai/core/v1/session"
+ 
+ import { Session } from "@/session/session"
+@@ -20,7 +22,7 @@ import {
+   WorkspaceRoutingQuery,
+   WorkspaceRoutingQueryFields,
+ } from "../middleware/workspace-routing"
+-import { ApiNotFoundError, PermissionNotFoundError, SessionBusyError } from "../errors"
++import { ApiNotFoundError, PermissionNotFoundError, QuestionNotFoundError, SessionBusyError } from "../errors"
+ import { described } from "./metadata"
+ import { QueryBoolean } from "./query"
+ import { ProviderV2 } from "@opencode-ai/core/provider"
+@@ -73,6 +75,18 @@ export const ShellPayload = Schema.Struct(Struct.omit(SessionPrompt.ShellInput.f
+ export const RevertPayload = Schema.Struct(Struct.omit(SessionRevert.RevertInput.fields, ["sessionID"]))
+ export const PermissionResponsePayload = Schema.Struct({
+   response: PermissionV1.Reply,
++  // Optional reject feedback, mirroring the bare /permission/:requestID/reply
++  // payload so the session-scoped route (the front-door-routable one the TUI
++  // migrates to in Phase 8) preserves subagent reject-with-feedback parity.
++  message: Schema.optional(Schema.String),
++})
++
++// Mirror of the bare /question/:requestID/reply payload (groups/question.ts),
++// re-declared here for the session-scoped question reply route (Phase 8).
++export const QuestionReplyPayload = Schema.Struct({
++  answers: Schema.Array(Question.Answer).annotate({
++    description: "User answers in order of questions (each answer is an array of selected labels)",
++  }),
+ })
+ 
+ export const SessionPaths = {
+@@ -99,6 +113,16 @@ export const SessionPaths = {
+   revert: `${root}/:sessionID/revert`,
+   unrevert: `${root}/:sessionID/unrevert`,
+   permissions: `${root}/:sessionID/permissions/:permissionID`,
++  // Session-scoped pending reads + question replies (bead workstation-mlve.3,
++  // Phase 8). These live under /session/:sessionID/… so the front door
++  // owner-routes them for free (a child resolves to the parent's owner, whose
++  // process runs the child's agent loop). GET lists back the D2 reconcile
++  // (fetch-pending-on-reconnect); the question reply/reject mirror the bare
++  // /question/:requestID routes but are addressable by session for the door.
++  permissionsList: `${root}/:sessionID/permissions`,
++  questionsList: `${root}/:sessionID/questions`,
++  questionReply: `${root}/:sessionID/questions/:questionID/reply`,
++  questionReject: `${root}/:sessionID/questions/:questionID/reject`,
+   deleteMessage: `${root}/:sessionID/message/:messageID`,
+   deletePart: `${root}/:sessionID/message/:messageID/part/:partID`,
+   updatePart: `${root}/:sessionID/message/:messageID/part/:partID`,
+@@ -406,6 +430,55 @@ export const SessionApi = HttpApi.make("session")
+             deprecated: true,
+           }),
+         ),
++        HttpApiEndpoint.get("permissionsList", SessionPaths.permissionsList, {
++          params: { sessionID: SessionID },
++          query: WorkspaceRoutingQuery,
++          success: described(Schema.Array(PermissionV1.Request), "Pending permissions for the session"),
++          error: [ApiNotFoundError],
++        }).annotateMerge(
++          OpenApi.annotations({
++            identifier: "session.permissions",
++            summary: "List pending permissions",
++            description: "Get all pending permission requests for a session (and its children resolve here).",
++          }),
++        ),
++        HttpApiEndpoint.get("questionsList", SessionPaths.questionsList, {
++          params: { sessionID: SessionID },
++          query: WorkspaceRoutingQuery,
++          success: described(Schema.Array(Question.Request), "Pending questions for the session"),
++          error: [ApiNotFoundError],
++        }).annotateMerge(
++          OpenApi.annotations({
++            identifier: "session.questions",
++            summary: "List pending questions",
++            description: "Get all pending question requests for a session.",
++          }),
++        ),
++        HttpApiEndpoint.post("questionReply", SessionPaths.questionReply, {
++          params: { sessionID: SessionID, questionID: QuestionID },
++          query: WorkspaceRoutingQuery,
++          payload: QuestionReplyPayload,
++          success: described(Schema.Boolean, "Question answered successfully"),
++          error: [HttpApiError.BadRequest, ApiNotFoundError, QuestionNotFoundError],
++        }).annotateMerge(
++          OpenApi.annotations({
++            identifier: "session.questionReply",
++            summary: "Reply to a question",
++            description: "Provide answers to a question request, addressable by session for front-door routing.",
++          }),
++        ),
++        HttpApiEndpoint.post("questionReject", SessionPaths.questionReject, {
++          params: { sessionID: SessionID, questionID: QuestionID },
++          query: WorkspaceRoutingQuery,
++          success: described(Schema.Boolean, "Question rejected successfully"),
++          error: [HttpApiError.BadRequest, ApiNotFoundError, QuestionNotFoundError],
++        }).annotateMerge(
++          OpenApi.annotations({
++            identifier: "session.questionReject",
++            summary: "Reject a question",
++            description: "Reject a question request, addressable by session for front-door routing.",
++          }),
++        ),
+         HttpApiEndpoint.delete("deleteMessage", SessionPaths.deleteMessage, {
+           params: { sessionID: SessionID, messageID: MessageID },
+           query: WorkspaceRoutingQuery,
+diff --git a/packages/opencode/src/server/routes/instance/httpapi/handlers/session.ts b/packages/opencode/src/server/routes/instance/httpapi/handlers/session.ts
+index 2ebf0cf..354b7ed 100644
+--- a/packages/opencode/src/server/routes/instance/httpapi/handlers/session.ts
++++ b/packages/opencode/src/server/routes/instance/httpapi/handlers/session.ts
+@@ -4,6 +4,8 @@ import { SessionV1 } from "@opencode-ai/core/v1/session"
+ import { EventV2Bridge } from "@/event-v2-bridge"
+ import { Command } from "@/command"
+ import { Permission } from "@/permission"
++import { Question } from "@/question"
++import { QuestionID } from "@/question/schema"
+ import { SessionShare } from "@/share/session"
+ import { Session } from "@/session/session"
+ import { SessionCompaction } from "@/session/compaction"
+@@ -30,12 +32,13 @@ import {
+   MessagesQuery,
+   PermissionResponsePayload,
+   PromptPayload,
++  QuestionReplyPayload,
+   RevertPayload,
+   ShellPayload,
+   SummarizePayload,
+   UpdatePayload,
+ } from "../groups/session"
+-import { PermissionNotFoundError } from "../errors"
++import { PermissionNotFoundError, QuestionNotFoundError } from "../errors"
+ import * as SessionError from "./session-errors"
+ 
+ const tryParseJson = (text: string) =>
+@@ -54,6 +57,7 @@ export const sessionHandlers = HttpApiBuilder.group(InstanceHttpApi, "session",
+     const runState = yield* SessionRunState.Service
+     const agentSvc = yield* Agent.Service
+     const permissionSvc = yield* Permission.Service
++    const questionSvc = yield* Question.Service
+     const statusSvc = yield* SessionStatus.Service
+     const todoSvc = yield* Todo.Service
+     const summary = yield* SessionSummary.Service
+@@ -362,12 +366,69 @@ export const sessionHandlers = HttpApiBuilder.group(InstanceHttpApi, "session",
+       payload: typeof PermissionResponsePayload.Type
+     }) {
+       yield* requireSession(ctx.params.sessionID)
+-      yield* permissionSvc.reply({ requestID: ctx.params.permissionID, reply: ctx.payload.response }).pipe(
+-        Effect.catchTag("Permission.NotFoundError", (error) =>
++      yield* permissionSvc
++        .reply({ requestID: ctx.params.permissionID, reply: ctx.payload.response, message: ctx.payload.message })
++        .pipe(
++          Effect.catchTag("Permission.NotFoundError", (error) =>
++            Effect.fail(
++              new PermissionNotFoundError({
++                requestID: String(error.requestID),
++                message: `Permission request not found: ${error.requestID}`,
++              }),
++            ),
++          ),
++        )
++      return true
++    })
++
++    // Session-scoped pending reads for the TUI's fetch-on-reconnect reconcile
++    // (bead workstation-mlve.3, Phase 8). Permission/Question services hold the
++    // full pending set in-process; filter by session (a child's requests carry
++    // the child sessionID and resolve to this same owner process).
++    const permissionsList = Effect.fn("SessionHttpApi.permissionsList")(function* (ctx: {
++      params: { sessionID: SessionID }
++    }) {
++      yield* requireSession(ctx.params.sessionID)
++      const all = yield* permissionSvc.list()
++      return all.filter((r) => r.sessionID === ctx.params.sessionID)
++    })
++
++    const questionsList = Effect.fn("SessionHttpApi.questionsList")(function* (ctx: {
++      params: { sessionID: SessionID }
++    }) {
++      yield* requireSession(ctx.params.sessionID)
++      const all = yield* questionSvc.list()
++      return all.filter((r) => r.sessionID === ctx.params.sessionID)
++    })
++
++    const questionReply = Effect.fn("SessionHttpApi.questionReply")(function* (ctx: {
++      params: { sessionID: SessionID; questionID: QuestionID }
++      payload: typeof QuestionReplyPayload.Type
++    }) {
++      yield* requireSession(ctx.params.sessionID)
++      yield* questionSvc.reply({ requestID: ctx.params.questionID, answers: ctx.payload.answers }).pipe(
++        Effect.catchTag("Question.NotFoundError", (error) =>
+           Effect.fail(
+-            new PermissionNotFoundError({
++            new QuestionNotFoundError({
+               requestID: String(error.requestID),
+-              message: `Permission request not found: ${error.requestID}`,
++              message: `Question request not found: ${error.requestID}`,
++            }),
++          ),
++        ),
++      )
++      return true
++    })
++
++    const questionReject = Effect.fn("SessionHttpApi.questionReject")(function* (ctx: {
++      params: { sessionID: SessionID; questionID: QuestionID }
++    }) {
++      yield* requireSession(ctx.params.sessionID)
++      yield* questionSvc.reject(ctx.params.questionID).pipe(
++        Effect.catchTag("Question.NotFoundError", (error) =>
++          Effect.fail(
++            new QuestionNotFoundError({
++              requestID: String(error.requestID),
++              message: `Question request not found: ${error.requestID}`,
+             }),
+           ),
+         ),
+@@ -433,6 +494,10 @@ export const sessionHandlers = HttpApiBuilder.group(InstanceHttpApi, "session",
+       .handle("revert", revert)
+       .handle("unrevert", unrevert)
+       .handle("permissionRespond", permissionRespond)
++      .handle("permissionsList", permissionsList)
++      .handle("questionsList", questionsList)
++      .handle("questionReply", questionReply)
++      .handle("questionReject", questionReject)
+       .handle("deleteMessage", deleteMessage)
+       .handle("deletePart", deletePart)
+       .handle("updatePart", updatePart)
+diff --git a/packages/sdk/js/src/v2/gen/sdk.gen.ts b/packages/sdk/js/src/v2/gen/sdk.gen.ts
+index 9ed0084..0365a56 100644
+--- a/packages/sdk/js/src/v2/gen/sdk.gen.ts
++++ b/packages/sdk/js/src/v2/gen/sdk.gen.ts
+@@ -201,10 +201,18 @@ import type {
+   SessionMessageResponses,
+   SessionMessagesErrors,
+   SessionMessagesResponses,
++  SessionPermissionsErrors,
++  SessionPermissionsResponses,
+   SessionPromptAsyncErrors,
+   SessionPromptAsyncResponses,
+   SessionPromptErrors,
+   SessionPromptResponses,
++  SessionQuestionRejectErrors,
++  SessionQuestionRejectResponses,
++  SessionQuestionReplyErrors,
++  SessionQuestionReplyResponses,
++  SessionQuestionsErrors,
++  SessionQuestionsResponses,
+   SessionRevertErrors,
+   SessionRevertResponses,
+   SessionShareErrors,
+@@ -1392,6 +1400,7 @@ export class Event extends HeyApiClient {
+     parameters?: {
+       directory?: string
+       workspace?: string
++      session_ids?: string
+     },
+     options?: Options<never, ThrowOnError>,
+   ) {
+@@ -1402,6 +1411,7 @@ export class Event extends HeyApiClient {
+           args: [
+             { in: "query", key: "directory" },
+             { in: "query", key: "workspace" },
++            { in: "query", key: "session_ids" },
+           ],
+         },
+       ],
+@@ -3168,6 +3178,7 @@ export class Permission extends HeyApiClient {
+       directory?: string
+       workspace?: string
+       response?: "once" | "always" | "reject"
++      message?: string
+     },
+     options?: Options<never, ThrowOnError>,
+   ) {
+@@ -3181,6 +3192,7 @@ export class Permission extends HeyApiClient {
+             { in: "query", key: "directory" },
+             { in: "query", key: "workspace" },
+             { in: "body", key: "response" },
++            { in: "body", key: "message" },
+           ],
+         },
+       ],
+@@ -4325,6 +4337,153 @@ export class Session2 extends HeyApiClient {
+       ...params,
+     })
+   }
++
++  /**
++   * List pending permissions
++   *
++   * Get all pending permission requests for a session (and its children resolve here).
++   */
++  public permissions<ThrowOnError extends boolean = false>(
++    parameters: {
++      sessionID: string
++      directory?: string
++      workspace?: string
++    },
++    options?: Options<never, ThrowOnError>,
++  ) {
++    const params = buildClientParams(
++      [parameters],
++      [
++        {
++          args: [
++            { in: "path", key: "sessionID" },
++            { in: "query", key: "directory" },
++            { in: "query", key: "workspace" },
++          ],
++        },
++      ],
++    )
++    return (options?.client ?? this.client).get<SessionPermissionsResponses, SessionPermissionsErrors, ThrowOnError>({
++      url: "/session/{sessionID}/permissions",
++      ...options,
++      ...params,
++    })
++  }
++
++  /**
++   * List pending questions
++   *
++   * Get all pending question requests for a session.
++   */
++  public questions<ThrowOnError extends boolean = false>(
++    parameters: {
++      sessionID: string
++      directory?: string
++      workspace?: string
++    },
++    options?: Options<never, ThrowOnError>,
++  ) {
++    const params = buildClientParams(
++      [parameters],
++      [
++        {
++          args: [
++            { in: "path", key: "sessionID" },
++            { in: "query", key: "directory" },
++            { in: "query", key: "workspace" },
++          ],
++        },
++      ],
++    )
++    return (options?.client ?? this.client).get<SessionQuestionsResponses, SessionQuestionsErrors, ThrowOnError>({
++      url: "/session/{sessionID}/questions",
++      ...options,
++      ...params,
++    })
++  }
++
++  /**
++   * Reply to a question
++   *
++   * Provide answers to a question request, addressable by session for front-door routing.
++   */
++  public questionReply<ThrowOnError extends boolean = false>(
++    parameters: {
++      sessionID: string
++      questionID: string
++      directory?: string
++      workspace?: string
++      answers?: Array<QuestionAnswer>
++    },
++    options?: Options<never, ThrowOnError>,
++  ) {
++    const params = buildClientParams(
++      [parameters],
++      [
++        {
++          args: [
++            { in: "path", key: "sessionID" },
++            { in: "path", key: "questionID" },
++            { in: "query", key: "directory" },
++            { in: "query", key: "workspace" },
++            { in: "body", key: "answers" },
++          ],
++        },
++      ],
++    )
++    return (options?.client ?? this.client).post<
++      SessionQuestionReplyResponses,
++      SessionQuestionReplyErrors,
++      ThrowOnError
++    >({
++      url: "/session/{sessionID}/questions/{questionID}/reply",
++      ...options,
++      ...params,
++      headers: {
++        "Content-Type": "application/json",
++        ...options?.headers,
++        ...params.headers,
++      },
++    })
++  }
++
++  /**
++   * Reject a question
++   *
++   * Reject a question request, addressable by session for front-door routing.
++   */
++  public questionReject<ThrowOnError extends boolean = false>(
++    parameters: {
++      sessionID: string
++      questionID: string
++      directory?: string
++      workspace?: string
++    },
++    options?: Options<never, ThrowOnError>,
++  ) {
++    const params = buildClientParams(
++      [parameters],
++      [
++        {
++          args: [
++            { in: "path", key: "sessionID" },
++            { in: "path", key: "questionID" },
++            { in: "query", key: "directory" },
++            { in: "query", key: "workspace" },
++          ],
++        },
++      ],
++    )
++    return (options?.client ?? this.client).post<
++      SessionQuestionRejectResponses,
++      SessionQuestionRejectErrors,
++      ThrowOnError
++    >({
++      url: "/session/{sessionID}/questions/{questionID}/reject",
++      ...options,
++      ...params,
++    })
++  }
+ }
+ 
+ export class Part extends HeyApiClient {
+diff --git a/packages/sdk/js/src/v2/gen/types.gen.ts b/packages/sdk/js/src/v2/gen/types.gen.ts
+index 5e067f3..0b7a8dc 100644
+--- a/packages/sdk/js/src/v2/gen/types.gen.ts
++++ b/packages/sdk/js/src/v2/gen/types.gen.ts
+@@ -7387,6 +7387,7 @@ export type EventSubscribeData = {
+   query?: {
+     directory?: string
+     workspace?: string
++    session_ids?: string
+   }
+   url: "/event"
+ }
+@@ -10365,6 +10366,7 @@ export type SessionUnrevertResponse = SessionUnrevertResponses[keyof SessionUnre
+ export type PermissionRespondData = {
+   body?: {
+     response: "once" | "always" | "reject"
++    message?: string
+   }
+   path: {
+     sessionID: string
+@@ -10399,6 +10401,149 @@ export type PermissionRespondResponses = {
+ 
+ export type PermissionRespondResponse = PermissionRespondResponses[keyof PermissionRespondResponses]
+ 
++export type SessionPermissionsData = {
++  body?: never
++  path: {
++    sessionID: string
++  }
++  query?: {
++    directory?: string
++    workspace?: string
++  }
++  url: "/session/{sessionID}/permissions"
++}
++
++export type SessionPermissionsErrors = {
++  /**
++   * Bad request
++   */
++  400: BadRequestError
++  /**
++   * NotFoundError
++   */
++  404: NotFoundError
++}
++
++export type SessionPermissionsError = SessionPermissionsErrors[keyof SessionPermissionsErrors]
++
++export type SessionPermissionsResponses = {
++  /**
++   * Pending permissions for the session
++   */
++  200: Array<PermissionRequest>
++}
++
++export type SessionPermissionsResponse = SessionPermissionsResponses[keyof SessionPermissionsResponses]
++
++export type SessionQuestionsData = {
++  body?: never
++  path: {
++    sessionID: string
++  }
++  query?: {
++    directory?: string
++    workspace?: string
++  }
++  url: "/session/{sessionID}/questions"
++}
++
++export type SessionQuestionsErrors = {
++  /**
++   * Bad request
++   */
++  400: BadRequestError
++  /**
++   * NotFoundError
++   */
++  404: NotFoundError
++}
++
++export type SessionQuestionsError = SessionQuestionsErrors[keyof SessionQuestionsErrors]
++
++export type SessionQuestionsResponses = {
++  /**
++   * Pending questions for the session
++   */
++  200: Array<QuestionRequest>
++}
++
++export type SessionQuestionsResponse = SessionQuestionsResponses[keyof SessionQuestionsResponses]
++
++export type SessionQuestionReplyData = {
++  body?: {
++    /**
++     * User answers in order of questions (each answer is an array of selected labels)
++     */
++    answers: Array<QuestionAnswer>
++  }
++  path: {
++    sessionID: string
++    questionID: string
++  }
++  query?: {
++    directory?: string
++    workspace?: string
++  }
++  url: "/session/{sessionID}/questions/{questionID}/reply"
++}
++
++export type SessionQuestionReplyErrors = {
++  /**
++   * BadRequest | InvalidRequestError
++   */
++  400: EffectHttpApiErrorBadRequest | InvalidRequestError
++  /**
++   * NotFoundError | QuestionNotFoundError
++   */
++  404: NotFoundError | QuestionNotFoundError
++}
++
++export type SessionQuestionReplyError = SessionQuestionReplyErrors[keyof SessionQuestionReplyErrors]
++
++export type SessionQuestionReplyResponses = {
++  /**
++   * Question answered successfully
++   */
++  200: boolean
++}
++
++export type SessionQuestionReplyResponse = SessionQuestionReplyResponses[keyof SessionQuestionReplyResponses]
++
++export type SessionQuestionRejectData = {
++  body?: never
++  path: {
++    sessionID: string
++    questionID: string
++  }
++  query?: {
++    directory?: string
++    workspace?: string
++  }
++  url: "/session/{sessionID}/questions/{questionID}/reject"
++}
++
++export type SessionQuestionRejectErrors = {
++  /**
++   * BadRequest | InvalidRequestError
++   */
++  400: EffectHttpApiErrorBadRequest | InvalidRequestError
++  /**
++   * NotFoundError | QuestionNotFoundError
++   */
++  404: NotFoundError | QuestionNotFoundError
++}
++
++export type SessionQuestionRejectError = SessionQuestionRejectErrors[keyof SessionQuestionRejectErrors]
++
++export type SessionQuestionRejectResponses = {
++  /**
++   * Question rejected successfully
++   */
++  200: boolean
++}
++
++export type SessionQuestionRejectResponse = SessionQuestionRejectResponses[keyof SessionQuestionRejectResponses]
++
+ export type PartDeleteData = {
+   body?: never
+   path: {

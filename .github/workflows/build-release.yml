@@ -73,6 +73,17 @@ jobs:
           cd opencode-src
           bun install
 
+      # NEW-G tripwire (bead workstation-mlve.3, Phase 8): assert the attached
+      # TUI rides the session-scoped /event stream (never the /global/event
+      # firehose) and replies to permissions/questions through session-scoped
+      # front-door routes. build-release ran NO tests before this, so the
+      # contract tests would have been inert. Runs from each package dir so the
+      # workspace resolves; dependency-light (no server/routing-lease import).
+      - name: Phase 8 contract tests (NEW-G)
+        run: |
+          cd opencode-src/packages/sdk/js && bun test test/door-scope.test.ts
+          cd ../../tui && bun test test/util/sse.test.ts test/util/route.test.ts
+
       - name: Build CLI
         run: |
           cd opencode-src/packages/opencode

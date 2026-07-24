@@ -1,0 +1,529 @@
+diff --git a/packages/opencode/src/cli/cmd/attach.ts b/packages/opencode/src/cli/cmd/attach.ts
+index 6e45774..e8009e5 100644
+--- a/packages/opencode/src/cli/cmd/attach.ts
++++ b/packages/opencode/src/cli/cmd/attach.ts
+@@ -1,7 +1,6 @@
+ import { cmd } from "./cmd"
+ import { UI } from "@/cli/ui"
+ import { errorMessage } from "@opencode-ai/tui/util/error"
+-import { resolveServeUrl } from "@opencode-ai/tui/util/route"
+ import { validateSession } from "../tui/validate-session"
+ import { ServerAuth } from "@/server/auth"
+ 
+@@ -12,7 +11,7 @@ export const AttachCommand = cmd({
+     yargs
+       .positional("url", {
+         type: "string",
+-        describe: "http://localhost:4096 (optional when --session is given: the owning serve is resolved via pigeon /route)",
++        describe: "the front-door url, e.g. http://localhost:4700 (defaults to OPENCODE_FRONTDOOR_URL)",
+       })
+       .option("dir", {
+         type: "string",
+@@ -114,18 +113,16 @@ export const AttachCommand = cmd({
+     const headers = ServerAuth.headers({ password: args.password, username: args.username })
+     const config = await TuiConfig.get()
+ 
+-    // Pool-aware resolution. With a K-serve pool sharing one opencode.db, only
+-    // the serve that owns a session emits its turn events on its in-memory bus.
+-    // When a session id is known, resolve the owning serve from pigeon's
+-    // GET /route so the TUI attaches to the right serve. Any /route failure
+-    // degrades to the explicitly-passed <url> (never worse). If neither a
+-    // resolvable session nor a <url> is available, fail loud — there is no
+-    // pre-pool ":4096" default to fall back to (that default is the exact
+-    // staleness bug this fixes).
+-    const fallback = args.url ?? ""
+-    const url = args.session ? await resolveServeUrl({ sessionID: args.session, fallback }) : fallback
++    // Phase 8 (bead workstation-mlve.3): the TUI rides the opaque front door.
++    // It attaches to a single fixed url — the door — which resolves the owning
++    // serve and routes REST by session path; the client no longer self-resolves
++    // pigeon /route (D5: the door owns ownership, no other door than the front
++    // door). Provide the url explicitly, or via OPENCODE_FRONTDOOR_URL. Fail
++    // loud if neither is available (there is no pre-pool ":4096" default).
++    const url =
++      args.url ?? (typeof process !== "undefined" ? process.env.OPENCODE_FRONTDOOR_URL : undefined) ?? ""
+     if (!url) {
+-      UI.error("attach: provide a <url>, or a --session that pigeon /route can resolve to an owning serve")
++      UI.error("attach: provide a <url> (the front door), or set OPENCODE_FRONTDOOR_URL")
+       process.exitCode = 1
+       return
+     }
+diff --git a/packages/tui/src/context/sdk.tsx b/packages/tui/src/context/sdk.tsx
+index e7452ae..5aba881 100644
+--- a/packages/tui/src/context/sdk.tsx
++++ b/packages/tui/src/context/sdk.tsx
+@@ -1,8 +1,7 @@
+ import { createOpencodeClient } from "@opencode-ai/sdk/v2"
+-import type { GlobalEvent } from "@opencode-ai/sdk/v2"
++import type { Event, GlobalEvent } from "@opencode-ai/sdk/v2"
+ import { Flag } from "@opencode-ai/core/flag/flag"
+ import { createSimpleContext } from "./helper"
+-import { resolveServeUrl } from "../util/route"
+ import { runSseAttempt } from "../util/sse"
+ import { batch, onCleanup, onMount } from "solid-js"
+ 
+@@ -10,6 +9,38 @@ export type EventSource = {
+   subscribe: (handler: (event: GlobalEvent) => void) => Promise<() => void>
+ }
+ 
++// Phase 8 (bead workstation-mlve.3): the attached TUI rides the opaque front
++// door and subscribes to a SESSION-SCOPED event stream
++// (`/event?session_ids=<root ∪ live children>`) instead of the per-process
++// `/global/event` firehose. The door owns serve ownership: it resolves the
++// owning serve, routes REST by session path, and drops the SSE leg on a
++// confirmed owner migration — so the client NEVER self-resolves pigeon /route
++// (that was attach-route-resolve + tui-follow-owner, now superseded). On any
++// leg drop the client simply reconnects to the SAME door url and the door
++// re-resolves the (possibly new) owner.
++//
++// How often (ms) the TUI polls GET /session/{root}/children to keep its
++// session_ids set current and reconcile child Session.Info into the store. A
++// child (subagent) session born after attach emits its lifecycle/permission/
++// question events under the CHILD session id, which the scoped filter drops
++// until that id is in the set — the child's own events therefore cannot be the
++// trigger to add it (chicken-and-egg), so we poll.
++const CHILD_POLL_INTERVAL_MS = (() => {
++  const env = typeof process !== "undefined" ? process.env?.OPENCODE_CHILD_POLL_INTERVAL_MS : undefined
++  const n = env ? Number(env) : Number.NaN
++  return Number.isFinite(n) && n > 0 ? n : 5000
++})()
++
++// NEW-A: only reset the reconnect backoff once a stream has stayed open at least
++// this long. Otherwise an owner-drift flap or an accept-then-die serve could
++// reset backoff every attempt and create a ~1s reconnect hammer. A short-lived
++// (re)connect counts as a failed attempt and keeps the exponential climbing.
++const MIN_OPEN_RESET_MS = (() => {
++  const env = typeof process !== "undefined" ? process.env?.OPENCODE_SSE_MIN_OPEN_MS : undefined
++  const n = env ? Number(env) : Number.NaN
++  return Number.isFinite(n) && n > 0 ? n : 10000
++})()
++
+ export const { use: useSDK, provider: SDKProvider } = createSimpleContext({
+   name: "SDK",
+   init: (props: {
+@@ -23,22 +54,17 @@ export const { use: useSDK, provider: SDKProvider } = createSimpleContext({
+     const abort = new AbortController()
+     let sse: AbortController | undefined
+ 
+-    // The serve we are currently connected to. Starts at props.url (already
+-    // resolved by `opencode attach`) but can change when a session migrates
+-    // serves in a K-serve pool — see the re-resolve in startSSE().
+-    let currentUrl = props.url
++    // The front-door url. FIXED for the lifetime of the TUI (D5): the door owns
++    // ownership, so there is no client-side re-resolve and this never changes.
++    const currentUrl = props.url
+ 
+-    function createSDK() {
+-      return createOpencodeClient({
+-        baseUrl: currentUrl,
+-        signal: abort.signal,
+-        directory: props.directory,
+-        fetch: props.fetch,
+-        headers: props.headers,
+-      })
+-    }
+-
+-    let sdk = createSDK()
++    const sdk = createOpencodeClient({
++      baseUrl: currentUrl,
++      signal: abort.signal,
++      directory: props.directory,
++      fetch: props.fetch,
++      headers: props.headers,
++    })
+ 
+     const handlers = new Set<(event: GlobalEvent) => void>()
+     const emitter = {
+@@ -87,66 +113,155 @@ export const { use: useSDK, provider: SDKProvider } = createSimpleContext({
+       flush()
+     }
+ 
++    // The live session_ids subscription set = {attach root} ∪ {live children}.
++    // Never empty while attached (always carries the root), so the server never
++    // blackholes this session's own events. Mutated by the children poll.
++    let sessionIds: string[] = props.sessionID ? [props.sessionID] : []
++
++    const sameSet = (a: string[], b: string[]) => {
++      if (a.length !== b.length) return false
++      const s = new Set(a)
++      return b.every((x) => s.has(x))
++    }
++
++    // Wrap an instance-scoped `/event` payload (or a synthesized one) into the
++    // `GlobalEvent` envelope { directory, payload } the emitter/useEvent layer
++    // expects (the `/global/event` firehose delivers that envelope; the scoped
++    // `/event` stream delivers the bare payload).
++    const wrap = (payload: Event): GlobalEvent =>
++      ({ directory: props.directory ?? "", payload }) as unknown as GlobalEvent
++
++    // Feed a fetched pending/child record into the store via the SAME event path
++    // the live stream uses, so the existing sync reducers de-dupe/reconcile it.
++    const inject = (type: Event["type"], properties: unknown, key: string) =>
++      handleEvent(wrap({ id: `reconcile:${key}`, type, properties } as unknown as Event))
++
++    // CRITICAL-1 (no event replay): a reconnect delivers only FUTURE events, so a
++    // permission/question asked in the poll→reconnect gap is LOST, not late — the
++    // subagent would hang. After every (re)open, fetch the pending permission +
++    // question lists for the whole set and reconcile them so nothing is missed.
++    const reconcilePending = async () => {
++      if (!props.sessionID) return
++      await Promise.all(
++        sessionIds.map(async (sid) => {
++          const [perms, quests] = await Promise.all([
++            sdk.session
++              .permissions({ sessionID: sid })
++              .then((r) => r.data)
++              .catch(() => undefined),
++            sdk.session
++              .questions({ sessionID: sid })
++              .then((r) => r.data)
++              .catch(() => undefined),
++          ])
++          if (perms) for (const p of perms) inject("permission.asked", p, `permission:${p.id}`)
++          if (quests) for (const q of quests) inject("question.asked", q, `question:${q.id}`)
++        }),
++      )
++    }
++
++    // D2 poll: keep the session_ids set = {root} ∪ live children, and reconcile
++    // each child Session.Info into the store (CRITICAL-3) so children() — which
++    // the permission/question aggregation flatMaps over — actually contains the
++    // child; otherwise a delivered child prompt still would not render. Returns
++    // true when the set changed, ending the attempt so open() re-subscribes with
++    // the new set (runSseAttempt reports this as `drifted` → reconnect now).
++    const pollChildren = async (signal: AbortSignal): Promise<boolean> => {
++      if (!props.sessionID) return false
++      let children: Array<{ id: string }> | undefined
++      try {
++        const res = await sdk.session.children({ sessionID: props.sessionID }, { signal })
++        children = res.data as Array<{ id: string }> | undefined
++      } catch {
++        return false
++      }
++      if (!children) return false
++      for (const child of children) inject("session.updated", { sessionID: child.id, info: child }, `session:${child.id}`)
++      const next = [props.sessionID, ...children.map((c) => c.id)].filter((v, i, a) => a.indexOf(v) === i)
++      if (!sameSet(next, sessionIds)) {
++        sessionIds = next
++        return true
++      }
++      return false
++    }
++
+     function startSSE() {
+       sse?.abort()
+       const ctrl = new AbortController()
+       sse = ctrl
+       ;(async () => {
+         let attempt = 0
++        // When the CURRENT attempt's stream opened (ms), for the NEW-A min-open
++        // backoff-reset guard. Reset each time a stream actually opens (onOpen).
++        let openedAt: number | undefined
+         while (true) {
+           if (abort.signal.aborted || ctrl.signal.aborted) break
+ 
+           // Each (re)connect runs as a discrete attempt with its OWN
+-          // AbortController (runSseAttempt), torn down before the next one
+-          // opens. Sharing one long-lived controller across reconnects (as the
+-          // first cut did) leaked one ESTABLISHED connection per reconnect up
+-          // to the per-origin pool cap and pinned a serve's event loop — and
+-          // calling resolveServeUrl with the long-lived signal accumulated an
+-          // AbortSignal.any listener per iteration (bead workstation-lyj0).
+-          await runSseAttempt<GlobalEvent>({
++          // AbortController (runSseAttempt), torn down before the next opens —
++          // sharing one long-lived controller leaked one ESTABLISHED connection
++          // per reconnect up to the per-origin pool cap (bead workstation-lyj0).
++          const result = await runSseAttempt<GlobalEvent>({
+             parentSignal: ctrl.signal,
+-            // Follow a session that migrated serves (pool-health reshuffle /
+-            // idle-migration). Re-resolve the owning serve from pigeon /route
+-            // before each (re)connect and rebuild the whole client if it moved,
+-            // so REST/control submits follow too (a non-owner serve can reject a
+-            // prompt under serve-lease enforcement). Any /route failure degrades
+-            // to the current url, so this is never worse than reconnecting in
+-            // place. The per-attempt `signal` keeps resolveServeUrl's bounded
+-            // AbortSignal.any listener short-lived.
+             open: async (signal) => {
++              openedAt = undefined
+               if (props.sessionID) {
+-                const next = await resolveServeUrl({
+-                  sessionID: props.sessionID,
+-                  fallback: currentUrl,
+-                  signal,
+-                })
+-                if (next !== currentUrl) {
+-                  currentUrl = next
+-                  sdk = createSDK()
++                // Session-scoped stream through the door: only events for the
++                // active session + its live children. Never an empty set. The
++                // scoped `/event` stream yields bare payloads, so wrap each into
++                // the GlobalEvent envelope the emitter/useEvent layer expects.
++                const res = await sdk.event.subscribe(
++                  { session_ids: sessionIds.join(",") },
++                  { signal, sseMaxRetryAttempts: 0 },
++                )
++                return {
++                  stream: (async function* () {
++                    for await (const ev of res.stream) yield wrap(ev)
++                  })(),
+                 }
+               }
+-              return sdk.global.event({
+-                signal,
+-                sseMaxRetryAttempts: 0,
+-              })
++              // Root/global TUI with no attached session: keep the firehose.
++              // The scoped path requires a non-empty set; Phase 9 addresses a
++              // root TUI pointed at the door.
++              return sdk.global.event({ signal, sseMaxRetryAttempts: 0 })
+             },
+             onOpen: async () => {
++              openedAt = Date.now()
+               if (Flag.OPENCODE_EXPERIMENTAL_WORKSPACES) {
+-                // Start syncing workspaces, it's important to do this after
+-                // we've started listening to events
++                // Start syncing workspaces after we've started listening.
+                 await sdk.sync.start().catch(() => {})
+               }
++              // Fetch-on-reconcile closes the no-replay gap (CRITICAL-1).
++              await reconcilePending()
+             },
+             onEvent: handleEvent,
++            // Poll children to follow subagent sessions born after attach and to
++            // keep the scoped set current (D2/D6). No-op for a global TUI.
++            poll: props.sessionID
++              ? { intervalMs: CHILD_POLL_INTERVAL_MS, check: pollChildren }
++              : undefined,
+           })
+ 
+           if (timer) clearTimeout(timer)
+           if (queue.length > 0) flush()
++          if (abort.signal.aborted || ctrl.signal.aborted) break
++
++          if (result.drifted) {
++            // Deliberate reconnect (the child set changed): reconnect NOW with
++            // the new session_ids and reset backoff — not an error drop.
++            attempt = 0
++            continue
++          }
++
++          // NEW-A: only treat this as a fresh start if the stream stayed open
++          // long enough; a quick drop keeps the exponential climbing.
++          const openMs = openedAt ? Date.now() - openedAt : 0
++          openedAt = undefined
++          if (openMs >= MIN_OPEN_RESET_MS) attempt = 0
+           attempt += 1
+-          if (abort.signal.aborted || ctrl.signal.aborted) break
+-
+-          // Exponential backoff
+-          const backoff = Math.min(retryDelay * 2 ** (attempt - 1), maxRetryDelay)
++          // Exponential backoff with up to +25% jitter (herd avoidance).
++          const base = Math.min(retryDelay * 2 ** (attempt - 1), maxRetryDelay)
++          const backoff = base + Math.random() * base * 0.25
+           await new Promise((resolve) => setTimeout(resolve, backoff))
+         }
+       })().catch(() => {})
+diff --git a/packages/tui/src/context/sync.tsx b/packages/tui/src/context/sync.tsx
+index 8a96ff6..8737236 100644
+--- a/packages/tui/src/context/sync.tsx
++++ b/packages/tui/src/context/sync.tsx
+@@ -208,9 +208,10 @@ export const {
+         case "permission.asked": {
+           const request = event.properties
+           if (permission.mode === "auto") {
+-            void sdk.client.permission.reply({
+-              requestID: request.id,
+-              reply: "once",
++            void sdk.client.permission.respond({
++              sessionID: request.sessionID,
++              permissionID: request.id,
++              response: "once",
+               directory,
+               workspace,
+             })
+diff --git a/packages/tui/src/routes/session/permission.tsx b/packages/tui/src/routes/session/permission.tsx
+index 766ed3c..a3399af 100644
+--- a/packages/tui/src/routes/session/permission.tsx
++++ b/packages/tui/src/routes/session/permission.tsx
+@@ -165,9 +165,10 @@ export function PermissionPrompt(props: { request: PermissionRequest; directory?
+           onSelect={(option) => {
+             setStore("stage", "permission")
+             if (option === "cancel") return
+-            void sdk.client.permission.reply({
+-              reply: "always",
+-              requestID: props.request.id,
++            void sdk.client.permission.respond({
++              response: "always",
++              sessionID: props.request.sessionID,
++              permissionID: props.request.id,
+               directory: props.directory,
+               workspace: project.workspace.current(),
+             })
+@@ -177,9 +178,10 @@ export function PermissionPrompt(props: { request: PermissionRequest; directory?
+       <Match when={store.stage === "reject"}>
+         <RejectPrompt
+           onConfirm={(message) => {
+-            void sdk.client.permission.reply({
+-              reply: "reject",
+-              requestID: props.request.id,
++            void sdk.client.permission.respond({
++              response: "reject",
++              sessionID: props.request.sessionID,
++              permissionID: props.request.id,
+               directory: props.directory,
+               message: message || undefined,
+               workspace: project.workspace.current(),
+@@ -415,17 +417,19 @@ export function PermissionPrompt(props: { request: PermissionRequest; directory?
+                     setStore("stage", "reject")
+                     return
+                   }
+-                  void sdk.client.permission.reply({
+-                    reply: "reject",
+-                    requestID: props.request.id,
++                  void sdk.client.permission.respond({
++                    response: "reject",
++                    sessionID: props.request.sessionID,
++                    permissionID: props.request.id,
+                     directory: props.directory,
+                     workspace: project.workspace.current(),
+                   })
+                   return
+                 }
+-                void sdk.client.permission.reply({
+-                  reply: "once",
+-                  requestID: props.request.id,
++                void sdk.client.permission.respond({
++                  response: "once",
++                  sessionID: props.request.sessionID,
++                  permissionID: props.request.id,
+                   directory: props.directory,
+                   workspace: project.workspace.current(),
+                 })
+diff --git a/packages/tui/src/routes/session/question.tsx b/packages/tui/src/routes/session/question.tsx
+index 191d0a9..ee1142e 100644
+--- a/packages/tui/src/routes/session/question.tsx
++++ b/packages/tui/src/routes/session/question.tsx
+@@ -47,16 +47,18 @@ export function QuestionPrompt(props: { request: QuestionRequest; directory?: st
+ 
+   function submit() {
+     const answers = questions().map((_, i) => store.answers[i] ?? [])
+-    void sdk.client.question.reply({
+-      requestID: props.request.id,
++    void sdk.client.session.questionReply({
++      sessionID: props.request.sessionID,
++      questionID: props.request.id,
+       directory: props.directory,
+       answers,
+     })
+   }
+ 
+   function reject() {
+-    void sdk.client.question.reject({
+-      requestID: props.request.id,
++    void sdk.client.session.questionReject({
++      sessionID: props.request.sessionID,
++      questionID: props.request.id,
+       directory: props.directory,
+     })
+   }
+@@ -71,8 +73,9 @@ export function QuestionPrompt(props: { request: QuestionRequest; directory?: st
+       setStore("custom", inputs)
+     }
+     if (single()) {
+-      void sdk.client.question.reply({
+-        requestID: props.request.id,
++      void sdk.client.session.questionReply({
++        sessionID: props.request.sessionID,
++        questionID: props.request.id,
+         directory: props.directory,
+         answers: [[answer]],
+       })
+diff --git a/packages/tui/src/util/sse.ts b/packages/tui/src/util/sse.ts
+index bad5735..fd209a6 100644
+--- a/packages/tui/src/util/sse.ts
++++ b/packages/tui/src/util/sse.ts
+@@ -23,14 +23,29 @@
+  *
+  * Never throws: connect/iterate errors are swallowed so the caller's reconnect
+  * loop continues (matches the prior inline behavior).
++ *
++ * `poll` (optional) runs a concurrent check every `intervalMs` against the
++ * attempt's OWN per-attempt signal. When `check` returns true the attempt is
++ * ended early (its controller aborted, like a drop) and the result reports
++ * `drifted: true` so the caller can reconnect IMMEDIATELY (reset backoff)
++ * instead of applying error backoff. Used in Phase 8 to reconnect the
++ * session-scoped stream when the active session's child set changes (bead
++ * workstation-mlve.3). A throwing or false `check` never ends the attempt. The
++ * poller reuses the existing per-attempt controller — it does NOT chain a new
++ * AbortSignal.any off the long-lived parent, which is what leaked listeners in
++ * the pre-lyj0 form.
+  */
+ export async function runSseAttempt<T>(opts: {
+   open: (signal: AbortSignal) => Promise<{ stream: AsyncIterable<T> }>
+   onEvent: (event: T) => void
+   parentSignal: AbortSignal
+   onOpen?: () => void | Promise<void>
+-}): Promise<void> {
+-  const { open, onEvent, parentSignal, onOpen } = opts
++  poll?: {
++    intervalMs: number
++    check: (signal: AbortSignal) => Promise<boolean>
++  }
++}): Promise<{ drifted: boolean }> {
++  const { open, onEvent, parentSignal, onOpen, poll } = opts
+ 
+   const attempt = new AbortController()
+   const onParentAbort = () => attempt.abort()
+@@ -41,9 +56,42 @@ export async function runSseAttempt<T>(opts: {
+     parentSignal.addEventListener("abort", onParentAbort, { once: true })
+   }
+ 
++  let drifted = false
++  let pollTimer: ReturnType<typeof setTimeout> | undefined
++  const stopPoll = () => {
++    if (pollTimer !== undefined) {
++      clearTimeout(pollTimer)
++      pollTimer = undefined
++    }
++  }
++  const schedulePoll = () => {
++    if (!poll || attempt.signal.aborted) return
++    pollTimer = setTimeout(async () => {
++      pollTimer = undefined
++      if (attempt.signal.aborted) return
++      let reconnect = false
++      try {
++        reconnect = await poll.check(attempt.signal)
++      } catch {
++        // A failing check (server down/flaky) must NEVER reconnect.
++        reconnect = false
++      }
++      if (attempt.signal.aborted) return
++      if (reconnect) {
++        // The subscription set changed — end this attempt so the caller's loop
++        // reconnects with the new set.
++        drifted = true
++        attempt.abort()
++        return
++      }
++      schedulePoll()
++    }, poll.intervalMs)
++  }
++
+   try {
+     const events = await open(attempt.signal)
+     await onOpen?.()
++    schedulePoll()
+     for await (const event of events.stream) {
+       if (attempt.signal.aborted) break
+       onEvent(event)
+@@ -52,7 +100,10 @@ export async function runSseAttempt<T>(opts: {
+     // Connect/stream error (non-2xx, refused connection, mid-stream drop):
+     // swallow and let the caller back off + reconnect.
+   } finally {
++    stopPoll()
+     attempt.abort()
+     parentSignal.removeEventListener("abort", onParentAbort)
+   }
++
++  return { drifted }
+ }
