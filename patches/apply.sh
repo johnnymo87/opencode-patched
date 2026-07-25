@@ -277,6 +277,23 @@
 #                                               repoints toggle + post-toggle refresh to session-scoped SDK methods,
 #                                               resolves root session ID for child/subagent sessions, and leaves
 #                                               bootstrap status call global.
+#  24. opus5-adaptive-thinking.patch (PR #38757) - generalize Claude adaptive-thinking gating in
+#                                               provider/transform.ts. Upstream commit 2b2aacc9 (in v1.18.5)
+#                                               replaces the two-part-version regexes anthropicOpus47OrLater
+#                                               (/opus-(\d+)[.-](\d+)/) and anthropicSonnet5OrLater with a single
+#                                               anthropicUsesModernAdaptiveThinking that makes the minor OPTIONAL
+#                                               (/claude-(?:[a-z]+-)?(\d+)(?:[.-](\d{1,2}))?/), so single-part IDs
+#                                               like claude-opus-5 are recognized (major 5 > 4 -> adaptive).
+#                                               WHY: on v1.17.13 claude-opus-5 fell through anthropicAdaptiveEfforts
+#                                               (=null), so variants() emitted the legacy {thinking:{type:"enabled",
+#                                               budgetTokens}} for the high/max variants. Vertex/Anthropic opus-5
+#                                               REJECTS type:"enabled" ("use thinking.type.adaptive + output_config.
+#                                               effort") -> 400 on any build/plan turn carrying variant high/max.
+#                                               Only the transform.ts source hunks are ported (the upstream test hunk
+#                                               and the opus-4-5 anthropicEffort/reasoningEffort hunks target a later
+#                                               refactor not present in v1.17.13; opus-4-5 keeps its v1.17.13 {effort}
+#                                               body via the new anthropicOpus45 predicate). SUNSET: drop on the
+#                                               upstream bump to >= v1.18.5.
 #
 # DROPPED on the v1.17 line (see workstation docs/plans/2026-06-11-opencode-1.17-cutover-runbook.md):
 #   - integration-list-batch.patch: DROPPED on the v1.17.13 roll-forward (2026-07-06).
@@ -362,6 +379,7 @@ PATCHES=(
   tui-door-tests
   session-mcp-routes
   tui-mcp-dialog
+  opus5-adaptive-thinking
 )
 
 for name in "${PATCHES[@]}"; do
