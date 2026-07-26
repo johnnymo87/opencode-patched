@@ -677,7 +677,7 @@
  import { startServeHeartbeat } from "../../serve/heartbeat"
  import { effectCmd } from "../effect-cmd"
  import { withNetworkOptions, resolveNetworkOptions } from "../network"
-@@ -26,6 +26,54 @@
+@@ -26,6 +26,66 @@
        const serveId = Flag.OPENCODE_SERVE_ID
        const instanceUuid = randomUUID()
        const endpoint = `http://127.0.0.1:${server.port}`
@@ -699,6 +699,18 @@
 +      // unit gets noticed; a silently-unfenced serve does not — the 2026-07-25
 +      // incident ran for hours precisely because nothing was loud), and the pool
 +      // degrades from K to K-1, which is what a pool is for.
++      // DELIBERATE RESIDUAL, do not "fix" this into a regression: a process with a
++      // COMPLETE and CORRECT inherited identity (SERVE_ID + ROUTING_DB +
++      // EXPECTED_PORT) that actually manages to BIND the expected port passes the
++      // fence and claims the slot. That is intended. Binding the port is only
++      // possible when the real pool member is not holding it, and at that moment
++      // possession of the port is exactly what "being the pool member" means — the
++      // kernel is the arbiter, which is the whole reason the port was chosen as the
++      // token. Tightening this (e.g. also requiring a systemd INVOCATION_ID, or
++      // refusing while another row looks live) reintroduces the failure mode that
++      // got the "refuse takeover while the slot looks live" design rejected: a
++      // registration-refused-but-still-running serve has a null identity, and
++      // withSessionLease FAILS OPEN on null identity.
 +      const fence = checkServePortFence(Flag.OPENCODE_SERVE_EXPECTED_PORT, server.port)
 +      if (fence.armed && !fence.ok) {
 +        const detail =
@@ -732,7 +744,7 @@
        const lease = yield* Effect.promise(() => getSharedRoutingLease())
        yield* Effect.promise(() => lease.registerSelf({ serveId, instanceUuid, endpoint }))
        
-@@ -45,6 +93,47 @@
+@@ -45,6 +105,47 @@
            )
            console.log(`serve heartbeat started (mode=${heartbeat.mode}, interval=${intervalMs}ms)`)
  
