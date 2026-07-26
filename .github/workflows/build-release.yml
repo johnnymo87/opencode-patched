@@ -84,6 +84,24 @@ jobs:
           cd opencode-src/packages/sdk/js && bun test test/door-scope.test.ts
           cd ../../tui && bun test test/util/sse.test.ts test/util/route.test.ts
 
+      # Part B tripwire (bead workstation-fdb1): the bound on the TUI's pending
+      # reconcile. reconcile.test.ts pins the guard's decision logic; the two
+      # component tests pin that context/sdk.tsx and context/sync.tsx actually USE
+      # it, driving the real SSE reconnect loop and the real bootstrap. All four run
+      # headless (verified with no TTY, TERM unset, CI=true) and take ~30s.
+      #
+      # Every assertion in these files has been mutation-proved: 17 targeted
+      # mutations of src/util/reconcile.ts, src/util/sse.ts, src/context/sdk.tsx and
+      # src/context/sync.tsx each turn at least one of them red. Without this step
+      # they would be inert -- build-release runs only the files named here.
+      - name: Part B pending-reconcile bound tests
+        run: |
+          cd opencode-src/packages/tui
+          bun test \
+            test/util/reconcile.test.ts \
+            test/cli/tui/reconcile-bound.test.tsx \
+            test/cli/cmd/tui/bootstrap-settled.test.tsx
+
       - name: Build CLI
         run: |
           cd opencode-src/packages/opencode

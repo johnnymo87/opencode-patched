@@ -1,0 +1,1286 @@
+diff --git a/packages/tui/src/util/reconcile.ts b/packages/tui/src/util/reconcile.ts
+new file mode 100644
+index 0000000..c9632fc
+--- /dev/null
++++ b/packages/tui/src/util/reconcile.ts
+@@ -0,0 +1,242 @@
++/**
++ * Part B (bead workstation-fdb1): bound the TUI's fetch-on-reconnect reconcile so
++ * a PERSISTENT reconcile error can no longer brick the TUI.
++ *
++ * Background. `context/sdk.tsx` fetches the pending permission/question lists in
++ * `runSseAttempt`'s `onOpen` — i.e. AFTER the SSE response headers arrive but
++ * BEFORE the `for await` pump starts consuming events. That ordering is
++ * load-bearing: it guarantees every injected pending record is applied strictly
++ * before any live event, so a `permission.replied` that races the fetch can never
++ * be undone by a stale re-add. Throwing from `onOpen` ends the attempt, which
++ * makes the caller reconnect with backoff and retry the reconcile. For a
++ * TRANSIENT failure that is exactly right (a reconnect delivers only FUTURE
++ * events, so a prompt asked during the gap is lost, not late — retry is the only
++ * safe recovery).
++ *
++ * For a PERSISTENT failure it was catastrophic: throw -> attempt ends before the
++ * pump -> reconnect -> same failure -> infinite reconnect -> the TUI never pumps
++ * a single event. The user sees a session frozen on a spinner forever and the
++ * only way out is a serve-pool restart, which kills every other live session.
++ *
++ * The bound. Count CONSECUTIVE reconcile-attempt failures of ANY kind (there is
++ * deliberately NO transient/permanent taxonomy — misclassifying a permanent error
++ * as transient is exactly the bug, and misclassifying a transient one costs the
++ * whole point of the retry). After `maxFailures`, PROCEED-DEGRADED: swallow the
++ * error so the caller starts the event pump, notify the user once per episode, and
++ * let a slow-cadence forced reconnect (`shouldReconnect`) retry the reconcile in
++ * the same safe pre-pump position. Any successful reconcile ends the episode.
++ *
++ * What degraded actually costs, precisely — it is NARROWER than it sounds, and
++ * getting this wrong in either direction leads to mistuning the cadence below.
++ * While degraded AND connected, live `*.asked` events still flow through the pump
++ * normally; the reconcile only ever existed to cover the RECONNECT GAP. So the loss
++ * is exactly: a prompt asked during a gap stays invisible until the next successful
++ * reconcile. Bounded, notified, and self-healing — as opposed to an unbounded,
++ * invisible, operator-only-recoverable freeze in which NOTHING renders at all.
++ *
++ * KNOWN STEADY STATE, not a bug: `settleAll` reports the batch failed if ANY
++ * session in it failed, and only a fully clean batch clears the episode. A child
++ * session that is permanently gone (Session.children() has no liveness filter, and
++ * a storage-missing session is a deterministic 404) therefore pins an otherwise
++ * healthy TUI in degraded state indefinitely — one forced reconnect every
++ * `degradedRetryMs`, forever. That is still strictly better than the freeze it
++ * replaces (the healthy sessions' prompts DO land, because settleAll lets every
++ * sibling finish), and it follows from the approved spec's "the counter reflects the
++ * attempt as a whole". Recovering on "the ACTIVE session's own reads succeeded", or
++ * pruning definitively-not-found children from the set, is the fix; it is a spec
++ * change and is tracked separately. Do not "simplify" this into silent per-session
++ * failure swallowing — that is the fail-open hole this whole file exists to avoid.
++ */
++
++const num = (value: string | undefined) => {
++  if (value === undefined || value === "") return Number.NaN
++  return Number(value)
++}
++
++/** Positive integer or fallback. Rejects 0/negative/NaN: `OPENCODE_RECONCILE_MAX_FAILURES=0`
++ * would make `failures < max` false on the FIRST failure, i.e. degrade instantly with
++ * zero retry budget, silently discarding the transient-recovery behavior. */
++export function resolveMaxFailures(value: string | undefined, fallback: number) {
++  const n = num(value)
++  return Number.isInteger(n) && n > 0 ? n : fallback
++}
++
++/** Positive duration or fallback. Same reasoning: 0 must not mean "immediately". */
++export function resolveMs(value: string | undefined, fallback: number) {
++  const n = num(value)
++  return Number.isFinite(n) && n > 0 ? n : fallback
++}
++
++const env = (name: string) => (typeof process !== "undefined" ? process.env?.[name] : undefined)
++
++/** Consecutive failed reconcile attempts tolerated before proceeding degraded.
++ * Override with OPENCODE_RECONCILE_MAX_FAILURES. 3 rides the SSE loop's existing
++ * ~1s + ~2s jittered backoff, so a genuinely transient blip still recovers with a
++ * full reconcile. */
++export const RECONCILE_MAX_FAILURES_DEFAULT = 3
++
++/** How long to stay degraded before forcing a full reconnect to retry the
++ * reconcile. Override with OPENCODE_RECONCILE_DEGRADED_RETRY_MS. A full reconnect
++ * (not a periodic re-fetch) is deliberate: a re-fetch concurrent with the running
++ * event pump would break the "injects strictly precede pumped events" ordering
++ * above, while a reconnect re-runs the reconcile in the safe pre-pump position for
++ * free.
++ *
++ * The cadence is slow because a reconnect is not free — `/event` has no replay, so
++ * a reconnect drops whatever was published in its gap. But that gap is SMALLER than
++ * it looks: the server registers its event listener eagerly, before the response
++ * body fiber starts, into an unbounded queue (see the "Listener registration is
++ * eager" comment in server/.../handlers/event.ts), so the loss window is only
++ * abort -> new-subscribe-headers — sub-second on a door that can accept
++ * connections — NOT the whole reconcile. The fork already reconnects on every
++ * child-set change via the ~5s drift poll, so one extra reconnect per few minutes
++ * is marginal against that baseline. */
++export const RECONCILE_DEGRADED_RETRY_DEFAULT_MS = 180_000
++
++/** Default deadline for one whole reconcile batch. Override with
++ * OPENCODE_RECONCILE_TIMEOUT_MS. Generous: the pending lists are an in-memory
++ * filter server-side, so 10s is far beyond any healthy response. */
++export const RECONCILE_TIMEOUT_DEFAULT_MS = 10_000
++
++/**
++ * The combined abort signal for ONE reconcile batch: the caller's per-attempt
++ * signal plus a deadline.
++ *
++ * CRITICAL — without the deadline the whole bound below is defeated. The SDK's
++ * default fetch sets `req.timeout = false` (packages/sdk/js/src/v2/client.ts) and
++ * `opencode attach` passes no fetch override, so a HUNG read never resolves, never
++ * rejects, and therefore never counts as a failure: `await onOpen` hangs forever,
++ * the event pump never starts, and no number of retries is ever attempted. A hang
++ * is a more likely real-world shape than a clean 502 (a wedged serve, a door
++ * waiting on an unresponsive upstream), so it MUST be converted into a countable
++ * rejection.
++ *
++ * ONE `AbortSignal.any` per batch, shared by every request in it — not one per
++ * request. Chaining an `any` per request off the attempt signal is precisely the
++ * listener-accumulation shape that produced MaxListenersExceededWarning in bead
++ * workstation-lyj0.
++ *
++ * `ms` is read lazily rather than captured at module load so it stays tunable at
++ * runtime (and injectable from tests).
++ */
++export function reconcileDeadline(parentSignal?: AbortSignal, ms?: number): AbortSignal {
++  const timeout = AbortSignal.timeout(ms ?? resolveMs(env("OPENCODE_RECONCILE_TIMEOUT_MS"), RECONCILE_TIMEOUT_DEFAULT_MS))
++  return parentSignal ? AbortSignal.any([parentSignal, timeout]) : timeout
++}
++
++export type ReconcileFailureContext = {
++  /** Consecutive failed attempts, including this one. */
++  failures: number
++  /** False while retry budget remains (this failure is about to be rethrown so the
++   * caller reconnects); true once the budget is spent and the caller will proceed. */
++  degraded: boolean
++  /** True only on the FIRST degraded attempt of an episode — the one-toast-per-episode
++   * latch. Always false while `degraded` is false. */
++  first: boolean
++}
++
++export type ReconcileGuard = {
++  /**
++   * Run one reconcile attempt. Rethrows while there is retry budget left (the
++   * caller must end the SSE attempt and reconnect); resolves once the budget is
++   * spent (the caller must proceed and start the event pump).
++   *
++   * `signal` is the attempt's abort signal. A rejection observed after it aborted
++   * is TEARDOWN (session switch, provider cleanup), not a reconcile failure, and
++   * must not be counted — otherwise switching sessions on a healthy door walks the
++   * counter toward a bogus degraded episode.
++   */
++  run(attempt: () => Promise<void>, signal?: AbortSignal): Promise<void>
++  /** True when a degraded episode has lasted long enough to warrant a forced reconnect. */
++  shouldReconnect(): boolean
++  readonly degraded: boolean
++  readonly failures: number
++}
++
++export function createReconcileGuard(opts?: {
++  maxFailures?: number
++  degradedRetryMs?: number
++  now?: () => number
++  /** Called on EVERY counted failure, degraded or not. Pre-degrade failures are
++   * otherwise completely invisible — runSseAttempt swallows the rethrow and the
++   * startSSE loop has a bare `.catch(() => {})` — so a recurring 2-failure blip
++   * would leave no trace at all. Log every call; toast only when `first`. */
++  onFailure?: (error: unknown, ctx: ReconcileFailureContext) => void
++  /** Called on the first successful reconcile that ends a degraded episode. */
++  onRecovered?: () => void
++}): ReconcileGuard {
++  // Env resolved at construction (once per SDKProvider), not at module load, so the
++  // knobs stay tunable at runtime and injectable from tests.
++  const maxFailures =
++    opts?.maxFailures ?? resolveMaxFailures(env("OPENCODE_RECONCILE_MAX_FAILURES"), RECONCILE_MAX_FAILURES_DEFAULT)
++  const degradedRetryMs =
++    opts?.degradedRetryMs ??
++    resolveMs(env("OPENCODE_RECONCILE_DEGRADED_RETRY_MS"), RECONCILE_DEGRADED_RETRY_DEFAULT_MS)
++  const now = opts?.now ?? (() => Date.now())
++
++  let failures = 0
++  // When the CURRENT degraded attempt proceeded. undefined <=> not degraded.
++  let degradedSince: number | undefined
++  // One notification per episode; cleared only by a successful reconcile.
++  let notified = false
++
++  return {
++    async run(attempt: () => Promise<void>, signal?: AbortSignal) {
++      try {
++        await attempt()
++      } catch (error) {
++        if (signal?.aborted) throw error
++        failures += 1
++        // NOTE: `failures` is intentionally NOT reset when degrading. Once an
++        // episode is open, every subsequent failed attempt degrades immediately
++        // rather than spending another retry budget — the door is already known
++        // sick, and re-spending the budget would mean another 3 frozen attempts
++        // per forced reconnect.
++        if (failures < maxFailures) {
++          opts?.onFailure?.(error, { failures, degraded: false, first: false })
++          throw error
++        }
++        degradedSince = now()
++        const first = !notified
++        notified = true
++        opts?.onFailure?.(error, { failures, degraded: true, first })
++        return
++      }
++      const wasDegraded = degradedSince !== undefined
++      failures = 0
++      degradedSince = undefined
++      notified = false
++      if (wasDegraded) opts?.onRecovered?.()
++    },
++    shouldReconnect() {
++      if (degradedSince === undefined) return false
++      return now() - degradedSince >= degradedRetryMs
++    },
++    get degraded() {
++      return degradedSince !== undefined
++    },
++    get failures() {
++      return failures
++    },
++  }
++}
++
++/**
++ * `Promise.allSettled` semantics with a rethrow: every task runs to completion,
++ * and the batch as a whole is reported failed if any task failed.
++ *
++ * Why not `Promise.all`: `Promise.all` does not cancel siblings, but it DOES
++ * return at the first rejection — so the caller tears the SSE attempt down while
++ * sibling injects are still in flight, and those injects land outside the
++ * "strictly before the event pump" window the reconcile ordering depends on. It
++ * also means one dead child session fails the reconcile for its healthy parent.
++ * `allSettled` closes both by construction while still reporting "the attempt as a
++ * whole failed" to the bound above.
++ */
++export async function settleAll(tasks: Iterable<Promise<unknown>>): Promise<void> {
++  const results = await Promise.allSettled(tasks)
++  const reasons = results.filter((r) => r.status === "rejected").map((r) => (r as PromiseRejectedResult).reason)
++  if (reasons.length === 0) return
++  if (reasons.length === 1) throw reasons[0]
++  throw new AggregateError(reasons, `${reasons.length} of ${results.length} reconcile fetches failed`)
++}
+diff --git a/packages/tui/src/util/sse.ts b/packages/tui/src/util/sse.ts
+index fd209a6..aa2029e 100644
+--- a/packages/tui/src/util/sse.ts
++++ b/packages/tui/src/util/sse.ts
+@@ -39,7 +39,10 @@ export async function runSseAttempt<T>(opts: {
+   open: (signal: AbortSignal) => Promise<{ stream: AsyncIterable<T> }>
+   onEvent: (event: T) => void
+   parentSignal: AbortSignal
+-  onOpen?: () => void | Promise<void>
++  // Receives the SAME per-attempt signal as `open`, so work onOpen kicks off (the
++  // Part B pending reconcile) is torn down with the attempt instead of leaving
++  // stragglers that outlive it (bead workstation-fdb1).
++  onOpen?: (signal: AbortSignal) => void | Promise<void>
+   poll?: {
+     intervalMs: number
+     check: (signal: AbortSignal) => Promise<boolean>
+@@ -90,7 +93,7 @@ export async function runSseAttempt<T>(opts: {
+ 
+   try {
+     const events = await open(attempt.signal)
+-    await onOpen?.()
++    await onOpen?.(attempt.signal)
+     schedulePoll()
+     for await (const event of events.stream) {
+       if (attempt.signal.aborted) break
+diff --git a/packages/tui/src/context/sdk.tsx b/packages/tui/src/context/sdk.tsx
+index f0c35ad..74575a3 100644
+--- a/packages/tui/src/context/sdk.tsx
++++ b/packages/tui/src/context/sdk.tsx
+@@ -3,7 +3,9 @@ import type { Event, GlobalEvent, Session } from "@opencode-ai/sdk/v2"
+ import { Flag } from "@opencode-ai/core/flag/flag"
+ import { createSimpleContext } from "./helper"
+ import { useRoute } from "./route"
++import { useToast } from "../ui/toast"
+ import { runSseAttempt } from "../util/sse"
++import { createReconcileGuard, reconcileDeadline, settleAll } from "../util/reconcile"
+ import { batch, createEffect, onCleanup, onMount } from "solid-js"
+ 
+ export type EventSource = {
+@@ -35,11 +37,12 @@ const CHILD_POLL_INTERVAL_MS = (() => {
+ // this long. Otherwise an owner-drift flap or an accept-then-die serve could
+ // reset backoff every attempt and create a ~1s reconnect hammer. A short-lived
+ // (re)connect counts as a failed attempt and keeps the exponential climbing.
+-const MIN_OPEN_RESET_MS = (() => {
++// Read lazily (Part B) so it is tunable at runtime and injectable from tests.
++const minOpenResetMs = () => {
+   const env = typeof process !== "undefined" ? process.env?.OPENCODE_SSE_MIN_OPEN_MS : undefined
+   const n = env ? Number(env) : Number.NaN
+   return Number.isFinite(n) && n > 0 ? n : 10000
+-})()
++}
+ 
+ // CRITICAL: the front door caps a multi-session subscribe at MAX_SESSION_IDS=32
+ // (400 "too many session_ids"), and Session.children() returns EVERY child row
+@@ -60,6 +63,7 @@ export const { use: useSDK, provider: SDKProvider } = createSimpleContext({
+     events?: EventSource
+   }) => {
+     const route = useRoute()
++    const toast = useToast()
+     const abort = new AbortController()
+     let sse: AbortController | undefined
+ 
+@@ -161,13 +165,26 @@ export const { use: useSDK, provider: SDKProvider } = createSimpleContext({
+     // this hole. Throwing ends the attempt so the caller reconnects and retries
+     // the reconcile (with backoff) — the poll only detects set *changes*, never
+     // a missed pending, so retry-via-reconnect is the only safe recovery.
+-    const reconcilePending = async () => {
++    //
++    // PART B (bead workstation-fdb1) changed two things about that throw:
++    //  - it is now BOUNDED by reconcileGuard, because "throw and retry forever"
++    //    turned any PERSISTENT error into an infinite reconnect loop that never
++    //    started the event pump — a permanently frozen TUI (see util/reconcile.ts);
++    //  - the fan-out is allSettled (settleAll), not Promise.all, so one dead child
++    //    session neither aborts its healthy siblings' in-flight reads nor lets
++    //    their injects land after the attempt has already been torn down.
++    // Every read shares ONE deadline signal (reconcileDeadline): the SDK's default
++    // fetch disables request timeouts, so a hung read would otherwise never resolve,
++    // never reject, and never be counted as a failure — `await onOpen` would hang
++    // forever and the bound would never engage.
++    const reconcilePending = async (parentSignal?: AbortSignal) => {
+       if (!activeSessionID) return
+-      await Promise.all(
++      const signal = reconcileDeadline(parentSignal)
++      await settleAll(
+         sessionIds.map(async (sid) => {
+-          const perms = await sdk.session.permissions({ sessionID: sid })
++          const perms = await sdk.session.permissions({ sessionID: sid }, { signal })
+           if (perms.error) throw perms.error
+-          const quests = await sdk.session.questions({ sessionID: sid })
++          const quests = await sdk.session.questions({ sessionID: sid }, { signal })
+           if (quests.error) throw quests.error
+           if (perms.data) for (const p of perms.data) inject("permission.asked", p, `permission:${p.id}`)
+           if (quests.data) for (const q of quests.data) inject("question.asked", q, `question:${q.id}`)
+@@ -175,6 +192,32 @@ export const { use: useSDK, provider: SDKProvider } = createSimpleContext({
+       )
+     }
+ 
++    // PART B: bound the reconcile. One guard per SDKProvider so the consecutive
++    // count and the one-toast-per-episode latch survive the reconnects (and the D6
++    // session switches) that make up a single episode. An attempt aborted by
++    // teardown is not counted (see ReconcileGuard.run).
++    const reconcileGuard = createReconcileGuard({
++      onFailure: (error, ctx) => {
++        // Captured by opentui's console (toggleable in-TUI, "save logs"), so an
++        // episode is diagnosable after the fact — otherwise EVERY error on this path
++        // is swallowed (runSseAttempt's catch, the startSSE .catch) and the toast is
++        // the only trace. Logged on every counted failure, degraded or not: the
++        // repetition is how you tell a 30-second blip from an hour-long outage, and
++        // pre-degrade failures are what tell you a retry actually worked.
++        console.error("tui pending-reconcile failed", {
++          failures: ctx.failures,
++          degraded: ctx.degraded,
++          sessionIds: sessionIds.join(","),
++          error,
++        })
++        if (!ctx.degraded || !ctx.first) return
++        toast.show({ variant: "warning", message: "Pending requests unavailable - retrying in background" })
++      },
++      onRecovered: () => {
++        console.error("tui pending-reconcile recovered")
++      },
++    })
++
+     // D2 poll: keep the session_ids set = {active} ∪ live children (bounded to
+     // MAX_CHILDREN, newest-active first, so it never exceeds the door cap), and
+     // reconcile newly-appearing child Session.Info into the store (CRITICAL-3)
+@@ -214,6 +257,18 @@ export const { use: useSDK, provider: SDKProvider } = createSimpleContext({
+       return false
+     }
+ 
++    // PART B: while degraded, force a slow-cadence FULL RECONNECT so the reconcile
++    // is retried in the one position where it is safe — before the pump starts.
++    // Piggy-backing on the existing per-attempt poller means no new timer and no new
++    // teardown path: `true` here aborts the attempt and reports `drifted`, which the
++    // loop already treats as "reconnect now, this was not an error". A periodic
++    // re-FETCH instead would run concurrently with the live pump and break the
++    // "injects strictly precede pumped events" ordering the reconcile depends on.
++    const pollCheck = async (signal: AbortSignal): Promise<boolean> => {
++      if (await pollChildren(signal)) return true
++      return reconcileGuard.shouldReconnect()
++    }
++
+     function startSSE() {
+       sse?.abort()
+       const ctrl = new AbortController()
+@@ -254,22 +309,28 @@ export const { use: useSDK, provider: SDKProvider } = createSimpleContext({
+               // (D6 effect) upgrades this to the scoped stream.
+               return sdk.global.event({ signal, sseMaxRetryAttempts: 0 })
+             },
+-            onOpen: async () => {
+-              openedAt = Date.now()
++            onOpen: async (signal) => {
+               if (Flag.OPENCODE_EXPERIMENTAL_WORKSPACES) {
+                 // Start syncing workspaces after we've started listening.
+                 await sdk.sync.start().catch(() => {})
+               }
+-              // Fetch-on-reconcile closes the no-replay gap (CRITICAL-1). May
+-              // throw → attempt ends → reconnect + retry (see reconcilePending).
+-              await reconcilePending()
++              // Fetch-on-reconcile closes the no-replay gap (CRITICAL-1). Throws
++              // while retry budget remains → attempt ends → reconnect + retry;
++              // resolves once the budget is spent → proceed degraded and let the
++              // pump start (PART B, see util/reconcile.ts).
++              await reconcileGuard.run(() => reconcilePending(signal), signal)
++              // PART B: openedAt is stamped AFTER the reconcile, not before. Stamped
++              // before, a reconcile that failed slowly (a 12s gateway timeout) still
++              // counted as ">= MIN_OPEN_RESET_MS open", so `attempt` was reset to 0
++              // on EVERY iteration and the "exponential backoff" collapsed into a
++              // ~1s reconnect hammer against an already-sick door. Left undefined on
++              // a throw, so a failed attempt always keeps the exponential climbing.
++              openedAt = Date.now()
+             },
+             onEvent: handleEvent,
+             // Poll children to follow subagent sessions born after attach and to
+             // keep the scoped set current (D2/D6). No-op for a global TUI.
+-            poll: activeSessionID
+-              ? { intervalMs: CHILD_POLL_INTERVAL_MS, check: pollChildren }
+-              : undefined,
++            poll: activeSessionID ? { intervalMs: CHILD_POLL_INTERVAL_MS, check: pollCheck } : undefined,
+           })
+ 
+           if (timer) clearTimeout(timer)
+@@ -287,7 +348,7 @@ export const { use: useSDK, provider: SDKProvider } = createSimpleContext({
+           // long enough; a quick drop keeps the exponential climbing.
+           const openMs = openedAt ? Date.now() - openedAt : 0
+           openedAt = undefined
+-          if (openMs >= MIN_OPEN_RESET_MS) attempt = 0
++          if (openMs >= minOpenResetMs()) attempt = 0
+           attempt += 1
+           // Exponential backoff with up to +25% jitter (herd avoidance).
+           const base = Math.min(retryDelay * 2 ** (attempt - 1), maxRetryDelay)
+diff --git a/packages/tui/src/context/sync.tsx b/packages/tui/src/context/sync.tsx
+index df21989..9d379fd 100644
+--- a/packages/tui/src/context/sync.tsx
++++ b/packages/tui/src/context/sync.tsx
+@@ -531,7 +531,15 @@ export const {
+         .then(() => {
+           if (store.status !== "complete") setStore("status", "partial")
+           // non-blocking
+-          void Promise.all([
++          //
++          // allSettled, NOT all (bead workstation-fdb1): one rejection here used to
++          // (a) skip setStore("status","complete") forever, which strands the
++          // `--session --fork` auto-fork gated on status === "complete" (app.tsx),
++          // and (b) surface as an UNHANDLED rejection, because this promise is
++          // `void`ed rather than returned into the outer .catch below. None of these
++          // reads is load-bearing enough to justify either. Each `.then` still
++          // applies its own result, so a partial success is a partial store update.
++          void Promise.allSettled([
+             ...(args.continue ? [] : [sessionListPromise.then((sessions) => setStore("session", reconcile(sessions)))]),
+             consoleStatePromise.then((consoleState) => setStore("console_state", reconcile(consoleState))),
+             sdk.client.command.list({ workspace }).then((x) => setStore("command", reconcile(x.data ?? []))),
+@@ -547,7 +555,13 @@ export const {
+             sdk.client.provider.auth({ workspace }).then((x) => setStore("provider_auth", reconcile(x.data ?? {}))),
+             sdk.client.vcs.get({ workspace }).then((x) => setStore("vcs", reconcile(x.data))),
+             project.workspace.sync(),
+-          ]).then(() => {
++          ]).then((results) => {
++            for (const result of results) {
++              if (result.status !== "rejected") continue
++              console.error("tui bootstrap non-blocking step failed", {
++                error: result.reason instanceof Error ? result.reason.message : String(result.reason),
++              })
++            }
+             setStore("status", "complete")
+           })
+         })
+diff --git a/packages/tui/test/util/reconcile.test.ts b/packages/tui/test/util/reconcile.test.ts
+new file mode 100644
+index 0000000..0692320
+--- /dev/null
++++ b/packages/tui/test/util/reconcile.test.ts
+@@ -0,0 +1,257 @@
++import { expect, test } from "bun:test"
++import { createReconcileGuard, reconcileDeadline, resolveMaxFailures, resolveMs, settleAll } from "../../src/util/reconcile"
++
++// Part B (bead workstation-fdb1). These tests pin the BOUND on the TUI's
++// fetch-on-reconnect reconcile. Before Part B, `reconcilePending` threw on ANY
++// error and the throw ended the SSE attempt BEFORE the event pump started, so a
++// PERSISTENT error (a door 502, a dead child session, a hung request) produced an
++// infinite reconnect loop and a permanently frozen TUI.
++
++function guardWith(overrides?: Parameters<typeof createReconcileGuard>[0]) {
++  const failed: { error: unknown; failures: number; degraded: boolean; first: boolean }[] = []
++  const recovered: number[] = []
++  let clock = 0
++  const guard = createReconcileGuard({
++    maxFailures: 3,
++    degradedRetryMs: 1000,
++    now: () => clock,
++    onFailure: (error, ctx) => failed.push({ error, ...ctx }),
++    onRecovered: () => recovered.push(clock),
++    ...overrides,
++  })
++  return {
++    guard,
++    failed,
++    /** Only the degraded subset — the calls that carry a user-visible consequence. */
++    get degraded() {
++      return failed.filter((f) => f.degraded)
++    },
++    recovered,
++    tick: (ms: number) => {
++      clock += ms
++    },
++    get clock() {
++      return clock
++    },
++  }
++}
++
++const boom = (message = "502") => async () => {
++  throw new Error(message)
++}
++
++test("(a) a persistent failure proceeds-degraded after exactly maxFailures attempts, toast fires once", async () => {
++  const h = guardWith()
++
++  // Attempts 1..maxFailures-1 RETHROW. The caller (runSseAttempt onOpen) treats a
++  // throw as "end this attempt", so the SSE loop backs off and retries — the
++  // existing transient-recovery behavior, deliberately preserved.
++  await expect(h.guard.run(boom())).rejects.toThrow("502")
++  expect(h.guard.degraded).toBe(false)
++  expect(h.guard.failures).toBe(1)
++  await expect(h.guard.run(boom())).rejects.toThrow("502")
++  expect(h.guard.degraded).toBe(false)
++  expect(h.guard.failures).toBe(2)
++  expect(h.degraded).toEqual([])
++
++  // Attempt 3 does NOT throw: proceed-degraded, so the caller starts the event
++  // pump instead of reconnecting forever. This is the un-brick.
++  await h.guard.run(boom())
++  expect(h.guard.degraded).toBe(true)
++  expect(h.degraded.length).toBe(1)
++  expect(h.degraded[0]!.first).toBe(true)
++  expect(h.degraded[0]!.failures).toBe(3)
++
++  // Still degraded, still no throw (never re-freezes), and NO second notification:
++  // one toast per EPISODE.
++  await h.guard.run(boom())
++  await h.guard.run(boom())
++  expect(h.guard.degraded).toBe(true)
++  expect(h.degraded.length).toBe(3)
++  expect(h.degraded.filter((d) => d.first).length).toBe(1)
++})
++
++test("(b) a transient failure that clears within the bound reconciles fully and never degrades", async () => {
++  const h = guardWith()
++  let calls = 0
++  const flaky = async () => {
++    calls += 1
++    if (calls < 3) throw new Error("transient")
++  }
++
++  await expect(h.guard.run(flaky)).rejects.toThrow("transient")
++  await expect(h.guard.run(flaky)).rejects.toThrow("transient")
++  // The 3rd attempt SUCCEEDS. It must not be counted as a failure and must not
++  // degrade, even though it is the maxFailures-th attempt.
++  await h.guard.run(flaky)
++
++  expect(calls).toBe(3)
++  expect(h.guard.degraded).toBe(false)
++  expect(h.guard.failures).toBe(0)
++  expect(h.degraded).toEqual([])
++  expect(h.guard.shouldReconnect()).toBe(false)
++})
++
++test("(d) the degraded flag and the notification latch reset on the first successful reconcile", async () => {
++  const h = guardWith()
++  const ok = async () => {}
++
++  for (let i = 0; i < 3; i++) await h.guard.run(boom()).catch(() => {})
++  expect(h.guard.degraded).toBe(true)
++  expect(h.degraded.length).toBe(1)
++
++  await h.guard.run(ok)
++  expect(h.guard.degraded).toBe(false)
++  expect(h.guard.failures).toBe(0)
++  expect(h.guard.shouldReconnect()).toBe(false)
++  expect(h.recovered.length).toBe(1)
++
++  // A LATER episode can notify again — the latch is per-episode, not per-process.
++  for (let i = 0; i < 3; i++) await h.guard.run(boom()).catch(() => {})
++  expect(h.guard.degraded).toBe(true)
++  expect(h.degraded.length).toBe(2)
++  expect(h.degraded.at(-1)!.first).toBe(true)
++})
++
++test("EVERY counted failure is reported, not only the degraded ones", async () => {
++  // Pre-degrade failures are otherwise invisible: runSseAttempt swallows the rethrow
++  // and the startSSE loop has a bare .catch(() => {}). Without this a recurring
++  // 2-failure blip against the door leaves no trace anywhere.
++  const h = guardWith()
++  await h.guard.run(boom("first")).catch(() => {})
++  await h.guard.run(boom("second")).catch(() => {})
++  expect(h.failed.map((f) => [f.failures, f.degraded, f.first])).toEqual([
++    [1, false, false],
++    [2, false, false],
++  ])
++  await h.guard.run(boom("third"))
++  expect(h.failed.at(-1)).toMatchObject({ failures: 3, degraded: true, first: true })
++})
++
++test("onRecovered only fires when recovering from degraded, not on every success", async () => {
++  const h = guardWith()
++  await h.guard.run(async () => {})
++  await h.guard.run(async () => {})
++  expect(h.recovered).toEqual([])
++})
++
++test("shouldReconnect gates the slow-cadence degraded reconnect and re-arms on each degraded attempt", async () => {
++  const h = guardWith()
++  expect(h.guard.shouldReconnect()).toBe(false)
++
++  for (let i = 0; i < 3; i++) await h.guard.run(boom()).catch(() => {})
++  expect(h.guard.degraded).toBe(true)
++  // Not yet due: a degraded TUI must not hammer a sick door.
++  expect(h.guard.shouldReconnect()).toBe(false)
++  h.tick(999)
++  expect(h.guard.shouldReconnect()).toBe(false)
++  h.tick(1)
++  expect(h.guard.shouldReconnect()).toBe(true)
++
++  // The forced reconnect re-runs reconcile; a fresh failure re-arms the timer, so
++  // the cadence stays slow instead of collapsing into a reconnect loop.
++  await h.guard.run(boom())
++  expect(h.guard.shouldReconnect()).toBe(false)
++  h.tick(1000)
++  expect(h.guard.shouldReconnect()).toBe(true)
++})
++
++test("an aborted attempt is teardown, not a reconcile failure: it does not count and never degrades", async () => {
++  const h = guardWith()
++  const ctrl = new AbortController()
++  ctrl.abort()
++
++  // A session switch / provider cleanup aborts the attempt, which aborts the
++  // in-flight reconcile fetches. That rejection must not poison the counter of a
++  // healthy door (bead workstation-fdb1, reviewer finding F7).
++  for (let i = 0; i < 5; i++) {
++    await expect(h.guard.run(boom(), ctrl.signal)).rejects.toThrow("502")
++  }
++  expect(h.guard.failures).toBe(0)
++  expect(h.guard.degraded).toBe(false)
++  expect(h.degraded).toEqual([])
++})
++
++test("(c) settleAll runs every task to completion even when one rejects", async () => {
++  const done: string[] = []
++  await expect(
++    settleAll([
++      (async () => {
++        throw new Error("fast-fail")
++      })(),
++      (async () => {
++        await Bun.sleep(20)
++        done.push("slow-sibling")
++      })(),
++      (async () => {
++        await Bun.sleep(40)
++        done.push("slower-sibling")
++      })(),
++    ]),
++  ).rejects.toThrow("fast-fail")
++
++  // With Promise.all the await returns at the FIRST rejection and the siblings'
++  // work lands after the caller has already torn the attempt down — i.e. the
++  // injects escape the "strictly before the event pump" window that the
++  // await-before-pump ordering exists to guarantee. allSettled closes that.
++  expect(done).toEqual(["slow-sibling", "slower-sibling"])
++})
++
++test("settleAll resolves when every task resolves", async () => {
++  await settleAll([Promise.resolve(1), Promise.resolve(2)])
++})
++
++test("settleAll throws the lone reason, and an AggregateError carrying every reason for many", async () => {
++  await expect(settleAll([Promise.reject(new Error("only"))])).rejects.toThrow("only")
++
++  const err = await settleAll([
++    Promise.reject(new Error("first")),
++    Promise.resolve(1),
++    Promise.reject(new Error("second")),
++  ]).catch((e) => e)
++  expect(err).toBeInstanceOf(AggregateError)
++  expect((err as AggregateError).errors.map((e) => (e as Error).message)).toEqual(["first", "second"])
++})
++
++test("reconcileDeadline converts a HANG into a countable rejection", async () => {
++  // Without this the bound never engages at all: the SDK disables request timeouts,
++  // so a hung read leaves `await onOpen` pending forever and no retry is ever tried.
++  const signal = reconcileDeadline(undefined, 50)
++  expect(signal.aborted).toBe(false)
++  await Bun.sleep(120)
++  expect(signal.aborted).toBe(true)
++})
++
++test("reconcileDeadline also honours the caller's attempt signal", () => {
++  // Teardown (session switch / provider cleanup) must actually cancel the in-flight
++  // reads, not leave stragglers that later poison the failure counter.
++  const attempt = new AbortController()
++  const signal = reconcileDeadline(attempt.signal, 60_000)
++  expect(signal.aborted).toBe(false)
++  attempt.abort()
++  expect(signal.aborted).toBe(true)
++})
++
++test("reconcileDeadline with an already-aborted attempt signal is aborted immediately", () => {
++  const attempt = new AbortController()
++  attempt.abort()
++  expect(reconcileDeadline(attempt.signal, 60_000).aborted).toBe(true)
++})
++
++test("env knobs reject junk instead of silently disabling the retry budget", () => {
++  // OPENCODE_RECONCILE_MAX_FAILURES=0 would make `failures < max` false on the
++  // FIRST failure -> degrade instantly with zero retry, silently dropping the
++  // transient-recovery behavior. NaN would do the same.
++  expect(resolveMaxFailures(undefined, 3)).toBe(3)
++  expect(resolveMaxFailures("", 3)).toBe(3)
++  expect(resolveMaxFailures("0", 3)).toBe(3)
++  expect(resolveMaxFailures("-1", 3)).toBe(3)
++  expect(resolveMaxFailures("nope", 3)).toBe(3)
++  expect(resolveMaxFailures("1", 3)).toBe(1)
++  expect(resolveMaxFailures("5", 3)).toBe(5)
++
++  expect(resolveMs(undefined, 1000)).toBe(1000)
++  expect(resolveMs("0", 1000)).toBe(1000)
++  expect(resolveMs("junk", 1000)).toBe(1000)
++  expect(resolveMs("250", 1000)).toBe(250)
++})
+diff --git a/packages/tui/test/util/sse.test.ts b/packages/tui/test/util/sse.test.ts
+index 1e861a7..30db1e1 100644
+--- a/packages/tui/test/util/sse.test.ts
++++ b/packages/tui/test/util/sse.test.ts
+@@ -102,6 +102,63 @@ test("runSseAttempt calls onOpen after the stream opens", async () => {
+   expect(order).toEqual(["open", "onOpen", "event"])
+ })
+ 
++test("runSseAttempt awaits an async onOpen to completion before pumping the first event", async () => {
++  // THE load-bearing invariant of the fetch-on-reconnect reconcile (bead
++  // workstation-fdb1): every record injected by onOpen must be applied strictly
++  // before any live event, so a stale pending record can never re-add itself over
++  // a `*.replied` that raced the fetch. If onOpen is ever fired-and-forgotten this
++  // goes red.
++  const order: string[] = []
++  await runSseAttempt<number>({
++    parentSignal: new AbortController().signal,
++    open: async () => ({ stream: streamOf([1, 2]) }),
++    onOpen: async () => {
++      order.push("onOpen:start")
++      await Bun.sleep(20)
++      order.push("onOpen:end")
++    },
++    onEvent: (e) => order.push(`event:${e}`),
++  })
++  expect(order).toEqual(["onOpen:start", "onOpen:end", "event:1", "event:2"])
++})
++
++test("runSseAttempt hands onOpen the per-attempt signal so its fetches are cancellable", async () => {
++  // Part B threads this signal into the reconcile fetches so an attempt teardown
++  // (session switch / provider cleanup) actually cancels them, instead of leaving
++  // stragglers that later poison the failure counter of a healthy door.
++  let openSignal: AbortSignal | undefined
++  let onOpenSignal: AbortSignal | undefined
++  await runSseAttempt<number>({
++    parentSignal: new AbortController().signal,
++    open: async (signal) => {
++      openSignal = signal
++      return { stream: streamOf([1]) }
++    },
++    onOpen: (signal) => {
++      onOpenSignal = signal
++    },
++    onEvent: () => {},
++  })
++  expect(onOpenSignal).toBeInstanceOf(AbortSignal)
++  expect(onOpenSignal).toBe(openSignal)
++})
++
++test("an onOpen that throws ends the attempt without pumping anything", async () => {
++  // This is the pre-Part-B freeze mechanism, kept deliberately for the
++  // still-has-retry-budget case: a throwing reconcile must NOT deliver events.
++  const events: number[] = []
++  const result = await runSseAttempt<number>({
++    parentSignal: new AbortController().signal,
++    open: async () => ({ stream: streamOf([1, 2, 3]) }),
++    onOpen: async () => {
++      throw new Error("reconcile failed")
++    },
++    onEvent: (e) => events.push(e),
++  })
++  expect(events).toEqual([])
++  expect(result.drifted).toBe(false)
++})
++
+ test("runSseAttempt balances parent-signal listeners across repeated attempts (no accumulation)", async () => {
+   // The original bug accumulated one un-removed AbortSignal.any listener on the
+   // long-lived signal per reconnect, tripping MaxListenersExceededWarning. The
+diff --git a/packages/tui/test/cli/tui/reconcile-bound.test.tsx b/packages/tui/test/cli/tui/reconcile-bound.test.tsx
+new file mode 100644
+index 0000000..0d21bfc
+--- /dev/null
++++ b/packages/tui/test/cli/tui/reconcile-bound.test.tsx
+@@ -0,0 +1,393 @@
++/** @jsxImportSource @opentui/solid */
++import { expect, test } from "bun:test"
++import { testRender } from "@opentui/solid"
++import type { GlobalEvent } from "@opencode-ai/sdk/v2"
++import { createEffect, onMount } from "solid-js"
++import { SDKProvider, useSDK } from "../../../src/context/sdk"
++import { useToast } from "../../../src/ui/toast"
++import { directory, json } from "../../fixture/tui-sdk"
++import { TestTuiContexts } from "../../fixture/tui-environment"
++
++// Part B (bead workstation-fdb1) WIRING proof. test/util/reconcile.test.ts pins the
++// guard's decision logic in isolation; this file pins that context/sdk.tsx actually
++// USES it, end to end through the real SSE reconnect loop:
++//
++//   before Part B: a PERSISTENT reconcile error threw out of onOpen on EVERY
++//   attempt, and the throw ended the attempt BEFORE the `for await` pump started.
++//   Reconnect -> same error -> forever. Zero events were ever delivered: a TUI
++//   frozen on a spinner until an operator restarted the serve pool.
++//
++//   after Part B: the 3rd consecutive failure proceeds degraded, the pump starts,
++//   live events flow, and the user gets one toast.
++
++const sessionID = "ses_root"
++
++const DEGRADED_TOAST = "Pending requests unavailable - retrying in background"
++
++async function wait(fn: () => boolean, timeout = 15000) {
++  const start = Date.now()
++  while (!fn()) {
++    if (Date.now() - start > timeout) throw new Error("timed out waiting for condition")
++    await Bun.sleep(10)
++  }
++}
++
++/** A fake front door. Serves a fresh SSE stream per /event subscribe and lets the
++ * test decide, per attempt, whether the pending-permission read succeeds. */
++function door(opts: { permissions: (attempt: number, signal?: AbortSignal | null) => Response | Promise<Response> }) {
++  const permissionCalls: number[] = []
++  const eventOpens: string[] = []
++  let live: ReadableStreamDefaultController<Uint8Array> | undefined
++
++  const fetchImpl = (async (input: RequestInfo | URL, init?: RequestInit) => {
++    const url = new URL(input instanceof Request ? input.url : String(input))
++    const signal = input instanceof Request ? input.signal : init?.signal
++    if (url.pathname === "/event") {
++      eventOpens.push(url.searchParams.get("session_ids") ?? "")
++      return new Response(
++        new ReadableStream<Uint8Array>({
++          start(controller) {
++            live = controller
++          },
++          cancel() {
++            live = undefined
++          },
++        }),
++        { headers: { "content-type": "text/event-stream", "cache-control": "no-cache" } },
++      )
++    }
++    if (url.pathname.endsWith("/permissions")) {
++      permissionCalls.push(Date.now())
++      return opts.permissions(permissionCalls.length, signal)
++    }
++    if (url.pathname.endsWith("/questions")) return json([])
++    if (url.pathname.endsWith("/children")) return json([])
++    return json({})
++  }) as typeof globalThis.fetch
++
++  return {
++    fetch: fetchImpl,
++    get permissionAttempts() {
++      return permissionCalls.length
++    },
++    eventOpens,
++    emit(payload: unknown) {
++      if (!live) throw new Error("no live event stream")
++      live.enqueue(new TextEncoder().encode(`data: ${JSON.stringify(payload)}\n\n`))
++    },
++    get streamOpen() {
++      return live !== undefined
++    },
++  }
++}
++
++/** Narrow view of the delivered `GlobalEvent` envelope. The payload is a large
++ * discriminated union and `wrap()` synthesizes members of it, so the tests read the
++ * two fields they care about through one shared accessor instead of casting inline. */
++function seen(event: GlobalEvent) {
++  const payload = event.payload as { id?: string; type?: string; properties?: { id?: string } }
++  return { id: payload.id, type: payload.type, propertyID: payload.properties?.id }
++}
++
++async function mount(d: { fetch: typeof globalThis.fetch }) {
++  const events: GlobalEvent[] = []
++  const toasts: string[] = []
++  let ready!: () => void
++  const mounted = new Promise<void>((resolve) => {
++    ready = resolve
++  })
++
++  function Probe() {
++    const sdk = useSDK()
++    const toast = useToast()
++    createEffect(() => {
++      const current = toast.currentToast
++      if (current) toasts.push(current.message)
++    })
++    onMount(() => {
++      sdk.event.on("event", (event) => events.push(event))
++      ready()
++    })
++    return <box />
++  }
++
++  const app = await testRender(() => (
++    <TestTuiContexts>
++      <SDKProvider url="http://door.test" sessionID={sessionID} directory={directory} fetch={d.fetch}>
++        <Probe />
++      </SDKProvider>
++    </TestTuiContexts>
++  ))
++  await mounted
++  return { app, events, toasts }
++}
++
++test(
++  "(a) a PERSISTENT reconcile failure proceeds degraded after 3 attempts: the pump starts and one toast fires",
++  async () => {
++    const d = door({ permissions: () => json({ error: "bad gateway" }, { status: 502 }) })
++    const { app, events, toasts } = await mount(d)
++    try {
++      // 3 consecutive failures (attempts 1 and 2 ride the ~1s/~2s backoff).
++      await wait(() => d.permissionAttempts >= 3)
++      // Proceed-degraded: the stream from attempt 3 stays open and PUMPS.
++      await wait(() => toasts.length >= 1)
++      expect(toasts[0]).toBe(DEGRADED_TOAST)
++
++      await wait(() => d.streamOpen)
++      d.emit({ id: "evt_live", type: "session.idle", properties: { sessionID } })
++      // THE un-brick: before Part B this never arrived, no matter how long you waited.
++      await wait(() => events.some((e) => seen(e).id === "evt_live"))
++
++      // Every /event subscribe stayed session-scoped (no fallback to the firehose).
++      expect(d.eventOpens.every((ids) => ids === sessionID)).toBe(true)
++      // ...and it degraded at 3, not later: no runaway reconnect loop.
++      expect(d.permissionAttempts).toBe(3)
++    } finally {
++      app.renderer.destroy()
++    }
++  },
++  30000,
++)
++
++test(
++  "(b) a TRANSIENT reconcile failure that clears within the bound reconciles fully and shows NO toast",
++  async () => {
++    const pending = {
++      id: "per_pending",
++      sessionID,
++      permission: "bash",
++      patterns: ["ls"],
++      metadata: {},
++      always: [],
++    }
++    const d = door({
++      permissions: (attempt) => (attempt === 1 ? json({ error: "flaky" }, { status: 503 }) : json([pending])),
++    })
++    const { app, events, toasts } = await mount(d)
++    try {
++      // Attempt 2 succeeds, so the pending permission is injected as a synthetic
++      // `permission.asked` through the same event path the live stream uses.
++      await wait(() => events.some((e) => seen(e).type === "permission.asked"))
++      await Bun.sleep(200)
++      expect(toasts).toEqual([])
++      expect(d.permissionAttempts).toBe(2)
++
++      // ...and the pump is live on the SAME attempt that reconciled.
++      await wait(() => d.streamOpen)
++      d.emit({ id: "evt_after_recovery", type: "session.idle", properties: { sessionID } })
++      await wait(() => events.some((e) => seen(e).id === "evt_after_recovery"))
++    } finally {
++      app.renderer.destroy()
++    }
++  },
++  30000,
++)
++
++test(
++  "a HUNG pending read still degrades: the deadline turns it into a countable failure",
++  async () => {
++    // The most likely real shape of this failure, and the one the pre-Part-B code
++    // could not recover from at all: a read that never answers. The SDK's default
++    // fetch sets req.timeout = false, so without reconcileDeadline `await onOpen`
++    // stays pending forever, the pump never starts, and the failure counter never
++    // moves — no reconnect, no backoff, no toast, just a frozen TUI.
++    const previous = process.env.OPENCODE_RECONCILE_TIMEOUT_MS
++    process.env.OPENCODE_RECONCILE_TIMEOUT_MS = "150"
++    const d = door({
++      // Headers arrive, then the body never completes — the shape a wedged serve or
++      // a door blocked on an unresponsive upstream actually has. Only an abort can
++      // end it, which is why the batch deadline has to exist.
++      permissions: (_attempt, signal) =>
++        new Response(
++          new ReadableStream<Uint8Array>({
++            start(controller) {
++              signal?.addEventListener("abort", () => {
++                try {
++                  controller.error(new Error("aborted"))
++                } catch {
++                  // already closed
++                }
++              })
++            },
++          }),
++          { headers: { "content-type": "application/json" } },
++        ),
++    })
++    const { app, toasts } = await mount(d)
++    try {
++      await wait(() => toasts.length >= 1)
++      expect(toasts[0]).toBe(DEGRADED_TOAST)
++      expect(d.permissionAttempts).toBe(3)
++      // The pump is live despite the door still hanging.
++      await wait(() => d.streamOpen)
++    } finally {
++      app.renderer.destroy()
++      if (previous === undefined) delete process.env.OPENCODE_RECONCILE_TIMEOUT_MS
++      else process.env.OPENCODE_RECONCILE_TIMEOUT_MS = previous
++    }
++  },
++  30000,
++)
++
++test(
++  "a slow reconcile failure must not collapse the exponential backoff into a ~1s hammer",
++  async () => {
++    // openedAt used to be stamped at the TOP of onOpen, i.e. BEFORE the reconcile.
++    // A reconcile that failed SLOWLY (a gateway timeout) therefore counted as
++    // ">= OPENCODE_SSE_MIN_OPEN_MS open", reset `attempt` to 0 on every iteration,
++    // and turned the exponential backoff into a fixed ~1s reconnect hammer against
++    // an already-sick door. Very likely why the production incident was as bad as it
++    // was. Stamping openedAt AFTER the reconcile leaves it undefined on a throw, so
++    // a failed attempt always keeps the exponential climbing.
++    const previous = {
++      minOpen: process.env.OPENCODE_SSE_MIN_OPEN_MS,
++      max: process.env.OPENCODE_RECONCILE_MAX_FAILURES,
++    }
++    process.env.OPENCODE_SSE_MIN_OPEN_MS = "50"
++    process.env.OPENCODE_RECONCILE_MAX_FAILURES = "4"
++    const at: number[] = []
++    const d = door({
++      permissions: async () => {
++        at.push(Date.now())
++        // Slow failure: longer than OPENCODE_SSE_MIN_OPEN_MS above.
++        await Bun.sleep(150)
++        return json({ error: "gateway timeout" }, { status: 504 })
++      },
++    })
++    const { app } = await mount(d)
++    try {
++      await wait(() => at.length >= 4, 25000)
++      const gaps = at.slice(1).map((t, i) => t - at[i]!)
++      expect(gaps.length).toBe(3)
++      // Correct: ~1s, ~2s, ~4s (each + 0..25% jitter, + the 150ms failure). Collapsed:
++      // ~1.15s, ~1.15s, ~1.15s.
++      //
++      // ABSOLUTE, not a ratio, deliberately: this file is a release gate, and a
++      // slow/contended runner only ever makes gaps LONGER, so this assertion cannot
++      // false-fail. A gap ratio would be the more direct statement of "exponential",
++      // but its worst-case clean margin is only ~1.53 against a ~1.4 threshold, and a
++      // single asymmetric ~800ms stall on the FIRST gap flips it — a flaky release
++      // gate is worse than a slightly less pointed assertion.
++      expect(gaps[2]!).toBeGreaterThan(3000)
++    } finally {
++      app.renderer.destroy()
++      if (previous.minOpen === undefined) delete process.env.OPENCODE_SSE_MIN_OPEN_MS
++      else process.env.OPENCODE_SSE_MIN_OPEN_MS = previous.minOpen
++      if (previous.max === undefined) delete process.env.OPENCODE_RECONCILE_MAX_FAILURES
++      else process.env.OPENCODE_RECONCILE_MAX_FAILURES = previous.max
++    }
++  },
++  40000,
++)
++
++test(
++  "a degraded episode SELF-HEALS via the slow-cadence forced reconnect, and re-arms the toast latch",
++  async () => {
++    // Spec item 3: recovery from degraded is a full RECONNECT, not a periodic
++    // re-fetch — a re-fetch would run concurrently with the live pump and break the
++    // "injects strictly precede pumped events" ordering. Nothing else can trigger a
++    // reconnect here (the stream never errors, the child set never changes), so if
++    // the degraded reconnect is not wired the pending prompt below NEVER lands.
++    const previous = {
++      retry: process.env.OPENCODE_RECONCILE_DEGRADED_RETRY_MS,
++      timeout: process.env.OPENCODE_RECONCILE_TIMEOUT_MS,
++    }
++    process.env.OPENCODE_RECONCILE_DEGRADED_RETRY_MS = "200"
++    process.env.OPENCODE_RECONCILE_TIMEOUT_MS = "500"
++    const pending = {
++      id: "per_after_heal",
++      sessionID,
++      permission: "bash",
++      patterns: ["ls"],
++      metadata: {},
++      always: [],
++    }
++    // Broken for exactly the 3 attempts it takes to degrade, healthy afterwards.
++    const d = door({
++      permissions: (attempt) => (attempt <= 3 ? json({ error: "bad gateway" }, { status: 502 }) : json([pending])),
++    })
++    const { app, events, toasts } = await mount(d)
++    try {
++      await wait(() => toasts.length >= 1)
++      expect(d.permissionAttempts).toBe(3)
++      const opensWhenDegraded = d.eventOpens.length
++
++      // The forced reconnect (detected on the next child poll tick) re-runs the
++      // reconcile in the safe pre-pump position, and it succeeds.
++      await wait(() => events.some((e) => seen(e).propertyID === pending.id), 25000)
++      expect(d.permissionAttempts).toBeGreaterThanOrEqual(4)
++      // It really was a RECONNECT, not an in-place re-fetch.
++      expect(d.eventOpens.length).toBeGreaterThan(opensWhenDegraded)
++      // Exactly one toast for the whole episode.
++      expect(toasts).toEqual([DEGRADED_TOAST])
++    } finally {
++      app.renderer.destroy()
++      if (previous.retry === undefined) delete process.env.OPENCODE_RECONCILE_DEGRADED_RETRY_MS
++      else process.env.OPENCODE_RECONCILE_DEGRADED_RETRY_MS = previous.retry
++      if (previous.timeout === undefined) delete process.env.OPENCODE_RECONCILE_TIMEOUT_MS
++      else process.env.OPENCODE_RECONCILE_TIMEOUT_MS = previous.timeout
++    }
++  },
++  40000,
++)
++
++test(
++  "(c) a dead child session's failed reconcile does not swallow its healthy parent's pending prompt",
++  async () => {
++    // The reconcile fans out over {active} U live children, and Session.children()
++    // has no liveness filter, so a gone/unroutable child is a permanent 404 while
++    // the parent is perfectly healthy. Under Promise.all the child's INSTANT
++    // rejection returns the await immediately, the attempt is torn down, and the
++    // parent's still-in-flight read is aborted with it — the parent's pending
++    // prompt is never injected on ANY attempt. allSettled lets every sibling finish
++    // first, so the parent's prompt lands even though the attempt is reported failed.
++    const parentPending = {
++      id: "per_parent",
++      sessionID,
++      permission: "bash",
++      patterns: ["ls"],
++      metadata: {},
++      always: [],
++    }
++    const child = { id: "ses_child", parentID: sessionID, time: { created: 1, updated: 2 } }
++    let parentReads = 0
++    const fetchImpl = (async (input: RequestInfo | URL, init?: RequestInit) => {
++      const url = new URL(input instanceof Request ? input.url : String(input))
++      const signal = input instanceof Request ? input.signal : init?.signal
++      if (url.pathname === "/event")
++        return new Response(new ReadableStream<Uint8Array>({ start() {} }), {
++          headers: { "content-type": "text/event-stream" },
++        })
++      if (url.pathname === `/session/${sessionID}/children`) return json([child])
++      // The CHILD is permanently gone and fails INSTANTLY.
++      if (url.pathname.startsWith(`/session/${child.id}/`)) return json({ error: "gone" }, { status: 404 })
++      if (url.pathname === `/session/${sessionID}/permissions`) {
++        parentReads += 1
++        // Slower than the child's failure, and genuinely cancellable — exactly the
++        // shape a real HTTP read has.
++        const first = parentReads === 1
++        await new Promise<void>((resolve, reject) => {
++          const timer = setTimeout(resolve, 60)
++          signal?.addEventListener("abort", () => {
++            clearTimeout(timer)
++            reject(new Error("aborted"))
++          })
++        })
++        // Nothing pending until the child is in scope, so the ONLY way this prompt
++        // can land is on an attempt that also reconciles the dead child.
++        return json(first ? [] : [parentPending])
++      }
++      if (url.pathname.endsWith("/questions")) return json([])
++      return json({})
++    }) as typeof globalThis.fetch
++
++    const { app, events } = await mount({ fetch: fetchImpl })
++    try {
++      await wait(() => events.some((e) => seen(e).propertyID === parentPending.id), 25000)
++    } finally {
++      app.renderer.destroy()
++    }
++  },
++  40000,
++)
+diff --git a/packages/tui/test/cli/cmd/tui/bootstrap-settled.test.tsx b/packages/tui/test/cli/cmd/tui/bootstrap-settled.test.tsx
+new file mode 100644
+index 0000000..cf6a6cd
+--- /dev/null
++++ b/packages/tui/test/cli/cmd/tui/bootstrap-settled.test.tsx
+@@ -0,0 +1,43 @@
++/** @jsxImportSource @opentui/solid */
++import { expect, test } from "bun:test"
++import { mount } from "./sync-fixture"
++
++// Part B (bead workstation-fdb1). bootstrap()'s non-blocking phase fired 11 reads
++// under a single Promise.all whose .then set status to "complete". One rejection
++// therefore (a) stranded status at "partial" forever — and app.tsx gates the
++// `--session --fork` auto-fork on status === "complete", so `--session X --fork`
++// silently never forked — and (b) became an UNHANDLED promise rejection, because
++// that promise is `void`ed rather than returned into bootstrap's .catch.
++//
++// `mount()` itself waits for status === "complete", so this test's assertion is
++// mostly "mount does not time out".
++test("one failing non-blocking bootstrap read still completes the bootstrap", async () => {
++  const { app, sync } = await mount((url) => {
++    // A rejecting fetch, not an HTTP error: none of these reads uses throwOnError,
++    // so only a transport-level failure (or a hang) can reject them — which is
++    // exactly the shape that stranded status in production.
++    if (url.pathname === "/vcs") throw new Error("vcs read failed")
++    return undefined
++  })
++  try {
++    expect(sync.status).toBe("complete")
++    // The siblings still applied their own results.
++    expect(sync.data.command).toEqual([])
++    expect(sync.data.lsp).toEqual([])
++  } finally {
++    app.renderer.destroy()
++  }
++})
++
++test("several failing non-blocking bootstrap reads still complete the bootstrap", async () => {
++  const { app, sync } = await mount((url) => {
++    if (["/vcs", "/command", "/session/status"].includes(url.pathname)) throw new Error(`${url.pathname} failed`)
++    return undefined
++  })
++  try {
++    expect(sync.status).toBe("complete")
++    expect(sync.data.lsp).toEqual([])
++  } finally {
++    app.renderer.destroy()
++  }
++})
+diff --git a/packages/tui/test/fixture/tui-environment.tsx b/packages/tui/test/fixture/tui-environment.tsx
+index 543332b..d49edec 100644
+--- a/packages/tui/test/fixture/tui-environment.tsx
++++ b/packages/tui/test/fixture/tui-environment.tsx
+@@ -5,6 +5,8 @@ import {
+   TuiTerminalEnvironmentProvider,
+   type TuiPaths,
+ } from "../../src/context/runtime"
++import { RouteProvider } from "../../src/context/route"
++import { ToastProvider } from "../../src/ui/toast"
+ import type { ParentProps } from "solid-js"
+ 
+ export function TestTuiContexts(
+@@ -25,7 +27,17 @@ export function TestTuiContexts(
+       }}
+     >
+       <TuiTerminalEnvironmentProvider value={{ platform: "linux" }}>
+-        <TuiStartupProvider value={{ skipInitialLoading: false }}>{props.children}</TuiStartupProvider>
++        <TuiStartupProvider value={{ skipInitialLoading: false }}>
++          {/* SDKProvider consumes Route (it follows in-TUI session switches) and
++              Toast (it reports a degraded pending-reconcile). app.tsx nests both
++              OUTSIDE SDKProvider, so the fixture must too — without them every
++              SDKProvider-based test dies in `init` with "context must be used
++              within a context provider". Nesting a test's own RouteProvider inside
++              this one is harmless: the inner provider wins. */}
++          <ToastProvider>
++            <RouteProvider>{props.children}</RouteProvider>
++          </ToastProvider>
++        </TuiStartupProvider>
+       </TuiTerminalEnvironmentProvider>
+     </TuiPathsProvider>
+   )

@@ -192,6 +192,7 @@ Each patch is owned by a specific repo. Do not edit a patch in the wrong repo.
 | `sqlite-foreign-key-wrap.patch` | **this repo** (`patches/sqlite-foreign-key-wrap.patch`) | local / original, no upstream PR |
 | `event-log-gate.patch` | **this repo** (`patches/event-log-gate.patch`) | backport of upstream commit `b0017bf1b9` gating; drop on cutover to an upstream release that includes it |
 | `compaction-bounded-load.patch` | **this repo** (`patches/compaction-bounded-load.patch`) | local / original; drop if upstream bounds the loop's message load or revives PR #25367 |
+| `tui-reconcile-bound.patch` | **this repo** (`patches/tui-reconcile-bound.patch`) | local / original (bead `workstation-fdb1`); bounds the pending-reconcile that `tui-door-attach.patch` introduced. Related upstream work: [PR #36603](https://github.com/anomalyco/opencode/pull/36603) implements the same *feature* against `dev` but fails **open** with `.catch(() => {})` — it never freezes and silently drops pending prompts. This patch is the middle ground (bounded + a visible toast). Must apply **last**. |
 
 When an upstream PR is merged, the corresponding patch can be dropped. (The big
 `caching.patch` formerly lived in the sibling repo `opencode-cached`; it was dropped
