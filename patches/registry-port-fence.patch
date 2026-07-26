@@ -56,7 +56,7 @@
      const nativeDb = new DatabaseSync(dbPath);
  
      return {
-@@ -237,6 +258,31 @@
+@@ -237,8 +258,40 @@
        "UPDATE serve_instance SET heartbeat_at = @now, health_state = 'healthy' WHERE serve_id = @serveId"
      );
  
@@ -86,9 +86,19 @@
 +    );
 +
      const markDeadStmt = db.prepare(
-       "UPDATE serve_instance SET draining = 1 WHERE serve_id = @serveId"
+-      "UPDATE serve_instance SET draining = 1 WHERE serve_id = @serveId"
++      // IDENTITY-FENCED. Only the process whose instance_uuid is currently in the
++      // row may drain it. Keyed on serve_id alone, a departing ROGUE evicts a live
++      // serve: the rogue claims the slot, the real serve's selfHeal restores the
++      // uuid, then the rogue's SIGTERM finalizer sets draining=1 on a row it no
++      // longer owns. `isServeHealthy` requires !draining and nothing clears it, so
++      // the live serve is out of the pool until someone restarts it. That is the
++      // third damage mode of the 2026-07-25 incident, and this closes it at source.
++      "UPDATE serve_instance SET draining = 1 WHERE serve_id = @serveId AND instance_uuid = @instanceUuid"
      );
-@@ -400,6 +446,49 @@
+ 
+     const acquireCASStmt = db.prepare(
+@@ -400,6 +453,59 @@
          });
        },
  
@@ -98,15 +108,19 @@
 +          if (!row) {
 +            // The row is gone entirely (reaped or deleted). A full register is the
 +            // only way back, and it is safe here because there is nothing to clobber.
-+            const now = Date.now();
-+            const metaRow: any = selectMetaStmt.get();
-+            if (!metaRow) return null;
++            // Recreate at the epoch WE registered with, never at whatever
++            // routing_meta says now. Using the current epoch here would be exactly
++            // the hole this module avoids by not healing via registerSelf: a stale
++            // binary would re-enter the pool it was fenced out of. Deleting a
++            // poisoned row is the natural incident-response move, so this branch is
++            // reachable at precisely the wrong moment (mid-cutover).
++            if (selfBootEpoch === null) return null;
 +            registerSelfStmt.run({
 +              serveId: options.serveId,
 +              instanceUuid: options.instanceUuid,
 +              endpoint: options.endpoint,
-+              binaryEpoch: Number(metaRow.binary_epoch),
-+              heartbeatAt: now,
++              binaryEpoch: selfBootEpoch,
++              heartbeatAt: Date.now(),
 +            });
 +            return { instanceUuid: "<row absent>", endpoint: "<row absent>", draining: false };
 +          }
@@ -116,11 +130,17 @@
 +            endpoint: String(row.endpoint),
 +            draining: Number(row.draining) === 1,
 +          };
-+          if (
++          // A foreign writer ALWAYS leaves a foreign instance_uuid, because only
++          // registerSelf writes that column. So uuid+endpoint agreeing means nobody
++          // else touched this row, and a draining=1 we find in that state came from
++          // a human -- the operator's last sticky lever for evicting a live-but-sick
++          // serve (health_state is overwritten by our own heartbeat within 5s, and
++          // endpoint by pigeon's reconciler within 5s). Un-draining it would mean
++          // the serve fights the operator taking it out of rotation. Respect it.
++          const identityIntact =
 +            previous.instanceUuid === options.instanceUuid &&
-+            previous.endpoint === options.endpoint &&
-+            !previous.draining
-+          ) {
++            previous.endpoint === options.endpoint;
++          if (identityIntact) {
 +            return null;
 +          }
 +
@@ -138,10 +158,58 @@
        async registerSelf(options) {
          return withRetry(() => {
            const now = Date.now();
-@@ -476,3 +565,72 @@
+@@ -419,6 +525,7 @@
+ 
+           registerSelfStmt.run(params);
+           setSelfIdentity({ serveId: options.serveId, instanceUuid: options.instanceUuid });
++          selfBootEpoch = binaryEpoch;
+         });
+       },
+ 
+@@ -434,10 +541,12 @@
+       },
+ 
+       async markDead(serveId) {
++        // No identity == we never registered (or the fence refused us), so we have
++        // no standing to drain anyone's slot.
++        const identity = getSelfIdentity();
++        if (!identity || identity.serveId !== serveId) return false;
+         return withRetry(() => {
+-          const res = markDeadStmt.run({
+-            serveId,
+-          });
++          const res = markDeadStmt.run({ serveId, instanceUuid: identity.instanceUuid });
+           return res.changes > 0;
+         });
+       },
+@@ -456,6 +565,9 @@
+ 
+ let sharedLeasePromise: Promise<RoutingLeaseDbAdapter> | null = null;
+ let selfIdentity: { serveId: string; instanceUuid: string } | null = null;
++/** The binary_epoch this process registered with. selfHeal must recreate a deleted
++ *  row at THIS epoch, never at whatever routing_meta currently says. */
++let selfBootEpoch: number | null = null;
+ 
+ export function getSelfIdentity(): { serveId: string; instanceUuid: string } | null {
+   return selfIdentity;
+@@ -463,6 +575,11 @@
+ 
+ export function setSelfIdentity(id: { serveId: string; instanceUuid: string } | null): void {
+   selfIdentity = id;
++  if (id === null) selfBootEpoch = null;
++}
++
++export function __setSelfBootEpoch(epoch: number | null): void {
++  selfBootEpoch = epoch;
+ }
+ 
+ export async function getSharedRoutingLease(): Promise<RoutingLeaseDbAdapter> {
+@@ -475,4 +592,74 @@
+ export function __resetSharedRoutingLease(): void {
    sharedLeasePromise = null;
    selfIdentity = null;
- }
++  selfBootEpoch = null;
++}
 +
 +// ---------------------------------------------------------------------------
 +// Registry port fence (bead pigeon-13p)
@@ -210,7 +278,7 @@
 +  }
 +
 +  return { armed: true, ok: true, expectedPort };
-+}
+ }
 --- a/packages/core/test/serve/routing-lease.test.ts
 +++ b/packages/core/test/serve/routing-lease.test.ts
 @@ -2,7 +2,7 @@
@@ -222,7 +290,7 @@
  import { Flag } from "../../src/flag/flag";
  
  const ROUTING_DDL = `
-@@ -634,3 +634,259 @@
+@@ -634,3 +634,376 @@
      }
    });
  });
@@ -334,7 +402,14 @@
 +    });
 +  });
 +
-+  test("repairs a lone draining=1 marker with everything else intact", async () => {
++  test("RESPECTS a lone draining=1 marker — that is the operator's eviction lever", async () => {
++    // draining=1 with our OWN uuid and endpoint intact cannot have come from a
++    // rogue: registerSelf always rewrites instance_uuid, so any foreign writer
++    // leaves a foreign uuid. It therefore came from a human (or a future drain
++    // implementation). It is the only sticky lever left for evicting a live-but-sick
++    // serve -- health_state is overwritten by our own heartbeat within 5s, and
++    // endpoint is overwritten by pigeon's reconciler within 5s. Un-draining here
++    // would mean a serve fights the operator trying to take it out of rotation.
 +    await withDb(async (adapter, _f, raw) => {
 +      await adapter.registerSelf({ serveId: "serve-2", instanceUuid: "real-uuid", endpoint: "http://127.0.0.1:4098" });
 +      raw.run("UPDATE serve_instance SET draining=1 WHERE serve_id=?", ["serve-2"]);
@@ -345,12 +420,55 @@
 +        endpoint: "http://127.0.0.1:4098",
 +      });
 +
-+      expect(healed).toEqual({
++      expect(healed).toBeNull();
++      expect(read(raw, "serve-2").draining).toBe(1);
++    });
++  });
++
++  test("clears draining when identity ALSO disagrees — proof a foreign process wrote the row", async () => {
++    await withDb(async (adapter, _f, raw) => {
++      await adapter.registerSelf({ serveId: "serve-2", instanceUuid: "real-uuid", endpoint: "http://127.0.0.1:4098" });
++      // Endpoint intact, but a foreign uuid: only registerSelf writes uuid, so this
++      // row was claimed by another process and its markDead set the drain.
++      raw.run("UPDATE serve_instance SET instance_uuid=?, draining=1 WHERE serve_id=?", ["rogue", "serve-2"]);
++
++      const healed = await adapter.selfHeal({
++        serveId: "serve-2",
 +        instanceUuid: "real-uuid",
 +        endpoint: "http://127.0.0.1:4098",
-+        draining: true,
 +      });
-+      expect(read(raw, "serve-2").draining).toBe(0);
++
++      expect(healed).not.toBeNull();
++      const row = read(raw, "serve-2");
++      expect(row.draining).toBe(0);
++      expect(row.instance_uuid).toBe("real-uuid");
++    });
++  });
++
++  test("row-absent recreate uses OUR boot epoch, not the current one", async () => {
++    // The patch's whole reason for not healing via registerSelf is that registerSelf
++    // re-reads binary_epoch from routing_meta, letting a stale binary re-enter the
++    // pool it was fenced out of. The row-absent branch used registerSelf and so
++    // reintroduced exactly that. Deleting a poisoned row is the natural
++    // incident-response move, which makes this reachable in the worst moment.
++    await withDb(async (adapter, _f, raw) => {
++      await adapter.registerSelf({ serveId: "serve-2", instanceUuid: "real-uuid", endpoint: "http://127.0.0.1:4098" });
++      expect(read(raw, "serve-2").binary_epoch).toBe(7);
++
++      raw.run("UPDATE routing_meta SET binary_epoch=8 WHERE id=1");   // new binary deployed
++      raw.run("DELETE FROM serve_instance WHERE serve_id=?", ["serve-2"]);  // operator clears a poisoned row
++
++      await adapter.selfHeal({
++        serveId: "serve-2",
++        instanceUuid: "real-uuid",
++        endpoint: "http://127.0.0.1:4098",
++      });
++
++      const row = read(raw, "serve-2");
++      expect(row).toBeDefined();
++      expect(row.endpoint).toBe("http://127.0.0.1:4098");
++      // Recreated, but still fenced OUT of the current epoch.
++      expect(row.binary_epoch).toBe(7);
 +    });
 +  });
 +
@@ -413,6 +531,73 @@
 +      expect(row.endpoint).toBe("http://127.0.0.1:4098");
 +      expect(row.instance_uuid).toBe("real-uuid");
 +      expect(row.draining).toBe(0);
++    });
++  });
++});
++
++describe("markDead identity fence", () => {
++  const withDb = async (fn: (adapter: any, raw: any) => Promise<void>) => {
++    await using tmp = await tmpdir();
++    const dbFile = path.join(tmp.path, "routing.db");
++    const { Database } = await import("bun:sqlite");
++    const seed = new Database(dbFile);
++    seed.exec("PRAGMA journal_mode=WAL;");
++    seed.run(ROUTING_DDL);
++    seed.run(
++      "INSERT OR IGNORE INTO routing_meta (id, schema_version, ddl_checksum, binary_epoch, updated_at) VALUES (1, 1, ?, 7, ?)",
++      [EXPECTED_DDL_CHECKSUM, Date.now()]
++    );
++    seed.close();
++    const original = process.env.OPENCODE_ROUTING_DB;
++    process.env.OPENCODE_ROUTING_DB = dbFile;
++    (Flag as any).OPENCODE_ROUTING_DB = dbFile;
++    try {
++      const adapter = await openRoutingLeaseDb();
++      const raw = new Database(dbFile);
++      await fn(adapter, raw);
++      raw.close();
++      await adapter.close();
++    } finally {
++      process.env.OPENCODE_ROUTING_DB = original;
++      (Flag as any).OPENCODE_ROUTING_DB = original;
++      __resetSharedRoutingLease();
++    }
++  };
++  const read = (raw: any, id: string) =>
++    raw.prepare("SELECT * FROM serve_instance WHERE serve_id = ?").get(id) as any;
++
++  test("the registered owner CAN drain its own slot (clean shutdown still works)", async () => {
++    await withDb(async (adapter, raw) => {
++      await adapter.registerSelf({ serveId: "serve-2", instanceUuid: "mine", endpoint: "http://127.0.0.1:4098" });
++      expect(await adapter.markDead("serve-2")).toBe(true);
++      expect(read(raw, "serve-2").draining).toBe(1);
++    });
++  });
++
++  test("a process whose uuid is no longer in the row CANNOT drain it", async () => {
++    // The 2026-07-25 third damage mode: a rogue claims the slot, the real serve's
++    // selfHeal restores the uuid, and THEN the rogue's SIGTERM finalizer fires. With
++    // markDead keyed on serve_id alone, that departing rogue evicts a live serve.
++    await withDb(async (adapter, raw) => {
++      await adapter.registerSelf({ serveId: "serve-2", instanceUuid: "rogue", endpoint: "http://127.0.0.1:44407" });
++      raw.run("UPDATE serve_instance SET instance_uuid=?, endpoint=? WHERE serve_id=?",
++        ["real", "http://127.0.0.1:4098", "serve-2"]);
++
++      expect(await adapter.markDead("serve-2")).toBe(false);
++      expect(read(raw, "serve-2").draining).toBe(0);
++    });
++  });
++
++  test("a process that never registered CANNOT drain anything", async () => {
++    await withDb(async (adapter, raw) => {
++      raw.run(
++        "INSERT INTO serve_instance (serve_id, instance_uuid, endpoint, binary_epoch, health_state, heartbeat_at, draining) VALUES (?,?,?,?,?,?,0)",
++        ["serve-2", "someone-else", "http://127.0.0.1:4098", 7, "healthy", Date.now()]
++      );
++      setSelfIdentity(null);
++
++      expect(await adapter.markDead("serve-2")).toBe(false);
++      expect(read(raw, "serve-2").draining).toBe(0);
 +    });
 +  });
 +});
