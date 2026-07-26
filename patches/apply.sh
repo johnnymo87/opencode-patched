@@ -436,6 +436,7 @@ PATCHES=(
   tui-mcp-dialog
   opus5-adaptive-thinking
   tui-reconcile-bound
+  registry-port-fence
 )
 
 for name in "${PATCHES[@]}"; do
