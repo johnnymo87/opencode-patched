@@ -1,6 +1,30 @@
+diff --git a/bun.lock b/bun.lock
+index ebf0a2a..aa9bd93 100644
+--- a/bun.lock
++++ b/bun.lock
+@@ -2677,7 +2677,7 @@
+ 
+     "@solidjs/router": ["@solidjs/router@0.15.4", "", { "peerDependencies": { "solid-js": "^1.8.6" } }, "sha512-WOpgg9a9T638cR+5FGbFi/IV4l2FpmBs1GpIMSPa0Ce9vyJN7Wts+X2PqMf9IYn0zUj2MlSJtm1gp7/HI/n5TQ=="],
+ 
+-    "@solidjs/start": ["@solidjs/start@https://pkg.pr.new/@solidjs/start@dfb2020", { "dependencies": { "@babel/core": "^7.28.3", "@babel/traverse": "^7.28.3", "@babel/types": "^7.28.5", "@solidjs/meta": "^0.29.4", "@tanstack/server-functions-plugin": "1.134.5", "@types/babel__traverse": "^7.28.0", "@types/micromatch": "^4.0.9", "cookie-es": "^2.0.0", "defu": "^6.1.4", "error-stack-parser": "^2.1.4", "es-module-lexer": "^1.7.0", "esbuild": "^0.25.3", "fast-glob": "^3.3.3", "h3": "npm:h3@2.0.1-rc.4", "html-to-image": "^1.11.13", "micromatch": "^4.0.8", "path-to-regexp": "^8.2.0", "pathe": "^2.0.3", "radix3": "^1.1.2", "seroval": "^1.3.2", "seroval-plugins": "^1.2.1", "shiki": "^1.26.1", "solid-js": "^1.9.9", "source-map-js": "^1.2.1", "srvx": "^0.9.1", "terracotta": "^1.0.6", "vite": "7.1.10", "vite-plugin-solid": "^2.11.9", "vitest": "^4.0.10" } }, "sha512-7JjjA49VGNOsMRI8QRUhVudZmv0CnJ18SliSgK1ojszs/c3ijftgVkzvXdkSLN4miDTzbkXewf65D6ZBo6W+GQ=="],
++    "@solidjs/start": ["@solidjs/start@https://pkg.pr.new/@solidjs/start@dfb2020", { "dependencies": { "@babel/core": "^7.28.3", "@babel/traverse": "^7.28.3", "@babel/types": "^7.28.5", "@solidjs/meta": "^0.29.4", "@tanstack/server-functions-plugin": "1.134.5", "@types/babel__traverse": "^7.28.0", "@types/micromatch": "^4.0.9", "cookie-es": "^2.0.0", "defu": "^6.1.4", "error-stack-parser": "^2.1.4", "es-module-lexer": "^1.7.0", "esbuild": "^0.25.3", "fast-glob": "^3.3.3", "h3": "npm:h3@2.0.1-rc.4", "html-to-image": "^1.11.13", "micromatch": "^4.0.8", "path-to-regexp": "^8.2.0", "pathe": "^2.0.3", "radix3": "^1.1.2", "seroval": "^1.3.2", "seroval-plugins": "^1.2.1", "shiki": "^1.26.1", "solid-js": "^1.9.9", "source-map-js": "^1.2.1", "srvx": "^0.9.1", "terracotta": "^1.0.6", "vite": "7.1.10", "vite-plugin-solid": "^2.11.9", "vitest": "^4.0.10" } }],
+ 
+     "@speed-highlight/core": ["@speed-highlight/core@1.2.15", "", {}, "sha512-BMq1K3DsElxDWawkX6eLg9+CKJrTVGCBAWVuHXVUV2u0s2711qiChLSId6ikYPfxhdYocLNt3wWwSvDiTvFabw=="],
+ 
+@@ -3805,7 +3805,7 @@
+ 
+     "get-tsconfig": ["get-tsconfig@4.14.0", "", { "dependencies": { "resolve-pkg-maps": "^1.0.0" } }, "sha512-yTb+8DXzDREzgvYmh6s9vHsSVCHeC0G3PI5bEXNBHtmshPnO+S5O7qgLEOn0I5QvMy6kpZN8K1NKGyilLb93wA=="],
+ 
+-    "ghostty-web": ["ghostty-web@github:anomalyco/ghostty-web#513463a", {}, "anomalyco-ghostty-web-513463a", "sha512-GZR8LSmgGzViWnBJrqRI8MpAZRCJxhcr1Hi9Tyeh7YRooHZQjK9J97FQRD3tbBaM2wjq05gzGY2UEsG+JtZeBw=="],
++    "ghostty-web": ["ghostty-web@github:anomalyco/ghostty-web#513463a", {}, "anomalyco-ghostty-web-513463a"],
+ 
+     "giget": ["giget@2.0.0", "", { "dependencies": { "citty": "^0.1.6", "consola": "^3.4.0", "defu": "^6.1.4", "node-fetch-native": "^1.6.6", "nypm": "^0.6.0", "pathe": "^2.0.3" }, "bin": { "giget": "dist/cli.mjs" } }, "sha512-L5bGsVkxJbJgdnwyuheIunkGatUF/zssUoxxjACCseZYAVbaqdh9Tsmmlkl8vYan09H7sbvKt4pS8GqKLBrEzA=="],
+ 
+diff --git a/packages/core/src/flag/flag.ts b/packages/core/src/flag/flag.ts
+index 5be4e46..1d85ed5 100644
 --- a/packages/core/src/flag/flag.ts
 +++ b/packages/core/src/flag/flag.ts
-@@ -47,6 +47,16 @@
+@@ -47,6 +47,23 @@ export const Flag = {
    OPENCODE_DB: process.env["OPENCODE_DB"],
    OPENCODE_ROUTING_DB: process.env["OPENCODE_ROUTING_DB"],
    OPENCODE_SERVE_ID: process.env["OPENCODE_SERVE_ID"],
@@ -14,12 +38,21 @@
 +  get OPENCODE_SERVE_EXPECTED_PORT() {
 +    return process.env["OPENCODE_SERVE_EXPECTED_PORT"]
 +  },
++  // Registry PID fence (bead workstation-4b1q): the PID of the legitimate serve
++  // process. Set by the wrapper as OPENCODE_SERVE_EXPECTED_PID=$$ before exec, so
++  // $$ == process.pid for the legitimate serve. Inherited by child processes but
++  // unforgeable by a child, closing port/host/socket hijack variants.
++  get OPENCODE_SERVE_EXPECTED_PID() {
++    return process.env["OPENCODE_SERVE_EXPECTED_PID"]
++  },
    // Serve self-heartbeat interval (ms). Default 5000. Lowered in tests for a
    // tighter RED/GREEN signal; also a legitimate production tunable.
    get OPENCODE_HEARTBEAT_INTERVAL_MS() {
+diff --git a/packages/core/src/serve/routing-lease.ts b/packages/core/src/serve/routing-lease.ts
+index 92a91af..da8843c 100644
 --- a/packages/core/src/serve/routing-lease.ts
 +++ b/packages/core/src/serve/routing-lease.ts
-@@ -46,6 +46,16 @@
+@@ -46,6 +46,16 @@ export interface RoutingLeaseDbAdapter {
  
    readValid(sessionId: string, token: LeaseToken): Promise<boolean>;
  
@@ -36,7 +69,7 @@
    registerSelf(options: {
      serveId: string;
      instanceUuid: string;
-@@ -151,7 +161,18 @@
+@@ -151,7 +161,18 @@ async function loadUnifiedDb(dbPath: string) {
        }
      };
    } else {
@@ -56,7 +89,7 @@
      const nativeDb = new DatabaseSync(dbPath);
  
      return {
-@@ -237,8 +258,40 @@
+@@ -237,8 +258,40 @@ export async function openRoutingLeaseDb(): Promise<RoutingLeaseDbAdapter> {
        "UPDATE serve_instance SET heartbeat_at = @now, health_state = 'healthy' WHERE serve_id = @serveId"
      );
  
@@ -98,7 +131,7 @@
      );
  
      const acquireCASStmt = db.prepare(
-@@ -400,6 +453,59 @@
+@@ -400,6 +453,59 @@ export async function openRoutingLeaseDb(): Promise<RoutingLeaseDbAdapter> {
          });
        },
  
@@ -158,7 +191,7 @@
        async registerSelf(options) {
          return withRetry(() => {
            const now = Date.now();
-@@ -419,6 +525,7 @@
+@@ -419,6 +525,7 @@ export async function openRoutingLeaseDb(): Promise<RoutingLeaseDbAdapter> {
  
            registerSelfStmt.run(params);
            setSelfIdentity({ serveId: options.serveId, instanceUuid: options.instanceUuid });
@@ -166,7 +199,7 @@
          });
        },
  
-@@ -434,10 +541,12 @@
+@@ -434,10 +541,12 @@ export async function openRoutingLeaseDb(): Promise<RoutingLeaseDbAdapter> {
        },
  
        async markDead(serveId) {
@@ -182,7 +215,7 @@
            return res.changes > 0;
          });
        },
-@@ -456,6 +565,9 @@
+@@ -456,6 +565,9 @@ export async function openRoutingLeaseDb(): Promise<RoutingLeaseDbAdapter> {
  
  let sharedLeasePromise: Promise<RoutingLeaseDbAdapter> | null = null;
  let selfIdentity: { serveId: string; instanceUuid: string } | null = null;
@@ -192,7 +225,7 @@
  
  export function getSelfIdentity(): { serveId: string; instanceUuid: string } | null {
    return selfIdentity;
-@@ -463,6 +575,11 @@
+@@ -463,6 +575,11 @@ export function getSelfIdentity(): { serveId: string; instanceUuid: string } | n
  
  export function setSelfIdentity(id: { serveId: string; instanceUuid: string } | null): void {
    selfIdentity = id;
@@ -204,7 +237,7 @@
  }
  
  export async function getSharedRoutingLease(): Promise<RoutingLeaseDbAdapter> {
-@@ -475,4 +592,74 @@
+@@ -475,4 +592,128 @@ export async function getSharedRoutingLease(): Promise<RoutingLeaseDbAdapter> {
  export function __resetSharedRoutingLease(): void {
    sharedLeasePromise = null;
    selfIdentity = null;
@@ -278,19 +311,75 @@
 +  }
 +
 +  return { armed: true, ok: true, expectedPort };
++}
++
++// ---------------------------------------------------------------------------
++// Registry PID fence (bead workstation-4b1q)
++// ---------------------------------------------------------------------------
++
++/**
++ * The result of checking that this process's PID matches the expected PID for its pool slot.
++ *
++ * WHY THIS EXISTS. The port fence compares OPENCODE_SERVE_EXPECTED_PORT against
++ * the bound port with no interface check. A nested `opencode serve --hostname ::1 --port 4098`
++ * binds alongside the real serve on 127.0.0.1:4098, passes the port fence, and reaches
++ * registerSelf — repointing slot instance_uuid and invalidating real serve session leases.
++ *
++ * WHY A PID. The wrapper exports OPENCODE_SERVE_EXPECTED_PID=$$ and execs the serve,
++ * so $$ == process.pid for the legitimate serve. A child process inherits the environment
++ * variable but can never inherit the PID, so PID discriminates exactly the hijack signature
++ * regardless of port, host, or socket variants.
++ */
++export type PidFenceVerdict =
++  | { armed: false }
++  | { armed: true; ok: true; expectedPid: number }
++  | { armed: true; ok: false; reason: "mismatch"; expectedPid: number; actualPid: number }
++  | { armed: true; ok: false; reason: "malformed"; expectedRaw: string; actualPid: number };
++
++/**
++ * Decide whether this process's PID matches the OPENCODE_SERVE_EXPECTED_PID expectation.
++ *
++ * ARMED ONLY WHEN THE EXPECTATION IS PRESENT. Unset or empty string means fence unarmed
++ * (fall back to existing behavior). This is MANDATORY so binary release and wrapper
++ * export can land in either order without crash-looping the pool.
++ *
++ * A MALFORMED value is NOT treated as absent: fails closed so typos cannot silently disarm.
++ */
++export function checkServePidFence(
++  expectedRaw: string | undefined,
++  actualPid: number,
++): PidFenceVerdict {
++  if (expectedRaw === undefined || expectedRaw.trim() === "") {
++    return { armed: false };
++  }
++
++  const trimmed = expectedRaw.trim();
++  // Strict bare decimal digits check: reject "123x", "0x1001", "1.5", etc.
++  const expectedPid = /^\d+$/.test(trimmed) ? Number(trimmed) : NaN;
++  if (!Number.isInteger(expectedPid) || expectedPid < 1 || expectedPid > 4194304) {
++    return { armed: true, ok: false, reason: "malformed", expectedRaw: trimmed, actualPid };
++  }
++
++  if (expectedPid !== actualPid) {
++    return { armed: true, ok: false, reason: "mismatch", expectedPid, actualPid };
++  }
++
++  return { armed: true, ok: true, expectedPid };
  }
+diff --git a/packages/core/test/serve/routing-lease.test.ts b/packages/core/test/serve/routing-lease.test.ts
+index 0820da0..56546b3 100644
 --- a/packages/core/test/serve/routing-lease.test.ts
 +++ b/packages/core/test/serve/routing-lease.test.ts
-@@ -2,7 +2,7 @@
+@@ -2,7 +2,7 @@ import { describe, expect, test } from "bun:test";
  import path from "node:path";
  import { createHash } from "node:crypto";
  import { tmpdir } from "../fixture/tmpdir";
 -import { openRoutingLeaseDb, SchemaMismatchError, getRoutingDbPath, EXPECTED_DDL_CHECKSUM, getSharedRoutingLease, __resetSharedRoutingLease, getSelfIdentity, setSelfIdentity } from "../../src/serve/routing-lease";
-+import { openRoutingLeaseDb, SchemaMismatchError, getRoutingDbPath, EXPECTED_DDL_CHECKSUM, getSharedRoutingLease, __resetSharedRoutingLease, getSelfIdentity, setSelfIdentity, checkServePortFence } from "../../src/serve/routing-lease";
++import { openRoutingLeaseDb, SchemaMismatchError, getRoutingDbPath, EXPECTED_DDL_CHECKSUM, getSharedRoutingLease, __resetSharedRoutingLease, getSelfIdentity, setSelfIdentity, checkServePortFence, checkServePidFence } from "../../src/serve/routing-lease";
  import { Flag } from "../../src/flag/flag";
  
  const ROUTING_DDL = `
-@@ -634,3 +634,376 @@
+@@ -634,3 +634,419 @@ describe("Routing Lease Adapter", () => {
      }
    });
  });
@@ -667,17 +756,62 @@
 +    });
 +  });
 +});
++
++describe("checkServePidFence", () => {
++  test("UNARMED when expectation is absent, empty, or whitespace-only", () => {
++    expect(checkServePidFence(undefined, 1234)).toEqual({ armed: false });
++    expect(checkServePidFence("", 1234)).toEqual({ armed: false });
++    expect(checkServePidFence("   ", 1234)).toEqual({ armed: false });
++  });
++
++  test("PASSES when actual PID matches expected PID", () => {
++    expect(checkServePidFence("1234", 1234)).toEqual({ armed: true, ok: true, expectedPid: 1234 });
++    expect(checkServePidFence(" 1234 ", 1234)).toEqual({ armed: true, ok: true, expectedPid: 1234 });
++  });
++
++  test("FAILS on mismatch: expected PID != actual PID", () => {
++    expect(checkServePidFence("1234", 5678)).toEqual({
++      armed: true,
++      ok: false,
++      reason: "mismatch",
++      expectedPid: 1234,
++      actualPid: 5678,
++    });
++  });
++
++  test("FAILS CLOSED on malformed expectation", () => {
++    for (const bad of ["banana", "123x", "-1", "0", "1.5", "NaN", "0x1001", "4194305"]) {
++      expect(checkServePidFence(bad, 1234)).toMatchObject({
++        armed: true,
++        ok: false,
++        reason: "malformed",
++      });
++    }
++  });
++
++  test("carries raw expectation through on malformed input", () => {
++    expect(checkServePidFence("banana", 1234)).toEqual({
++      armed: true,
++      ok: false,
++      reason: "malformed",
++      expectedRaw: "banana",
++      actualPid: 1234,
++    });
++  });
++});
+diff --git a/packages/opencode/src/cli/cmd/serve.ts b/packages/opencode/src/cli/cmd/serve.ts
+index 1c5d191..4fc7581 100644
 --- a/packages/opencode/src/cli/cmd/serve.ts
 +++ b/packages/opencode/src/cli/cmd/serve.ts
 @@ -1,6 +1,6 @@
  import { Effect, Deferred } from "effect"
  import { randomUUID } from "node:crypto"
 -import { getSharedRoutingLease, getRoutingDbPath } from "@opencode-ai/core/serve/routing-lease"
-+import { getSharedRoutingLease, getRoutingDbPath, checkServePortFence } from "@opencode-ai/core/serve/routing-lease"
++import { getSharedRoutingLease, getRoutingDbPath, checkServePortFence, checkServePidFence } from "@opencode-ai/core/serve/routing-lease"
  import { startServeHeartbeat } from "../../serve/heartbeat"
  import { effectCmd } from "../effect-cmd"
  import { withNetworkOptions, resolveNetworkOptions } from "../network"
-@@ -26,6 +26,66 @@
+@@ -26,6 +26,95 @@ export const ServeCommand = effectCmd({
        const serveId = Flag.OPENCODE_SERVE_ID
        const instanceUuid = randomUUID()
        const endpoint = `http://127.0.0.1:${server.port}`
@@ -699,18 +833,15 @@
 +      // unit gets noticed; a silently-unfenced serve does not — the 2026-07-25
 +      // incident ran for hours precisely because nothing was loud), and the pool
 +      // degrades from K to K-1, which is what a pool is for.
-+      // DELIBERATE RESIDUAL, do not "fix" this into a regression: a process with a
-+      // COMPLETE and CORRECT inherited identity (SERVE_ID + ROUTING_DB +
-+      // EXPECTED_PORT) that actually manages to BIND the expected port passes the
-+      // fence and claims the slot. That is intended. Binding the port is only
-+      // possible when the real pool member is not holding it, and at that moment
-+      // possession of the port is exactly what "being the pool member" means — the
-+      // kernel is the arbiter, which is the whole reason the port was chosen as the
-+      // token. Tightening this (e.g. also requiring a systemd INVOCATION_ID, or
-+      // refusing while another row looks live) reintroduces the failure mode that
-+      // got the "refuse takeover while the slot looks live" design rejected: a
-+      // registration-refused-but-still-running serve has a null identity, and
-+      // withSessionLease FAILS OPEN on null identity.
++      // TIGHTENED RESIDUAL (bead workstation-4b1q): Previously, a process with a
++      // complete inherited identity that managed to BIND the expected port (e.g. via
++      // IPv6/IPv4 binding on ::1 alongside 127.0.0.1) passed the port fence alone and
++      // claimed the slot. The PID fence below tightens that: a child process inheriting
++      // OPENCODE_SERVE_EXPECTED_PID=$$ cannot inherit the parent process's PID, so it
++      // fails the PID fence and exits (exit code 21). This does NOT reintroduce the
++      // rejected "refuse takeover while the slot looks live" design, because this fence
++      // EXITS (exit 21) rather than continuing to run with a null identity (since
++      // withSessionLease fails OPEN on a null identity — that was the hazard).
 +      const fence = checkServePortFence(Flag.OPENCODE_SERVE_EXPECTED_PORT, server.port)
 +      if (fence.armed && !fence.ok) {
 +        const detail =
@@ -741,10 +872,42 @@
 +        )
 +      }
 +
++      // REGISTRY PID FENCE (bead workstation-4b1q). The port fence checks TCP port
++      // possession but has no interface check, so a nested serve on ::1:4098 can
++      // bind alongside 127.0.0.1:4098 and pass the port fence. The PID fence verifies
++      // process.pid against OPENCODE_SERVE_EXPECTED_PID (exported by the wrapper as $$).
++      // A child process inherits the expectation variable but can never inherit the PID.
++      const pidFence = checkServePidFence(Flag.OPENCODE_SERVE_EXPECTED_PID, process.pid)
++      if (pidFence.armed && !pidFence.ok) {
++        const detail =
++          pidFence.reason === "mismatch"
++            ? `process PID ${pidFence.actualPid} != expected PID ${pidFence.expectedPid}`
++            : `OPENCODE_SERVE_EXPECTED_PID="${pidFence.expectedRaw}" is not a valid PID (actual PID ${pidFence.actualPid})`
++        console.error(
++          `FATAL: refusing to claim routing slot ${serveId}: ${detail}. ` +
++            `This process is not the pool member for that slot — most likely it inherited ` +
++            `OPENCODE_SERVE_ID and OPENCODE_ROUTING_DB from a parent opencode session. ` +
++            `Registering would repoint ${serveId} at ${endpoint} for every client and ` +
++            `invalidate the real serve's session leases. Scrub OPENCODE_SERVE_ID and ` +
++            `OPENCODE_ROUTING_DB before spawning a throwaway serve. Exiting.`,
++        )
++        // Exit before registerSelf, so no endpoint/instance_uuid write happens, and
++        // before setSelfIdentity, so no lease can be written either.
++        yield* Effect.sync(() => process.exit(21))
++      }
++      if (!pidFence.armed) {
++        console.warn(
++          `WARNING: routing slot ${serveId} PID fence NOT ARMED ` +
++            `(OPENCODE_SERVE_EXPECTED_PID unset). Any child process inheriting ` +
++            `OPENCODE_SERVE_ID + OPENCODE_ROUTING_DB can hijack this slot if port binding succeeds. ` +
++            `Set OPENCODE_SERVE_EXPECTED_PID=$$ in the wrapper before exec.`,
++        )
++      }
++
        const lease = yield* Effect.promise(() => getSharedRoutingLease())
        yield* Effect.promise(() => lease.registerSelf({ serveId, instanceUuid, endpoint }))
        
-@@ -45,6 +105,47 @@
+@@ -45,6 +134,47 @@ export const ServeCommand = effectCmd({
            )
            console.log(`serve heartbeat started (mode=${heartbeat.mode}, interval=${intervalMs}ms)`)
  
@@ -792,9 +955,11 @@
            // Finalizers run LIFO: register markDead FIRST so it runs LAST, after
            // the heartbeat has stopped — otherwise a trailing beat could resurrect
            // health_state='healthy' over the draining marker.
+diff --git a/packages/opencode/test/cli/serve/serve-process.test.ts b/packages/opencode/test/cli/serve/serve-process.test.ts
+index 20e2783..46ad654 100644
 --- a/packages/opencode/test/cli/serve/serve-process.test.ts
 +++ b/packages/opencode/test/cli/serve/serve-process.test.ts
-@@ -319,4 +319,167 @@
+@@ -319,4 +319,202 @@ describe("opencode serve (subprocess)", () => {
        }),
      60_000,
    )
@@ -921,6 +1086,41 @@
 +  )
 +
 +
++  cliIt.live(
++    "PID fence: REFUSES to claim the slot and EXITS when process PID does not match expected PID",
++    ({ opencode }) =>
++      Effect.gen(function* () {
++        const tmp = yield* Effect.promise(() => tmpdir())
++        yield* Effect.addFinalizer(() => Effect.promise(() => tmp[Symbol.asyncDispose]()))
++        const dbFile = path.join(tmp.path, "routing.db")
++        seedRoutingDb(dbFile)
++
++        const serveId = "serve-pid-fence-mismatch"
++        const port = yield* Effect.promise(() => freePort())
++
++        // PID 1 is init; the spawned child process PID will never be 1.
++        // Note: the test "port fence: registers normally when the bound port IS the expected port"
++        // above doubles as the unarmed-PID end-to-end case, since it sets no PID var.
++        const server = yield* opencode.serve({
++          port,
++          env: {
++            OPENCODE_ROUTING_DB: dbFile,
++            OPENCODE_SERVE_ID: serveId,
++            OPENCODE_SERVE_EXPECTED_PORT: String(port),
++            OPENCODE_SERVE_EXPECTED_PID: "1",
++          },
++        })
++
++        // It must die on its own (exit code 21) — no kill() here.
++        const exitCode = yield* Effect.promise(() => server.exited)
++        expect(exitCode).toBe(21)
++
++        // The slot must be untouched.
++        expect(readServeRow(dbFile, serveId)).toBeNull()
++      }),
++    60_000,
++  )
++
 +  // ---------------------------------------------------------------------------
 +  // HARNESS HERMETICITY GUARD (bead pigeon-13p).
 +  //
@@ -962,9 +1162,11 @@
 +  )
 +
  })
+diff --git a/packages/opencode/test/lib/cli-process.ts b/packages/opencode/test/lib/cli-process.ts
+index 12e8d9c..768c834 100644
 --- a/packages/opencode/test/lib/cli-process.ts
 +++ b/packages/opencode/test/lib/cli-process.ts
-@@ -59,6 +59,45 @@
+@@ -59,6 +59,46 @@ function forkStderrDrain(stream: ReadableStream<Uint8Array>, into: string[]) {
    )
  }
  
@@ -993,6 +1195,7 @@
 +  "OPENCODE_SERVE_ID",
 +  "OPENCODE_ROUTING_DB",
 +  "OPENCODE_SERVE_EXPECTED_PORT",
++  "OPENCODE_SERVE_EXPECTED_PID",
 +  "OPENCODE_DB",
 +  "OPENCODE_SESSION_ID",
 +  "OPENCODE_WORKSPACE_ID",
@@ -1010,7 +1213,7 @@
  function isolatedEnv(home: string, configJson: string): Record<string, string> {
    return {
      OPENCODE_TEST_HOME: home,
-@@ -128,6 +167,11 @@
+@@ -128,6 +168,11 @@ export type ServeHandle = {
    readonly kill: () => void
    // Resolves with the exit code once the process exits. Bun returns a number.
    readonly exited: Promise<number>
@@ -1022,7 +1225,7 @@
  }
  
  // `opencode acp` speaks newline-delimited JSON-RPC over stdin/stdout. It is
-@@ -285,7 +329,7 @@
+@@ -285,7 +330,7 @@ export function withCliFixture<A, E>(
          Effect.sync(() =>
            Bun.spawn(["bun", "run", "--conditions=browser", cliEntry, ...runArgs(message, opts)], {
              cwd: home,
@@ -1031,7 +1234,7 @@
              stdin: "ignore",
              stdout: "pipe",
              stderr: "pipe",
-@@ -326,7 +370,7 @@
+@@ -326,7 +371,7 @@ export function withCliFixture<A, E>(
          Effect.sync(() =>
            Bun.spawn(["bun", "run", "--conditions=browser", cliEntry, ...argv], {
              cwd: home,
@@ -1040,7 +1243,7 @@
              stdout: "pipe",
              stderr: "pipe",
            }),
-@@ -348,11 +392,13 @@
+@@ -348,11 +393,13 @@ export function withCliFixture<A, E>(
        //   "opencode server listening on http://<host>:<port>"
        const readyRe = /listening on (http:\/\/([^\s:]+):(\d+))/
        const readyDeferred = yield* Deferred.make<{ url: string; hostname: string; port: number }>()
@@ -1054,7 +1257,7 @@
              const m = line.match(readyRe)
              return m ? Deferred.succeed(readyDeferred, { url: m[1], hostname: m[2], port: Number(m[3]) }) : Effect.void
            }),
-@@ -382,6 +428,7 @@
+@@ -382,6 +429,7 @@ export function withCliFixture<A, E>(
            proc.kill()
          },
          exited: proc.exited as Promise<number>,
@@ -1062,7 +1265,7 @@
        } satisfies ServeHandle
      })
  
-@@ -397,7 +444,7 @@
+@@ -397,7 +445,7 @@ export function withCliFixture<A, E>(
          Effect.sync(() =>
            Bun.spawn(["bun", "run", "--conditions=browser", cliEntry, ...argv], {
              cwd: opts?.cwd ?? home,
@@ -1071,7 +1274,10 @@
              stdin: "pipe",
              stdout: "pipe",
              stderr: "pipe",
---- a/packages/opencode/test/lib/hermetic-env.test.ts
+diff --git a/packages/opencode/test/lib/hermetic-env.test.ts b/packages/opencode/test/lib/hermetic-env.test.ts
+new file mode 100644
+index 0000000..5fe1f6c
+--- /dev/null
 +++ b/packages/opencode/test/lib/hermetic-env.test.ts
 @@ -0,0 +1,73 @@
 +/**
