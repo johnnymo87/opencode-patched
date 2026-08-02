@@ -1,25 +1,3 @@
-diff --git a/bun.lock b/bun.lock
-index ebf0a2a..aa9bd93 100644
---- a/bun.lock
-+++ b/bun.lock
-@@ -2677,7 +2677,7 @@
- 
-     "@solidjs/router": ["@solidjs/router@0.15.4", "", { "peerDependencies": { "solid-js": "^1.8.6" } }, "sha512-WOpgg9a9T638cR+5FGbFi/IV4l2FpmBs1GpIMSPa0Ce9vyJN7Wts+X2PqMf9IYn0zUj2MlSJtm1gp7/HI/n5TQ=="],
- 
--    "@solidjs/start": ["@solidjs/start@https://pkg.pr.new/@solidjs/start@dfb2020", { "dependencies": { "@babel/core": "^7.28.3", "@babel/traverse": "^7.28.3", "@babel/types": "^7.28.5", "@solidjs/meta": "^0.29.4", "@tanstack/server-functions-plugin": "1.134.5", "@types/babel__traverse": "^7.28.0", "@types/micromatch": "^4.0.9", "cookie-es": "^2.0.0", "defu": "^6.1.4", "error-stack-parser": "^2.1.4", "es-module-lexer": "^1.7.0", "esbuild": "^0.25.3", "fast-glob": "^3.3.3", "h3": "npm:h3@2.0.1-rc.4", "html-to-image": "^1.11.13", "micromatch": "^4.0.8", "path-to-regexp": "^8.2.0", "pathe": "^2.0.3", "radix3": "^1.1.2", "seroval": "^1.3.2", "seroval-plugins": "^1.2.1", "shiki": "^1.26.1", "solid-js": "^1.9.9", "source-map-js": "^1.2.1", "srvx": "^0.9.1", "terracotta": "^1.0.6", "vite": "7.1.10", "vite-plugin-solid": "^2.11.9", "vitest": "^4.0.10" } }, "sha512-7JjjA49VGNOsMRI8QRUhVudZmv0CnJ18SliSgK1ojszs/c3ijftgVkzvXdkSLN4miDTzbkXewf65D6ZBo6W+GQ=="],
-+    "@solidjs/start": ["@solidjs/start@https://pkg.pr.new/@solidjs/start@dfb2020", { "dependencies": { "@babel/core": "^7.28.3", "@babel/traverse": "^7.28.3", "@babel/types": "^7.28.5", "@solidjs/meta": "^0.29.4", "@tanstack/server-functions-plugin": "1.134.5", "@types/babel__traverse": "^7.28.0", "@types/micromatch": "^4.0.9", "cookie-es": "^2.0.0", "defu": "^6.1.4", "error-stack-parser": "^2.1.4", "es-module-lexer": "^1.7.0", "esbuild": "^0.25.3", "fast-glob": "^3.3.3", "h3": "npm:h3@2.0.1-rc.4", "html-to-image": "^1.11.13", "micromatch": "^4.0.8", "path-to-regexp": "^8.2.0", "pathe": "^2.0.3", "radix3": "^1.1.2", "seroval": "^1.3.2", "seroval-plugins": "^1.2.1", "shiki": "^1.26.1", "solid-js": "^1.9.9", "source-map-js": "^1.2.1", "srvx": "^0.9.1", "terracotta": "^1.0.6", "vite": "7.1.10", "vite-plugin-solid": "^2.11.9", "vitest": "^4.0.10" } }],
- 
-     "@speed-highlight/core": ["@speed-highlight/core@1.2.15", "", {}, "sha512-BMq1K3DsElxDWawkX6eLg9+CKJrTVGCBAWVuHXVUV2u0s2711qiChLSId6ikYPfxhdYocLNt3wWwSvDiTvFabw=="],
- 
-@@ -3805,7 +3805,7 @@
- 
-     "get-tsconfig": ["get-tsconfig@4.14.0", "", { "dependencies": { "resolve-pkg-maps": "^1.0.0" } }, "sha512-yTb+8DXzDREzgvYmh6s9vHsSVCHeC0G3PI5bEXNBHtmshPnO+S5O7qgLEOn0I5QvMy6kpZN8K1NKGyilLb93wA=="],
- 
--    "ghostty-web": ["ghostty-web@github:anomalyco/ghostty-web#513463a", {}, "anomalyco-ghostty-web-513463a", "sha512-GZR8LSmgGzViWnBJrqRI8MpAZRCJxhcr1Hi9Tyeh7YRooHZQjK9J97FQRD3tbBaM2wjq05gzGY2UEsG+JtZeBw=="],
-+    "ghostty-web": ["ghostty-web@github:anomalyco/ghostty-web#513463a", {}, "anomalyco-ghostty-web-513463a"],
- 
-     "giget": ["giget@2.0.0", "", { "dependencies": { "citty": "^0.1.6", "consola": "^3.4.0", "defu": "^6.1.4", "node-fetch-native": "^1.6.6", "nypm": "^0.6.0", "pathe": "^2.0.3" }, "bin": { "giget": "dist/cli.mjs" } }, "sha512-L5bGsVkxJbJgdnwyuheIunkGatUF/zssUoxxjACCseZYAVbaqdh9Tsmmlkl8vYan09H7sbvKt4pS8GqKLBrEzA=="],
- 
 diff --git a/packages/core/src/flag/flag.ts b/packages/core/src/flag/flag.ts
 index 5be4e46..1d85ed5 100644
 --- a/packages/core/src/flag/flag.ts
@@ -800,7 +778,7 @@ index 0820da0..56546b3 100644
 +  });
 +});
 diff --git a/packages/opencode/src/cli/cmd/serve.ts b/packages/opencode/src/cli/cmd/serve.ts
-index 1c5d191..4fc7581 100644
+index 1c5d191..358a207 100644
 --- a/packages/opencode/src/cli/cmd/serve.ts
 +++ b/packages/opencode/src/cli/cmd/serve.ts
 @@ -1,6 +1,6 @@
@@ -811,7 +789,7 @@ index 1c5d191..4fc7581 100644
  import { startServeHeartbeat } from "../../serve/heartbeat"
  import { effectCmd } from "../effect-cmd"
  import { withNetworkOptions, resolveNetworkOptions } from "../network"
-@@ -26,6 +26,95 @@ export const ServeCommand = effectCmd({
+@@ -26,6 +26,98 @@ export const ServeCommand = effectCmd({
        const serveId = Flag.OPENCODE_SERVE_ID
        const instanceUuid = randomUUID()
        const endpoint = `http://127.0.0.1:${server.port}`
@@ -833,15 +811,18 @@ index 1c5d191..4fc7581 100644
 +      // unit gets noticed; a silently-unfenced serve does not — the 2026-07-25
 +      // incident ran for hours precisely because nothing was loud), and the pool
 +      // degrades from K to K-1, which is what a pool is for.
-+      // TIGHTENED RESIDUAL (bead workstation-4b1q): Previously, a process with a
-+      // complete inherited identity that managed to BIND the expected port (e.g. via
-+      // IPv6/IPv4 binding on ::1 alongside 127.0.0.1) passed the port fence alone and
-+      // claimed the slot. The PID fence below tightens that: a child process inheriting
-+      // OPENCODE_SERVE_EXPECTED_PID=$$ cannot inherit the parent process's PID, so it
-+      // fails the PID fence and exits (exit code 21). This does NOT reintroduce the
++      // TIGHTENED RESIDUAL (bead workstation-4b1q): When OPENCODE_SERVE_EXPECTED_PID
++      // is ARMED, a process with a complete inherited identity that manages to BIND the
++      // expected port (e.g. via IPv6/IPv4 binding on ::1 alongside 127.0.0.1) fails the
++      // PID fence below and exits (exit code 21). This does NOT reintroduce the
 +      // rejected "refuse takeover while the slot looks live" design, because this fence
 +      // EXITS (exit 21) rather than continuing to run with a null identity (since
 +      // withSessionLease fails OPEN on a null identity — that was the hazard).
++      //
++      // When OPENCODE_SERVE_EXPECTED_PID is UNSET (fence unarmed), the pre-PID-fence
++      // residual applies unchanged: binding the expected port is only possible when the
++      // real pool member is not holding it, and at that moment possession of the port is
++      // treated as "being the pool member" with the kernel as arbiter.
 +      const fence = checkServePortFence(Flag.OPENCODE_SERVE_EXPECTED_PORT, server.port)
 +      if (fence.armed && !fence.ok) {
 +        const detail =
@@ -889,7 +870,7 @@ index 1c5d191..4fc7581 100644
 +            `OPENCODE_SERVE_ID and OPENCODE_ROUTING_DB from a parent opencode session. ` +
 +            `Registering would repoint ${serveId} at ${endpoint} for every client and ` +
 +            `invalidate the real serve's session leases. Scrub OPENCODE_SERVE_ID and ` +
-+            `OPENCODE_ROUTING_DB before spawning a throwaway serve. Exiting.`,
++            `OPENCODE_ROUTING_DB before spawning a throwaway serve, or relaunch a legitimate pool member via bash -c 'export OPENCODE_SERVE_EXPECTED_PID=$$; exec opencode serve --port <port> --hostname 127.0.0.1'. Exiting.`,
 +        )
 +        // Exit before registerSelf, so no endpoint/instance_uuid write happens, and
 +        // before setSelfIdentity, so no lease can be written either.
@@ -907,7 +888,7 @@ index 1c5d191..4fc7581 100644
        const lease = yield* Effect.promise(() => getSharedRoutingLease())
        yield* Effect.promise(() => lease.registerSelf({ serveId, instanceUuid, endpoint }))
        
-@@ -45,6 +134,47 @@ export const ServeCommand = effectCmd({
+@@ -45,6 +137,47 @@ export const ServeCommand = effectCmd({
            )
            console.log(`serve heartbeat started (mode=${heartbeat.mode}, interval=${intervalMs}ms)`)
  
@@ -956,10 +937,10 @@ index 1c5d191..4fc7581 100644
            // the heartbeat has stopped — otherwise a trailing beat could resurrect
            // health_state='healthy' over the draining marker.
 diff --git a/packages/opencode/test/cli/serve/serve-process.test.ts b/packages/opencode/test/cli/serve/serve-process.test.ts
-index 20e2783..46ad654 100644
+index 20e2783..1a08de3 100644
 --- a/packages/opencode/test/cli/serve/serve-process.test.ts
 +++ b/packages/opencode/test/cli/serve/serve-process.test.ts
-@@ -319,4 +319,202 @@ describe("opencode serve (subprocess)", () => {
+@@ -319,4 +319,242 @@ describe("opencode serve (subprocess)", () => {
        }),
      60_000,
    )
@@ -1098,9 +1079,6 @@ index 20e2783..46ad654 100644
 +        const serveId = "serve-pid-fence-mismatch"
 +        const port = yield* Effect.promise(() => freePort())
 +
-+        // PID 1 is init; the spawned child process PID will never be 1.
-+        // Note: the test "port fence: registers normally when the bound port IS the expected port"
-+        // above doubles as the unarmed-PID end-to-end case, since it sets no PID var.
 +        const server = yield* opencode.serve({
 +          port,
 +          env: {
@@ -1117,6 +1095,49 @@ index 20e2783..46ad654 100644
 +
 +        // The slot must be untouched.
 +        expect(readServeRow(dbFile, serveId)).toBeNull()
++      }),
++    60_000,
++  )
++
++  cliIt.live(
++    "PID fence: registers normally when OPENCODE_SERVE_EXPECTED_PID matches process PID via wrapper exec",
++    ({ opencode }) =>
++      Effect.gen(function* () {
++        const tmp = yield* Effect.promise(() => tmpdir())
++        yield* Effect.addFinalizer(() => Effect.promise(() => tmp[Symbol.asyncDispose]()))
++        const dbFile = path.join(tmp.path, "routing.db")
++        seedRoutingDb(dbFile)
++
++        const serveId = "serve-pid-fence-match"
++        const port = yield* Effect.promise(() => freePort())
++
++        // Exec through wrapper shell: sets OPENCODE_SERVE_EXPECTED_PID=$$ then execs serve.
++        // process.pid of the serve process matches $$ exactly.
++        const server = yield* opencode.serve({
++          port,
++          exec: true,
++          env: {
++            OPENCODE_ROUTING_DB: dbFile,
++            OPENCODE_SERVE_ID: serveId,
++            OPENCODE_SERVE_EXPECTED_PORT: String(port),
++          },
++        })
++
++        let row: any = null
++        for (let i = 0; i < 50; i++) {
++          row = readServeRow(dbFile, serveId)
++          if (row) break
++          yield* Effect.sleep("100 millis")
++        }
++
++        expect(row).toBeDefined()
++        expect(row).not.toBeNull()
++        expect(row.endpoint).toBe(`http://127.0.0.1:${port}`)
++        expect(row.health_state).toBe("healthy")
++        expect(row.draining).toBe(0)
++
++        server.kill()
++        yield* Effect.promise(() => server.exited)
 +      }),
 +    60_000,
 +  )
@@ -1163,7 +1184,7 @@ index 20e2783..46ad654 100644
 +
  })
 diff --git a/packages/opencode/test/lib/cli-process.ts b/packages/opencode/test/lib/cli-process.ts
-index 12e8d9c..768c834 100644
+index 12e8d9c..0c7260a 100644
 --- a/packages/opencode/test/lib/cli-process.ts
 +++ b/packages/opencode/test/lib/cli-process.ts
 @@ -59,6 +59,46 @@ function forkStderrDrain(stream: ReadableStream<Uint8Array>, into: string[]) {
@@ -1213,7 +1234,15 @@ index 12e8d9c..768c834 100644
  function isolatedEnv(home: string, configJson: string): Record<string, string> {
    return {
      OPENCODE_TEST_HOME: home,
-@@ -128,6 +168,11 @@ export type ServeHandle = {
+@@ -111,6 +151,7 @@ export type ServeOpts = SpawnOpts & {
+   readonly port?: number
+   readonly hostname?: string
+   readonly extraArgs?: string[]
++  readonly exec?: boolean
+   // How long to wait for the "listening on http://..." line before failing.
+   // Default 15s — startup is dominated by bun's transpile + plugin init, not
+   // the actual listen() call.
+@@ -128,6 +169,11 @@ export type ServeHandle = {
    readonly kill: () => void
    // Resolves with the exit code once the process exits. Bun returns a number.
    readonly exited: Promise<number>
@@ -1225,7 +1254,7 @@ index 12e8d9c..768c834 100644
  }
  
  // `opencode acp` speaks newline-delimited JSON-RPC over stdin/stdout. It is
-@@ -285,7 +330,7 @@ export function withCliFixture<A, E>(
+@@ -285,7 +331,7 @@ export function withCliFixture<A, E>(
          Effect.sync(() =>
            Bun.spawn(["bun", "run", "--conditions=browser", cliEntry, ...runArgs(message, opts)], {
              cwd: home,
@@ -1234,16 +1263,28 @@ index 12e8d9c..768c834 100644
              stdin: "ignore",
              stdout: "pipe",
              stderr: "pipe",
-@@ -326,7 +371,7 @@ export function withCliFixture<A, E>(
+@@ -319,14 +365,18 @@ export function withCliFixture<A, E>(
+       if (opts?.hostname) argv.push("--hostname", opts.hostname)
+       if (opts?.extraArgs) argv.push(...opts.extraArgs)
+ 
++      const spawnCmd = opts?.exec
++        ? ["bash", "-c", `export OPENCODE_SERVE_EXPECTED_PID=\$\$; exec bun run --conditions=browser "${cliEntry}" ${argv.map((a) => `"${a}"`).join(" ")}`]
++        : ["bun", "run", "--conditions=browser", cliEntry, ...argv]
++
+       // Acquire the subprocess; release sends SIGTERM and awaits exit on
+       // scope close. Wrapped in Effect.ignore so a flaky kill doesn't surface
+       // as a finalizer error during test teardown.
+       const proc = yield* Effect.acquireRelease(
          Effect.sync(() =>
-           Bun.spawn(["bun", "run", "--conditions=browser", cliEntry, ...argv], {
+-          Bun.spawn(["bun", "run", "--conditions=browser", cliEntry, ...argv], {
++          Bun.spawn(spawnCmd, {
              cwd: home,
 -            env: { ...process.env, ...env, ...opts?.env },
 +            env: { ...hermeticBaseEnv(), ...env, ...opts?.env },
              stdout: "pipe",
              stderr: "pipe",
            }),
-@@ -348,11 +393,13 @@ export function withCliFixture<A, E>(
+@@ -348,11 +398,13 @@ export function withCliFixture<A, E>(
        //   "opencode server listening on http://<host>:<port>"
        const readyRe = /listening on (http:\/\/([^\s:]+):(\d+))/
        const readyDeferred = yield* Deferred.make<{ url: string; hostname: string; port: number }>()
@@ -1257,7 +1298,7 @@ index 12e8d9c..768c834 100644
              const m = line.match(readyRe)
              return m ? Deferred.succeed(readyDeferred, { url: m[1], hostname: m[2], port: Number(m[3]) }) : Effect.void
            }),
-@@ -382,6 +429,7 @@ export function withCliFixture<A, E>(
+@@ -382,6 +434,7 @@ export function withCliFixture<A, E>(
            proc.kill()
          },
          exited: proc.exited as Promise<number>,
@@ -1265,7 +1306,7 @@ index 12e8d9c..768c834 100644
        } satisfies ServeHandle
      })
  
-@@ -397,7 +445,7 @@ export function withCliFixture<A, E>(
+@@ -397,7 +450,7 @@ export function withCliFixture<A, E>(
          Effect.sync(() =>
            Bun.spawn(["bun", "run", "--conditions=browser", cliEntry, ...argv], {
              cwd: opts?.cwd ?? home,
