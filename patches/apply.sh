@@ -350,6 +350,48 @@
 #                                               RouteProvider + ToastProvider. MUST apply LAST (it diffs against
 #                                               the full stack; tui-mcp-dialog also edits sync.tsx).
 #
+#  26. registry-port-fence.patch (local)    - refuse to claim a pool slot this process does not own,
+#                                               and fence markDead on identity so a restarting serve
+#                                               cannot evict the live owner of its old port. Previously
+#                                               undocumented in this list -- added here while numbering
+#                                               the next patch, since an undocumented entry is how the
+#                                               list silently stops describing the build.
+#
+#  27. plugin-loader-observability.patch (local) - make plugin load failures OBSERVABLE (bead
+#                                               workstation-5yox step 3a). The loader could fail to load
+#                                               a plugin and emit NOTHING ANYWHERE: report.error routes
+#                                               every stage to publishPluginError, which only publishes a
+#                                               Session.Event.Error that no log sink observes, and
+#                                               report.missing is a bare no-op that does not even do that.
+#                                               MEASURED on a real serve against three broken plugins: the
+#                                               unpatched binary produced 0 log lines, 0 level=ERROR lines
+#                                               and 118 bytes of stdout while answering HTTP 200. On this
+#                                               host that silence covers 8 of the 9 deployed plugin files,
+#                                               including two mkOutOfStoreSymlinks into other repos'
+#                                               live checkouts that have no build-time cover at all.
+#                                               Adds (a) logPluginError(), a structured logError beside the
+#                                               existing publishPluginError, called from ALL FOUR
+#                                               report.error stages AND from report.missing; (b) an INFO
+#                                               "plugin loaded" line per successfully applied plugin --
+#                                               INFO because a production log carries zero DEBUG lines, so
+#                                               DEBUG would not be emitted at all. Deliberately reuses the
+#                                               EXACT message text ("failed to load plugin") and `path`
+#                                               field of the pre-existing load-failure logError, so a log
+#                                               consumer needs no change to gain the new shapes; `stage`
+#                                               is appended to distinguish them for a human. Note an
+#                                               import-time throw arrives as stage "load", not the "entry"
+#                                               one might predict -- which is why all stages are covered
+#                                               rather than the interesting-looking one.
+#                                               Tests: test/plugin/loader-observability.test.ts, run by the
+#                                               "Plugin loader observability tests" step in
+#                                               build-release.yml -- a patch-carried test that no workflow
+#                                               names is inert. Verified non-vacuous by mutation: with the
+#                                               source hunks reverted all 4 go red.
+#                                               Disjoint from every other patch (no other patch touches
+#                                               plugin/{index,loader,shared}.ts), so order-independent.
+#                                               SUNSET: drop if upstream merges the equivalent; an upstream
+#                                               PR carries the same three changes.
+#
 # DROPPED on the v1.17 line (see workstation docs/plans/2026-06-11-opencode-1.17-cutover-runbook.md):
 #   - integration-list-batch.patch: DROPPED on the v1.17.13 roll-forward (2026-07-06).
 #     UPSTREAMED — v1.17.13 Integration.list now does the bulk shape natively:
@@ -437,6 +479,7 @@ PATCHES=(
   opus5-adaptive-thinking
   tui-reconcile-bound
   registry-port-fence
+  plugin-loader-observability
 )
 
 for name in "${PATCHES[@]}"; do

@@ -102,6 +102,17 @@ jobs:
             test/cli/tui/reconcile-bound.test.tsx \
             test/cli/cmd/tui/bootstrap-settled.test.tsx
 
+      # plugin-loader-observability.patch makes plugin load failures visible at
+      # all -- several shapes previously emitted NOTHING anywhere, not even on
+      # stderr. The log line is the entire contract, and on the deployed hosts it
+      # is the only per-file signal for 8 of 9 plugin files, so it is pinned by a
+      # test rather than by hope. Named here because build-release runs only the
+      # files it names; a patch-carried test that no step names is inert.
+      - name: Plugin loader observability tests
+        run: |
+          cd opencode-src/packages/opencode
+          bun test test/plugin/loader-observability.test.ts
+
       - name: Build CLI
         run: |
           cd opencode-src/packages/opencode
