@@ -410,12 +410,24 @@
 #                                               Stamps {serveId, invocationId, port, pid} into the
 #                                               assistant row's data blob in messageData(), the SINGLE
 #                                               upsert path for both creation and every later update --
-#                                               so it covers the main agent loop, subtasks, shell and
-#                                               compaction alike, and re-stamps on each update so a later
-#                                               write cannot strip it. MEASURED reason this matters: of
-#                                               91 sessions invisible to the front-door log in 24h, 60
-#                                               were subagent children, so a main-loop-only stamp would
-#                                               have missed most of the orphan population.
+#                                               so it covers every assistant row the sweeper can sweep
+#                                               (main agent loop, subtasks, compaction), and re-stamps on
+#                                               each update so the stamp names the LAST writer. NOT shell
+#                                               messages: those go through SessionMessageUpdater into the
+#                                               separate session_message table, which the sweeper never
+#                                               reads. MEASURED reason the choke point matters: of 91
+#                                               sessions invisible to the front-door log in 24h, 60 were
+#                                               subagent children, so a main-loop-only stamp would have
+#                                               missed most of the orphan population.
+#                                               Last-writer rather than creator is deliberate: a writer
+#                                               is alive at the instant it writes, so a stamp naming a
+#                                               DEAD invocation proves nothing has touched the row since
+#                                               that invocation died. The else-branch STRIPS a foreign
+#                                               stamp when the gate declines -- without it a declining
+#                                               process would carry someone else's identity forward
+#                                               (`serve` is a declared field, so it survives a
+#                                               decode/re-publish cycle) and the row would name a process
+#                                               that is not its last writer.
 #                                               Keyed on systemd's INVOCATION_ID, NOT pid and NOT a
 #                                               timestamp: the unit's MainPID is a wrapper script so
 #                                               process.pid != MainPID, and Date.now() at start never
@@ -424,16 +436,47 @@
 #                                               Verified on cloudbox that INVOCATION_ID reaches the
 #                                               process and matches `systemctl show -p InvocationID`,
 #                                               4/4 pool members.
-#                                               Gated on OPENCODE_SERVE_ID (only the pool template sets
-#                                               it) because systemd exports INVOCATION_ID to every child
-#                                               of every unit -- three non-pool processes on this host
-#                                               were measured carrying one, and a standalone TUI stamping
-#                                               an inherited stale id would invite the sweeper to abort
-#                                               its live rows. No stamp => the sweeper keeps the old
-#                                               cutoff, so the change is strictly additive.
+#                                               THE GATE ESTABLISHES FATE-SHARING, NOT ANCESTRY, and the
+#                                               obvious env-only version is WRONG -- adversarial review
+#                                               falsified it by measurement. env vars say "descended from
+#                                               a serve"; the stamp needs "dies with that serve". Every
+#                                               agent tool subprocess inherits OPENCODE_SERVE_ID *and*
+#                                               INVOCATION_ID while running in its own transient scope
+#                                               under oc-agent.slice (workstation-yt0p), so it OUTLIVES a
+#                                               serve restart and carries a scope invocation id that
+#                                               appears in no opencode-serve@* unit -- measured: a tool
+#                                               call reporting serve-3 with INVOCATION_ID=21efa50c...
+#                                               while its serve was 8b8f626a.... Any opencode core process
+#                                               started from there (`opencode run`, `opencode debug
+#                                               agent`) boots the projector and would stamp an
+#                                               always-dead-looking invocation onto LIVE rows, and the
+#                                               sweeper would abort a running turn -- a case today's
+#                                               min-cutoff gate handles CORRECTLY, so an env-only gate
+#                                               would have made things strictly worse, not additive.
+#                                               So the gate additionally requires /proc/self/cgroup to
+#                                               name opencode-serve@<port>.service. With the default
+#                                               KillMode=control-group everything in that cgroup dies
+#                                               with the unit, which makes "invocation dead => writer
+#                                               dead" true by systemd mechanics rather than env hygiene.
+#                                               Outside it: no stamp, and the sweeper keeps its old
+#                                               conservative cutoff -- so the change IS additive.
+#                                               Inert on macOS (launchd sets OPENCODE_SERVE_ID but gives
+#                                               no INVOCATION_ID and has no /proc/self/cgroup), which is
+#                                               the correct outcome there.
 #                                               Tests: test/session/serve-provenance{,-gate}.test.ts,
-#                                               which need a step in build-release.yml -- a patch-carried
-#                                               test that no workflow names is inert.
+#                                               named by a step in build-release.yml -- a patch-carried
+#                                               test that no workflow names is inert. 16 tests. Verified
+#                                               non-vacuous by mutating the PRODUCTION lines one at a
+#                                               time, not just the gate helper: removing the cgroup check
+#                                               turns 5 red, removing the stamping block 1, removing the
+#                                               strip else-branch 1.
+#                                               NO REPLAY HAZARD (checked, because a re-projection would
+#                                               re-stamp a dead row with a live identity and un-sweep the
+#                                               worst rows): projector handlers run only inside the
+#                                               transaction that FIRST persists an event; the replay path
+#                                               dedupes and returns at event.ts:282 before reaching them.
+#                                               The machinery that could change this is remove() plus
+#                                               replayAll(); nothing calls that combination today.
 #                                               Touches projector.ts, which sqlite-foreign-key-wrap also
 #                                               patches, but at disjoint hunks (that one at ~23/270/321,
 #                                               this at ~75); ordered after it regardless.
