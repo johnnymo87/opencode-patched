@@ -392,6 +392,95 @@
 #                                               SUNSET: drop if upstream merges the equivalent; an upstream
 #                                               PR carries the same three changes.
 #
+#  28. message-serve-provenance.patch (local) - stamp WHICH SERVE created an assistant row, so the
+#                                               phantom-busy sweeper can finalize an orphan promptly
+#                                               instead of deferring it up to ~24h (bead
+#                                               workstation-63wo, the build branch of a pre-committed
+#                                               decision rule).
+#                                               A serve killed abruptly (kernel OOM, canary SIGKILL,
+#                                               crash) never runs cleanup, leaving an assistant row with
+#                                               time.completed unset and no error -- the session then
+#                                               shimmers "working" forever in every TUI that loads it,
+#                                               ~1 core each. The sweeper may only finalize such a row
+#                                               once it is certain the CREATING process is gone, and
+#                                               nothing in the row said who that was, so it fell back to
+#                                               "older than the OLDEST live pool member" -- which cannot
+#                                               see a fresh single-member orphan until the nightly
+#                                               whole-pool restart.
+#                                               Stamps {serveId, invocationId, port, pid} into the
+#                                               assistant row's data blob in messageData(), the SINGLE
+#                                               upsert path for both creation and every later update --
+#                                               so it covers every assistant row the sweeper can sweep
+#                                               (main agent loop, subtasks, compaction), and re-stamps on
+#                                               each update so the stamp names the LAST writer. NOT shell
+#                                               messages: those go through SessionMessageUpdater into the
+#                                               separate session_message table, which the sweeper never
+#                                               reads. MEASURED reason the choke point matters: of 91
+#                                               sessions invisible to the front-door log in 24h, 60 were
+#                                               subagent children, so a main-loop-only stamp would have
+#                                               missed most of the orphan population.
+#                                               Last-writer rather than creator is deliberate: a writer
+#                                               is alive at the instant it writes, so a stamp naming a
+#                                               DEAD invocation proves nothing has touched the row since
+#                                               that invocation died. The else-branch STRIPS a foreign
+#                                               stamp when the gate declines -- without it a declining
+#                                               process would carry someone else's identity forward
+#                                               (`serve` is a declared field, so it survives a
+#                                               decode/re-publish cycle) and the row would name a process
+#                                               that is not its last writer.
+#                                               Keyed on systemd's INVOCATION_ID, NOT pid and NOT a
+#                                               timestamp: the unit's MainPID is a wrapper script so
+#                                               process.pid != MainPID, and Date.now() at start never
+#                                               equals ActiveEnterTimestamp -- either comparison would
+#                                               judge every LIVE row dead and abort running turns.
+#                                               Verified on cloudbox that INVOCATION_ID reaches the
+#                                               process and matches `systemctl show -p InvocationID`,
+#                                               4/4 pool members.
+#                                               THE GATE ESTABLISHES FATE-SHARING, NOT ANCESTRY, and the
+#                                               obvious env-only version is WRONG -- adversarial review
+#                                               falsified it by measurement. env vars say "descended from
+#                                               a serve"; the stamp needs "dies with that serve". Every
+#                                               agent tool subprocess inherits OPENCODE_SERVE_ID *and*
+#                                               INVOCATION_ID while running in its own transient scope
+#                                               under oc-agent.slice (workstation-yt0p), so it OUTLIVES a
+#                                               serve restart and carries a scope invocation id that
+#                                               appears in no opencode-serve@* unit -- measured: a tool
+#                                               call reporting serve-3 with INVOCATION_ID=21efa50c...
+#                                               while its serve was 8b8f626a.... Any opencode core process
+#                                               started from there (`opencode run`, `opencode debug
+#                                               agent`) boots the projector and would stamp an
+#                                               always-dead-looking invocation onto LIVE rows, and the
+#                                               sweeper would abort a running turn -- a case today's
+#                                               min-cutoff gate handles CORRECTLY, so an env-only gate
+#                                               would have made things strictly worse, not additive.
+#                                               So the gate additionally requires /proc/self/cgroup to
+#                                               name opencode-serve@<port>.service. With the default
+#                                               KillMode=control-group everything in that cgroup dies
+#                                               with the unit, which makes "invocation dead => writer
+#                                               dead" true by systemd mechanics rather than env hygiene.
+#                                               Outside it: no stamp, and the sweeper keeps its old
+#                                               conservative cutoff -- so the change IS additive.
+#                                               Inert on macOS (launchd sets OPENCODE_SERVE_ID but gives
+#                                               no INVOCATION_ID and has no /proc/self/cgroup), which is
+#                                               the correct outcome there.
+#                                               Tests: test/session/serve-provenance{,-gate}.test.ts,
+#                                               named by a step in build-release.yml -- a patch-carried
+#                                               test that no workflow names is inert. 16 tests. Verified
+#                                               non-vacuous by mutating the PRODUCTION lines one at a
+#                                               time, not just the gate helper: removing the cgroup check
+#                                               turns 5 red, removing the stamping block 1, removing the
+#                                               strip else-branch 1.
+#                                               NO REPLAY HAZARD (checked, because a re-projection would
+#                                               re-stamp a dead row with a live identity and un-sweep the
+#                                               worst rows): projector handlers run only inside the
+#                                               transaction that FIRST persists an event; the replay path
+#                                               dedupes and returns at event.ts:282 before reaching them.
+#                                               The machinery that could change this is remove() plus
+#                                               replayAll(); nothing calls that combination today.
+#                                               Touches projector.ts, which sqlite-foreign-key-wrap also
+#                                               patches, but at disjoint hunks (that one at ~23/270/321,
+#                                               this at ~75); ordered after it regardless.
+#
 # DROPPED on the v1.17 line (see workstation docs/plans/2026-06-11-opencode-1.17-cutover-runbook.md):
 #   - integration-list-batch.patch: DROPPED on the v1.17.13 roll-forward (2026-07-06).
 #     UPSTREAMED — v1.17.13 Integration.list now does the bulk shape natively:
@@ -480,6 +569,7 @@ PATCHES=(
   tui-reconcile-bound
   registry-port-fence
   plugin-loader-observability
+  message-serve-provenance
 )
 
 for name in "${PATCHES[@]}"; do

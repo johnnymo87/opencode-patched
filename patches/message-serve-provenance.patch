@@ -1,0 +1,385 @@
+diff --git a/packages/core/src/session/projector.ts b/packages/core/src/session/projector.ts
+index afa60dfa88..b561ee3803 100644
+--- a/packages/core/src/session/projector.ts
++++ b/packages/core/src/session/projector.ts
+@@ -1,5 +1,6 @@
+ export * as SessionProjector from "./projector"
+ 
++import { readFileSync } from "node:fs"
+ import { and, desc, eq, gt, or, sql } from "drizzle-orm"
+ import { DateTime, Effect, Layer, Schema } from "effect"
+ import { Database } from "../database/database"
+@@ -75,11 +76,137 @@ function sessionRow(info: SessionV1.SessionInfo): typeof SessionTable.$inferInse
+   }
+ }
+ 
+-function messageData(
++// WRITE-TIME SERVE PROVENANCE (bead workstation-63wo).
++//
++// A serve that dies abruptly -- kernel OOM kill, canary SIGKILL, crash -- never
++// runs its cleanup, so it leaves an assistant row with `time.completed` unset and
++// no `error`. That row makes the session shimmer "working" forever in every TUI
++// that loads it, burning about a core per TUI. An external sweeper finalizes such
++// rows, but it may only do so when it is certain the process that CREATED the row
++// is gone; finalizing a row a LIVE serve is still generating would abort a running
++// turn. Nothing in the row recorded who wrote it, so the sweeper had to fall back
++// to "older than the OLDEST live serve in the pool" -- which is sound but defers a
++// fresh single-member orphan until the nightly whole-pool restart, up to ~24h.
++//
++// Stamping the creating serve's identity makes that decision exact: finalize a
++// stale row iff its stamped invocation is not among the currently-live ones.
++//
++// INVOCATION_ID rather than a pid or a start timestamp, because both of those are
++// wrong here in ways that fail toward ABORTING LIVE TURNS:
++//   * the unit's MainPID is a wrapper script (`comm` = ".opencode-wrapp"), so
++//     `process.pid` does not equal MainPID and a pid comparison would judge every
++//     live row dead;
++//   * `Date.now()` at process start never equals systemd's ActiveEnterTimestamp
++//     (the wrapper runs first), so an equality test on it is always false;
++//   * INVOCATION_ID is 128-bit, unique per unit ACTIVATION, needs no clock, and is
++//     immune to exec-vs-child indirection.
++//
++// Gated on OPENCODE_SERVE_ID, which only the pool's serve template sets. systemd
++// exports INVOCATION_ID to every child of every unit, so without that gate a
++// standalone TUI inheriting one from an unrelated unit would stamp a foreign,
++// long-dead invocation onto its own LIVE rows and invite the sweeper to abort
++// them. Absent stamp => the sweeper keeps its old conservative cutoff, so this is
++// purely additive: it can only ever make the sweeper act SOONER on rows it can
++// prove are orphaned, never on rows it cannot.
++//
++export type ServeProvenance = { serveId: string; invocationId: string; port: string; pid: number }
++
++// Exported and pure so the GATE is directly testable. The gate is the part that
++// can abort live turns if it is wrong, and its inputs are ambient process state,
++// which is awkward to vary through the projector's Effect/database machinery.
++//
++// THE GATE MUST ESTABLISH FATE-SHARING, NOT ANCESTRY. This is the subtle part,
++// and the obvious env-only version of it is WRONG. The stamp is only meaningful
++// to the sweeper if "the stamped invocation is gone" implies "the writer is
++// gone". Environment variables cannot establish that: systemd exports
++// INVOCATION_ID to every child of a unit, and children inherit OPENCODE_SERVE_ID
++// too, so an env-only check says "descended from a serve" when we need "will die
++// with that serve".
++//
++// On this host those are provably different populations. Every agent tool
++// subprocess runs in its own transient scope under `oc-agent.slice` (so that a
++// runaway build cannot OOM its serve), which means it OUTLIVES a serve restart
++// and carries a DIFFERENT invocation id of its own -- measured: a tool call
++// reported OPENCODE_SERVE_ID=serve-3 with INVOCATION_ID=21efa50c... while the
++// serve itself was 8b8f626a.... Any opencode core process started from there
++// (`opencode run`, `opencode debug agent`) boots this projector and would stamp
++// an invocation the sweeper cannot find in its unit set -- i.e. one that always
++// looks dead -- onto rows that are very much alive. The sweeper would then abort
++// a live turn, which is the one outcome this whole design exists to prevent.
++//
++// So membership in the serve's own cgroup is the actual requirement. With the
++// default KillMode=control-group, everything in that cgroup dies with the unit,
++// which makes "invocation dead => writer dead" true by systemd mechanics rather
++// than by env hygiene. A process outside it declines to stamp and falls back to
++// the sweeper's old conservative cutoff.
++export function serveProvenance(
++  env: Record<string, string | undefined>,
++  pid: number,
++  cgroup: string,
++): ServeProvenance | undefined {
++  const serveId = env["OPENCODE_SERVE_ID"]
++  const invocationId = env["INVOCATION_ID"]
++  const port = env["OPENCODE_SERVE_EXPECTED_PORT"]
++  // All three are required. Without a serve id this is not a pool process;
++  // without an invocation id nothing can liveness-check the row; without the port
++  // we cannot name the unit whose cgroup we must prove we are inside. A
++  // half-identity is worse than none, because it would only mislead the sweeper.
++  if (!serveId || !invocationId || !port) return undefined
++  // The unit name appears literally in the cgroup path, e.g.
++  //   0::/system.slice/system-opencode\x2dserve.slice/opencode-serve@4099.service
++  // (the slice component is escaped, the unit component is not).
++  if (!cgroup.includes(`opencode-serve@${port}.service`)) return undefined
++  return { serveId, invocationId, port, pid }
++}
++
++function selfCgroup(): string {
++  // Absent on non-systemd hosts (macOS/launchd sets OPENCODE_SERVE_ID but has no
++  // cgroups or INVOCATION_ID), where the correct outcome is simply no stamp.
++  try {
++    return readFileSync("/proc/self/cgroup", "utf8")
++  } catch {
++    return ""
++  }
++}
++
++// Computed once at module load: it is ambient process state that cannot change
++// for the life of the process, and re-deriving it would put a file read on the
++// hot path of every message update.
++const SERVE_PROVENANCE = serveProvenance(process.env, process.pid, selfCgroup())
++
++// Exported only so the stamping itself can be tested. The gate is tested through
++// serveProvenance(), but the gate being right is worthless if this function does
++// not actually apply it, and that line is the one the sweeper's correctness rests
++// on.
++export function messageData(
+   info: (typeof SessionV1.Event.MessageUpdated.Type)["data"]["info"],
+ ): typeof MessageTable.$inferInsert.data {
+   const { id: _, sessionID: __, ...rest } = info
+-  return rest as DeepMutable<typeof rest>
++  const data = rest as DeepMutable<typeof rest>
++  // Only assistant rows can strand a session in the "working" state, and only
++  // they are swept, so user rows are left alone rather than carrying dead weight
++  // on every write.
++  //
++  // This is the single upsert path for BOTH row creation and every later update
++  // (the projector's onConflictDoUpdate rewrites the whole `data` blob), so
++  // stamping here covers every assistant row the sweeper can sweep -- the main
++  // agent loop, subtasks and compaction alike -- and re-stamps on each update, so
++  // the stamp always names the LAST writer.
++  //
++  // Last-writer rather than creator is deliberate and is what the sweeper needs:
++  // a writer is by definition alive at the moment it writes, so a stamp naming a
++  // dead invocation proves nobody has touched the row since that invocation died.
++  //
++  // The else-branch is load-bearing, not tidiness. `serve` is a DECLARED schema
++  // field, so it survives a decode/re-publish cycle; without the strip, a process
++  // that fails the gate could carry someone else's stamp forward and the row
++  // would name a process that is not its last writer -- destroying exactly the
++  // invariant above.
++  if (data.role === "assistant") {
++    if (SERVE_PROVENANCE) data.serve = { ...SERVE_PROVENANCE }
++    else delete data.serve
++  }
++  return data
+ }
+ 
+ function partData(part: (typeof SessionV1.Event.PartUpdated.Type)["data"]["part"]): typeof PartTable.$inferInsert.data {
+diff --git a/packages/core/test/session/serve-provenance-gate.test.ts b/packages/core/test/session/serve-provenance-gate.test.ts
+new file mode 100644
+index 0000000000..ee12386d98
+--- /dev/null
++++ b/packages/core/test/session/serve-provenance-gate.test.ts
+@@ -0,0 +1,136 @@
++import { describe, expect, test } from "bun:test"
++import { messageData, serveProvenance } from "../../src/session/projector"
++
++// Bead workstation-63wo. This gate decides whether an assistant row carries a
++// serve identity, and therefore whether the phantom-busy sweeper is allowed to
++// use its precise liveness check on that row instead of its old conservative
++// cutoff. Wrong in the permissive direction, it lets the sweeper ABORT A LIVE
++// TURN, so every branch is pinned here.
++
++const INV = "8b8f626a0fe144d4810eaf31497b6ebe"
++const SERVE_CGROUP = "0::/system.slice/system-opencode\\x2dserve.slice/opencode-serve@4099.service\n"
++// Measured on cloudbox: agent tool subprocesses run in their own transient scope
++// under oc-agent.slice, which OUTLIVES a serve restart.
++const AGENT_SCOPE_CGROUP =
++  "0::/user.slice/user-1000.slice/user@1000.service/oc.slice/oc-agent.slice/oc-agent-183917-710.scope\n"
++
++const serveEnv = {
++  OPENCODE_SERVE_ID: "serve-3",
++  INVOCATION_ID: INV,
++  OPENCODE_SERVE_EXPECTED_PORT: "4099",
++}
++
++describe("serveProvenance gate", () => {
++  test("stamps a real pool serve", () => {
++    expect(serveProvenance(serveEnv, 4242, SERVE_CGROUP)).toEqual({
++      serveId: "serve-3",
++      invocationId: INV,
++      port: "4099",
++      pid: 4242,
++    })
++  })
++
++  // THE CASE THAT MAKES THE CGROUP CHECK NECESSARY.
++  test("does NOT stamp a descendant that escaped the serve cgroup", () => {
++    // An agent tool subprocess inherits the serve's whole environment, so an
++    // env-only gate passes it. But it lives in oc-agent.slice, so it SURVIVES a
++    // serve restart, and it carries its own transient-scope INVOCATION_ID that
++    // appears in no opencode-serve@* unit. Stamping it would hand the sweeper an
++    // invocation that always looks dead, attached to a row that is alive -- and
++    // the sweeper would abort a running turn.
++    expect(serveProvenance(serveEnv, 1, AGENT_SCOPE_CGROUP)).toBeUndefined()
++    // Even when the child happens to carry the serve's OWN invocation id, the
++    // fate-sharing argument still fails, because it does not die with the unit.
++    expect(
++      serveProvenance({ ...serveEnv, INVOCATION_ID: INV }, 1, AGENT_SCOPE_CGROUP),
++    ).toBeUndefined()
++  })
++
++  test("does NOT stamp a serve whose cgroup names a DIFFERENT pool member", () => {
++    // Guards against matching "any opencode-serve unit" instead of our own.
++    const otherMember = "0::/system.slice/system-opencode\\x2dserve.slice/opencode-serve@4096.service\n"
++    expect(serveProvenance(serveEnv, 1, otherMember)).toBeUndefined()
++  })
++
++  test("does NOT stamp a process that merely inherited INVOCATION_ID", () => {
++    // systemd exports INVOCATION_ID to every child of every unit; three non-pool
++    // processes on cloudbox were measured carrying one.
++    expect(serveProvenance({ INVOCATION_ID: INV }, 1, SERVE_CGROUP)).toBeUndefined()
++  })
++
++  test("does NOT stamp without an invocation id", () => {
++    expect(
++      serveProvenance({ OPENCODE_SERVE_ID: "serve-3", OPENCODE_SERVE_EXPECTED_PORT: "4099" }, 1, SERVE_CGROUP),
++    ).toBeUndefined()
++  })
++
++  test("does NOT stamp without a port (cannot verify cgroup membership)", () => {
++    expect(serveProvenance({ OPENCODE_SERVE_ID: "serve-3", INVOCATION_ID: INV }, 1, SERVE_CGROUP)).toBeUndefined()
++  })
++
++  test("does NOT stamp a bare process (standalone TUI, `opencode run`)", () => {
++    expect(serveProvenance({}, 1, "")).toBeUndefined()
++  })
++
++  test("does NOT stamp on a host with no cgroups (macOS/launchd)", () => {
++    // home.darwin.nix sets OPENCODE_SERVE_ID, but launchd provides no
++    // INVOCATION_ID and there is no /proc/self/cgroup. Correct outcome: inert.
++    expect(serveProvenance(serveEnv, 1, "")).toBeUndefined()
++  })
++
++  test("treats empty-string env vars as absent", () => {
++    // `Environment=OPENCODE_SERVE_ID=` in a unit file yields "" rather than unset.
++    expect(serveProvenance({ ...serveEnv, OPENCODE_SERVE_ID: "" }, 1, SERVE_CGROUP)).toBeUndefined()
++    expect(serveProvenance({ ...serveEnv, INVOCATION_ID: "" }, 1, SERVE_CGROUP)).toBeUndefined()
++    expect(serveProvenance({ ...serveEnv, OPENCODE_SERVE_EXPECTED_PORT: "" }, 1, SERVE_CGROUP)).toBeUndefined()
++  })
++})
++
++// The gate being right is worthless if messageData does not apply it. These pin
++// the production line itself, at the exact JSON path the sweeper will query.
++describe("messageData stamping", () => {
++  const assistant = {
++    id: "msg_01",
++    sessionID: "ses_01",
++    role: "assistant" as const,
++    parentID: "msg_00",
++    modelID: "m",
++    providerID: "p",
++    mode: "build",
++    agent: "build",
++    path: { cwd: "/tmp", root: "/tmp" },
++    cost: 0,
++    tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
++    time: { created: 1 },
++  }
++
++  test("drops id and sessionID (they are columns, not blob fields)", () => {
++    const out = messageData(assistant as any) as Record<string, any>
++    expect("id" in out).toBe(false)
++    expect("sessionID" in out).toBe(false)
++    expect(out.role).toBe("assistant")
++  })
++
++  test("in a test process (not a pool serve) it stamps nothing", () => {
++    // The suite does not run inside a serve cgroup, so the gate must decline --
++    // which is also what proves the gate is consulted at all.
++    const out = messageData(assistant as any) as Record<string, any>
++    expect(out.serve).toBeUndefined()
++  })
++
++  test("STRIPS a foreign stamp rather than carrying it forward", () => {
++    // `serve` is a declared schema field, so it survives decode/re-publish. If a
++    // process that fails the gate merely left it alone, the row would name a
++    // process that is not its last writer -- the invariant the sweeper relies on.
++    const withForeign = { ...assistant, serve: { serveId: "serve-9", invocationId: "dead", port: "4096", pid: 1 } }
++    const out = messageData(withForeign as any) as Record<string, any>
++    expect(out.serve).toBeUndefined()
++  })
++
++  test("leaves user rows alone entirely", () => {
++    const user = { id: "msg_02", sessionID: "ses_01", role: "user" as const, time: { created: 1 } }
++    const out = messageData(user as any) as Record<string, any>
++    expect("serve" in out).toBe(false)
++    expect(out.role).toBe("user")
++  })
++})
+diff --git a/packages/core/test/session/serve-provenance.test.ts b/packages/core/test/session/serve-provenance.test.ts
+new file mode 100644
+index 0000000000..b771444c84
+--- /dev/null
++++ b/packages/core/test/session/serve-provenance.test.ts
+@@ -0,0 +1,58 @@
++import { describe, expect, test } from "bun:test"
++import { Schema } from "effect"
++import { SessionV1 } from "../../src/v1/session"
++
++// Bead workstation-63wo. The sweeper's new gate reads
++// `data -> '$.serve.invocationId'` off assistant message rows, so the field has
++// to survive the schema encode that the SDK and the durable event log perform.
++// Effect's Schema drops excess properties by default, which is exactly how an
++// undeclared stamp would vanish -- silently, and only on the encoded paths, so
++// local reads would still look right.
++
++const base = {
++  id: "msg_01",
++  sessionID: "ses_01",
++  role: "assistant" as const,
++  parentID: "msg_00",
++  modelID: "some-model",
++  providerID: "some-provider",
++  mode: "build",
++  agent: "build",
++  path: { cwd: "/tmp", root: "/tmp" },
++  cost: 0,
++  tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
++  time: { created: 1 },
++}
++
++describe("assistant serve provenance stamp", () => {
++  test("survives a schema encode round-trip", () => {
++    const msg = {
++      ...base,
++      serve: { serveId: "serve-3", invocationId: "8b8f626a0fe144d4810eaf31497b6ebe", port: "4099", pid: 1234 },
++    }
++    const encoded = Schema.encodeUnknownSync(SessionV1.Assistant)(msg) as Record<string, any>
++    expect(encoded.serve).toBeDefined()
++    expect(encoded.serve.invocationId).toBe("8b8f626a0fe144d4810eaf31497b6ebe")
++    expect(encoded.serve.serveId).toBe("serve-3")
++
++    const decoded = Schema.decodeUnknownSync(SessionV1.Assistant)(encoded) as Record<string, any>
++    expect(decoded.serve.invocationId).toBe("8b8f626a0fe144d4810eaf31497b6ebe")
++  })
++
++  test("is optional -- an unstamped row still validates", () => {
++    // Rows written by a non-pool process, or by any build predating the stamp,
++    // have no `serve` key at all. Those must remain valid, because the sweeper
++    // deliberately falls back to its old conservative cutoff for them.
++    const encoded = Schema.encodeUnknownSync(SessionV1.Assistant)(base) as Record<string, any>
++    expect("serve" in encoded).toBe(false)
++  })
++
++  test("port and pid are optional -- a stamp is usable with invocationId alone", () => {
++    // invocationId is the only gate input. port narrows which unit to consult and
++    // pid is forensics; a serve missing either must still produce a usable stamp
++    // rather than none.
++    const msg = { ...base, serve: { serveId: "serve-0", invocationId: "deadbeef" } }
++    const encoded = Schema.encodeUnknownSync(SessionV1.Assistant)(msg) as Record<string, any>
++    expect(encoded.serve.invocationId).toBe("deadbeef")
++  })
++})
+diff --git a/packages/schema/src/v1/session.ts b/packages/schema/src/v1/session.ts
+index 75e9282f11..694663edf2 100644
+--- a/packages/schema/src/v1/session.ts
++++ b/packages/schema/src/v1/session.ts
+@@ -482,6 +482,23 @@ export const Assistant = Schema.Struct({
+   structured: Schema.optional(Schema.Any),
+   variant: Schema.optional(Schema.String),
+   finish: Schema.optional(Schema.String),
++  // Which serve process created this row. Written by the projector, never by a
++  // caller. See packages/core/src/session/projector.ts (bead workstation-63wo)
++  // for why it exists and why it is keyed on systemd's INVOCATION_ID.
++  //
++  // Declared here so the field survives the schema encode that the SDK and the
++  // durable event log perform (excess properties are dropped by default). It is
++  // optional in the strongest sense: rows written by a non-pool process, or by a
++  // build predating this field, simply do not have it, and the sweeper falls
++  // back to its old conservative cutoff for those.
++  serve: Schema.optional(
++    Schema.Struct({
++      serveId: Schema.String,
++      invocationId: Schema.String,
++      port: Schema.optional(Schema.String),
++      pid: Schema.optional(NonNegativeInt),
++    }),
++  ),
+ }).annotate({ identifier: "AssistantMessage" })
+ export type Assistant = Omit<Types.DeepMutable<Schema.Schema.Type<typeof Assistant>>, "error"> & {
+   error?: AssistantError

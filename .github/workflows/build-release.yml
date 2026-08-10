@@ -113,6 +113,16 @@ jobs:
           cd opencode-src/packages/opencode
           bun test test/plugin/loader-observability.test.ts
 
+      # message-serve-provenance: the gate deciding whether an assistant row gets
+      # a serve stamp. Wrong in the permissive direction, it lets the phantom-busy
+      # sweeper abort a LIVE turn -- so each branch (inherited INVOCATION_ID, no
+      # invocation id, bare process, empty-string env) is pinned. Named here for
+      # the same reason as the step above: an unnamed patch-carried test is inert.
+      - name: Serve provenance stamp tests
+        run: |
+          cd opencode-src/packages/core
+          bun test test/session/serve-provenance.test.ts test/session/serve-provenance-gate.test.ts
+
       - name: Build CLI
         run: |
           cd opencode-src/packages/opencode
