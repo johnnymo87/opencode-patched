@@ -392,6 +392,52 @@
 #                                               SUNSET: drop if upstream merges the equivalent; an upstream
 #                                               PR carries the same three changes.
 #
+#  28. message-serve-provenance.patch (local) - stamp WHICH SERVE created an assistant row, so the
+#                                               phantom-busy sweeper can finalize an orphan promptly
+#                                               instead of deferring it up to ~24h (bead
+#                                               workstation-63wo, the build branch of a pre-committed
+#                                               decision rule).
+#                                               A serve killed abruptly (kernel OOM, canary SIGKILL,
+#                                               crash) never runs cleanup, leaving an assistant row with
+#                                               time.completed unset and no error -- the session then
+#                                               shimmers "working" forever in every TUI that loads it,
+#                                               ~1 core each. The sweeper may only finalize such a row
+#                                               once it is certain the CREATING process is gone, and
+#                                               nothing in the row said who that was, so it fell back to
+#                                               "older than the OLDEST live pool member" -- which cannot
+#                                               see a fresh single-member orphan until the nightly
+#                                               whole-pool restart.
+#                                               Stamps {serveId, invocationId, port, pid} into the
+#                                               assistant row's data blob in messageData(), the SINGLE
+#                                               upsert path for both creation and every later update --
+#                                               so it covers the main agent loop, subtasks, shell and
+#                                               compaction alike, and re-stamps on each update so a later
+#                                               write cannot strip it. MEASURED reason this matters: of
+#                                               91 sessions invisible to the front-door log in 24h, 60
+#                                               were subagent children, so a main-loop-only stamp would
+#                                               have missed most of the orphan population.
+#                                               Keyed on systemd's INVOCATION_ID, NOT pid and NOT a
+#                                               timestamp: the unit's MainPID is a wrapper script so
+#                                               process.pid != MainPID, and Date.now() at start never
+#                                               equals ActiveEnterTimestamp -- either comparison would
+#                                               judge every LIVE row dead and abort running turns.
+#                                               Verified on cloudbox that INVOCATION_ID reaches the
+#                                               process and matches `systemctl show -p InvocationID`,
+#                                               4/4 pool members.
+#                                               Gated on OPENCODE_SERVE_ID (only the pool template sets
+#                                               it) because systemd exports INVOCATION_ID to every child
+#                                               of every unit -- three non-pool processes on this host
+#                                               were measured carrying one, and a standalone TUI stamping
+#                                               an inherited stale id would invite the sweeper to abort
+#                                               its live rows. No stamp => the sweeper keeps the old
+#                                               cutoff, so the change is strictly additive.
+#                                               Tests: test/session/serve-provenance{,-gate}.test.ts,
+#                                               which need a step in build-release.yml -- a patch-carried
+#                                               test that no workflow names is inert.
+#                                               Touches projector.ts, which sqlite-foreign-key-wrap also
+#                                               patches, but at disjoint hunks (that one at ~23/270/321,
+#                                               this at ~75); ordered after it regardless.
+#
 # DROPPED on the v1.17 line (see workstation docs/plans/2026-06-11-opencode-1.17-cutover-runbook.md):
 #   - integration-list-batch.patch: DROPPED on the v1.17.13 roll-forward (2026-07-06).
 #     UPSTREAMED — v1.17.13 Integration.list now does the bulk shape natively:
@@ -480,6 +526,7 @@ PATCHES=(
   tui-reconcile-bound
   registry-port-fence
   plugin-loader-observability
+  message-serve-provenance
 )
 
 for name in "${PATCHES[@]}"; do
