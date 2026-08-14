@@ -1,8 +1,8 @@
 diff --git a/packages/tui/src/app.tsx b/packages/tui/src/app.tsx
-index 17a9a554c..668eebc13 100644
+index 57f372ef70..790517c43d 100644
 --- a/packages/tui/src/app.tsx
 +++ b/packages/tui/src/app.tsx
-@@ -61,6 +61,7 @@ import * as Model from "./util/model"
+@@ -65,6 +65,7 @@ import * as Model from "./util/model"
  import { ArgsProvider, useArgs, type Args } from "./context/args"
  import open from "open"
  import { PromptRefProvider, usePromptRef } from "./context/prompt"
@@ -10,7 +10,7 @@ index 17a9a554c..668eebc13 100644
  import { TuiConfigProvider, useTuiConfig, type TuiConfig } from "./config"
  import { createTuiApiAdapters } from "./plugin/adapters"
  import { createTuiApi } from "./plugin/api"
-@@ -357,6 +358,7 @@ function App(props: { onSnapshot?: () => Promise<string[]>; pluginHost: TuiPlugi
+@@ -371,6 +372,7 @@ function App(props: { onSnapshot?: () => Promise<string[]>; pluginHost: TuiPlugi
    const dialog = useDialog()
    const local = useLocal()
    const kv = useKV()
@@ -18,7 +18,7 @@ index 17a9a554c..668eebc13 100644
    const keymap = useOpencodeKeymap()
    const event = useEvent()
    const sdk = useSDK()
-@@ -867,6 +869,15 @@ function App(props: { onSnapshot?: () => Promise<string[]>; pluginHost: TuiPlugi
+@@ -890,6 +892,15 @@ function App(props: { onSnapshot?: () => Promise<string[]>; pluginHost: TuiPlugi
            dialog.clear()
          },
        },
@@ -35,7 +35,7 @@ index 17a9a554c..668eebc13 100644
          name: "app.toggle.animations",
          title: kv.get("animations_enabled", true) ? "Disable animations" : "Enable animations",
 diff --git a/packages/tui/src/component/prompt/index.tsx b/packages/tui/src/component/prompt/index.tsx
-index aa002080b..66342caed 100644
+index fe7f4a22f7..2913c77bcc 100644
 --- a/packages/tui/src/component/prompt/index.tsx
 +++ b/packages/tui/src/component/prompt/index.tsx
 @@ -54,6 +54,11 @@ import { useArgs } from "../../context/args"
@@ -49,8 +49,8 @@ index aa002080b..66342caed 100644
 +import { useVimIndicator } from "../vim/vim-indicator"
  import { usePromptMove } from "./move"
  import { readLocalAttachment } from "./local-attachment"
- 
-@@ -136,6 +141,7 @@ function formatEditorContext(selection: EditorSelection) {
+ import { useLocation } from "../../context/location"
+@@ -139,6 +144,7 @@ function formatEditorContext(selection: EditorSelection) {
  }
  
  let stashed: { prompt: PromptInfo; cursor: number } | undefined
@@ -58,7 +58,7 @@ index aa002080b..66342caed 100644
  
  export function Prompt(props: PromptProps) {
    let input: TextareaRenderable
-@@ -154,6 +160,7 @@ export function Prompt(props: PromptProps) {
+@@ -158,6 +164,7 @@ export function Prompt(props: PromptProps) {
    const project = useProject()
    const sync = useSync()
    const tuiConfig = useTuiConfig()
@@ -66,8 +66,8 @@ index aa002080b..66342caed 100644
    const dialog = useDialog()
    const toast = useToast()
    const status = createMemo(() => sync.data.session_status?.[props.sessionID ?? ""] ?? { type: "idle" })
-@@ -249,6 +256,19 @@ export function Prompt(props: PromptProps) {
-     if (!props.disabled) input.cursorColor = theme.text
+@@ -254,6 +261,23 @@ export function Prompt(props: PromptProps) {
+     if (tuiConfig.cursor) input.cursorStyle = tuiConfig.cursor
    })
  
 +  createEffect(() => {
@@ -80,13 +80,17 @@ index aa002080b..66342caed 100644
 +      input.cursorStyle = { style: "block", blinking: false }
 +      return
 +    }
-+    input.cursorStyle = { style: "block", blinking: true }
++    // Not in a vim-controlled mode: defer to the user's `tui.cursor` config
++    // (added upstream in 1.18) and only fall back to the historical default
++    // when it is unset. Without the `??` this effect runs after upstream's and
++    // silently clobbers `tui.cursor` for every non-vim user.
++    input.cursorStyle = tuiConfig.cursor ?? { style: "block", blinking: true }
 +  })
 +
    const lastUserMessage = createMemo(() => {
      if (!props.sessionID) return undefined
      const messages = sync.data.message[props.sessionID]
-@@ -293,6 +313,38 @@ export function Prompt(props: PromptProps) {
+@@ -298,6 +322,38 @@ export function Prompt(props: PromptProps) {
      interrupt: 0,
    })
  
@@ -125,7 +129,7 @@ index aa002080b..66342caed 100644
    createEffect(
      on(
        () => props.sessionID,
-@@ -393,9 +445,16 @@ export function Prompt(props: PromptProps) {
+@@ -398,9 +454,16 @@ export function Prompt(props: PromptProps) {
          run: () => {
            if (auto()?.visible) return
            if (!input.focused) return
@@ -142,7 +146,7 @@ index aa002080b..66342caed 100644
              return
            }
            if (!props.sessionID) return
-@@ -838,7 +897,17 @@ export function Prompt(props: PromptProps) {
+@@ -844,7 +907,17 @@ export function Prompt(props: PromptProps) {
      return {
        target: inputTarget,
        enabled: inputTarget() !== undefined && store.mode === "shell",
@@ -161,7 +165,7 @@ index aa002080b..66342caed 100644
      }
    })
  
-@@ -849,7 +918,17 @@ export function Prompt(props: PromptProps) {
+@@ -855,7 +928,17 @@ export function Prompt(props: PromptProps) {
          cursorVersion()
          return inputTarget() !== undefined && store.mode === "shell" && input?.visualCursor.offset === 0
        })(),
@@ -180,7 +184,7 @@ index aa002080b..66342caed 100644
      }
    })
  
-@@ -1113,6 +1192,7 @@ export function Prompt(props: PromptProps) {
+@@ -1119,6 +1202,7 @@ export function Prompt(props: PromptProps) {
          })
        if (editorParts.length > 0) editor.markSelectionSent()
      }
@@ -188,7 +192,7 @@ index aa002080b..66342caed 100644
      history.append({
        ...store.prompt,
        mode: currentMode,
-@@ -1279,6 +1359,18 @@ export function Prompt(props: PromptProps) {
+@@ -1285,6 +1369,18 @@ export function Prompt(props: PromptProps) {
      setStore("extmarkToPartIndex", new Map())
    }
  
@@ -207,7 +211,7 @@ index aa002080b..66342caed 100644
    const highlight = createMemo(() => {
      if (leader()) return theme.border
      if (store.mode === "shell") return theme.primary
-@@ -1376,17 +1468,14 @@ export function Prompt(props: PromptProps) {
+@@ -1382,17 +1478,14 @@ export function Prompt(props: PromptProps) {
                  setCursorVersion((value) => value + 1)
                }}
                onCursorChange={() => setCursorVersion((value) => value + 1)}
@@ -228,7 +232,7 @@ index aa002080b..66342caed 100644
                onPaste={async (event: PasteEvent) => {
                  if (props.disabled) {
                    event.preventDefault()
-@@ -1435,6 +1524,9 @@ export function Prompt(props: PromptProps) {
+@@ -1443,6 +1536,9 @@ export function Prompt(props: PromptProps) {
              />
              <box flexDirection="row" flexShrink={0} paddingTop={1} gap={1} justifyContent="space-between">
                <box flexDirection="row" gap={1}>
@@ -240,7 +244,7 @@ index aa002080b..66342caed 100644
                      <>
 diff --git a/packages/tui/src/component/vim/index.ts b/packages/tui/src/component/vim/index.ts
 new file mode 100644
-index 000000000..de06fd60d
+index 0000000000..de06fd60da
 --- /dev/null
 +++ b/packages/tui/src/component/vim/index.ts
 @@ -0,0 +1,14 @@
@@ -260,7 +264,7 @@ index 000000000..de06fd60d
 +}
 diff --git a/packages/tui/src/component/vim/vim-handler.ts b/packages/tui/src/component/vim/vim-handler.ts
 new file mode 100644
-index 000000000..f4c594451
+index 0000000000..f4c5944511
 --- /dev/null
 +++ b/packages/tui/src/component/vim/vim-handler.ts
 @@ -0,0 +1,321 @@
@@ -587,7 +591,7 @@ index 000000000..f4c594451
 +}
 diff --git a/packages/tui/src/component/vim/vim-indicator.ts b/packages/tui/src/component/vim/vim-indicator.ts
 new file mode 100644
-index 000000000..7e6ec7601
+index 0000000000..7e6ec76012
 --- /dev/null
 +++ b/packages/tui/src/component/vim/vim-indicator.ts
 @@ -0,0 +1,14 @@
@@ -607,7 +611,7 @@ index 000000000..7e6ec7601
 +}
 diff --git a/packages/tui/src/component/vim/vim-motion-jump.ts b/packages/tui/src/component/vim/vim-motion-jump.ts
 new file mode 100644
-index 000000000..279fe9a6f
+index 0000000000..279fe9a6ff
 --- /dev/null
 +++ b/packages/tui/src/component/vim/vim-motion-jump.ts
 @@ -0,0 +1,32 @@
@@ -645,7 +649,7 @@ index 000000000..279fe9a6f
 +}
 diff --git a/packages/tui/src/component/vim/vim-motions.ts b/packages/tui/src/component/vim/vim-motions.ts
 new file mode 100644
-index 000000000..c86a62bc2
+index 0000000000..c86a62bc28
 --- /dev/null
 +++ b/packages/tui/src/component/vim/vim-motions.ts
 @@ -0,0 +1,254 @@
@@ -905,7 +909,7 @@ index 000000000..c86a62bc2
 +}
 diff --git a/packages/tui/src/component/vim/vim-scroll.ts b/packages/tui/src/component/vim/vim-scroll.ts
 new file mode 100644
-index 000000000..e886584c9
+index 0000000000..e886584c98
 --- /dev/null
 +++ b/packages/tui/src/component/vim/vim-scroll.ts
 @@ -0,0 +1,15 @@
@@ -926,7 +930,7 @@ index 000000000..e886584c9
 +}
 diff --git a/packages/tui/src/component/vim/vim-state.ts b/packages/tui/src/component/vim/vim-state.ts
 new file mode 100644
-index 000000000..d3f8ca5fa
+index 0000000000..d3f8ca5faa
 --- /dev/null
 +++ b/packages/tui/src/component/vim/vim-state.ts
 @@ -0,0 +1,41 @@
@@ -972,12 +976,12 @@ index 000000000..d3f8ca5fa
 +  }
 +}
 diff --git a/packages/tui/src/config/index.tsx b/packages/tui/src/config/index.tsx
-index df9239763..b5dada714 100644
+index bde0bfb071..0e4f6d1184 100644
 --- a/packages/tui/src/config/index.tsx
 +++ b/packages/tui/src/config/index.tsx
-@@ -63,6 +63,7 @@ export const Info = Schema.Struct({
-   scroll_acceleration: Schema.optional(ScrollAcceleration),
+@@ -72,6 +72,7 @@ export const Info = Schema.Struct({
    diff_style: Schema.optional(DiffStyle),
+   cursor: Schema.optional(Cursor),
    mouse: Schema.optional(Schema.Boolean).annotate({ description: "Enable or disable mouse capture (default: true)" }),
 +  vim: Schema.optional(Schema.Boolean).annotate({ description: "Enable vim-style input for the prompt" }),
  })
@@ -985,7 +989,7 @@ index df9239763..b5dada714 100644
  
 diff --git a/packages/tui/test/cli/tui/vim-motions.test.ts b/packages/tui/test/cli/tui/vim-motions.test.ts
 new file mode 100644
-index 000000000..6a8d8730c
+index 0000000000..6a8d8730c8
 --- /dev/null
 +++ b/packages/tui/test/cli/tui/vim-motions.test.ts
 @@ -0,0 +1,776 @@

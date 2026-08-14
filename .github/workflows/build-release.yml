@@ -17,6 +17,11 @@ on:
         required: false
         type: boolean
         default: false
+      expected_sha:
+        description: 'Optional upstream commit SHA to assert after cloning the tag. Upstream REWRITES HISTORY, so a tag can move between the moment a patch stack is validated and the moment this workflow clones it. Set this to the SHA your gate measured and the build fails loudly instead of silently building different sources.'
+        required: false
+        type: string
+        default: ''
   workflow_call:
     inputs:
       version:
@@ -30,6 +35,10 @@ on:
         required: false
         type: boolean
         default: false
+      expected_sha:
+        required: false
+        type: string
+        default: ''
 
 permissions:
   contents: write
@@ -53,7 +62,15 @@ jobs:
       - name: Setup Bun
         uses: oven-sh/setup-bun@v2
         with:
-          bun-version: latest
+          # PINNED, was `latest`. bun's version demonstrably moves results in
+          # this tree -- the packages/opencode failure count moved 25 -> 19/20
+          # between 1.3.3 and 1.3.14 -- so `latest` meant the release build ran
+          # a bun that nothing had validated. 1.3.14 is what the v1.18.18
+          # roll-forward gate was measured on AND what upstream v1.18.18
+          # declares in its own package.json `packageManager`.
+          # To bump: match upstream's packageManager, then re-run the stacked
+          # build gate before releasing (workstation-l60f is the template).
+          bun-version: 1.3.14
 
       - name: Clone upstream opencode
         run: |
@@ -62,6 +79,20 @@ jobs:
           cd opencode-src
           echo "Cloned opencode v${{ inputs.version }}"
           git log -1 --oneline
+          # Upstream rewrites history, so the tag name is NOT a stable identity.
+          # When the caller pins a SHA, refuse to build anything else.
+          EXPECTED="${{ inputs.expected_sha }}"
+          if [ -n "$EXPECTED" ]; then
+            ACTUAL="$(git rev-parse HEAD)"
+            if [ "${ACTUAL#$EXPECTED}" = "$ACTUAL" ]; then
+              echo "::error::tag v${{ inputs.version }} resolves to $ACTUAL, expected $EXPECTED."
+              echo "::error::The tag MOVED. Every gate run against the old sha is about a different tree."
+              exit 1
+            fi
+            echo "✓ upstream sha matches pinned $EXPECTED"
+          else
+            echo "::warning::No expected_sha pinned -- building whatever the tag points at today."
+          fi
 
       - name: Apply patches
         run: |
@@ -137,6 +168,10 @@ jobs:
           # internal Mach-O signer (broken in bun 1.3.12, see the build-macos job)
           # so the darwin binaries carry NO signature slot. They are ad-hoc signed
           # on a real macOS runner in build-macos. Remove once bun >1.3.12 ships.
+          # SUNSET CONDITION NOW MET (2026-08-14): this workflow pins bun 1.3.14,
+          # which is > 1.3.12. Kept anyway because it is harmless (macOS re-signs)
+          # and removing it is a separate, separately-verifiable change -- but it
+          # is now dead weight rather than a live workaround. Delete deliberately.
           BUN_NO_CODESIGN_MACHO_BINARY: "1"
 
       # The darwin binaries are produced here (bun compile is a pure cross-compile,
@@ -339,14 +374,14 @@ jobs:
           body: |
             # OpenCode v${{ inputs.version }} with Local Patches
 
-            This release applies six patches to OpenCode v${{ inputs.version }}:
+            This release applies the patch stack in
+            [`patches/apply.sh`](https://github.com/johnnymo87/opencode-patched/blob/main/patches/apply.sh)
+            to OpenCode v${{ inputs.version }}. **That file is the authoritative
+            list** -- it carries a numbered entry per patch plus tombstones for
+            everything dropped and why. This body used to hand-enumerate the
+            patches and had drifted badly (it advertised six patches, and a
+            retry cap that is now upstream), so it no longer tries to.
 
-            1. **Gemini empty parts fix** from [PR #28669](https://github.com/anomalyco/opencode/pull/28669)
-            2. **Tool use/result mismatch fix** from [PR #16751](https://github.com/anomalyco/opencode/pull/16751)
-            3. **Cache thinking-skip** for [Issue #17883](https://github.com/anomalyco/opencode/issues/17883) -- when marking the conversation cache breakpoint, scan backwards to the last *cacheable* content block instead of `content[length-1]`, so `cache_control` never lands on a trailing reasoning/thinking block (which Anthropic rejects with HTTP 400).
-            4. **Retry cap** (local) -- caps model-stream retries at `MAX_RETRIES = 8` and adds downward-only backoff jitter to prevent thundering herd conditions.
-            5. **Vim keybindings** from [PR #12679](https://github.com/anomalyco/opencode/pull/12679)
-            6. **SQLite foreign key wrapping** (local) -- recursively inspects database exceptions to correctly capture nested constraint failures on modern effect-drizzle error structures.
 
             Note: As of 2026-06-02, the big **caching.patch** (formerly fetched from [opencode-cached](https://github.com/johnnymo87/opencode-cached), PR #5422) is DROPPED. Upstream `applyCaching` already implements the moving-tail conversation anchor (`non-system.slice(-2)`), making the fork patch redundant; the only behavior upstream lacked (skipping reasoning blocks at the cache breakpoint) is preserved as the small `cache-thinking-skip.patch` above. As of v1.15.10, the bus-eager-subscribe patch (PR #27959) and the bus instance-context fix (PR #28051) are DROPPED -- both are upstream-merged in v1.15.5+.
 
@@ -368,10 +403,6 @@ jobs:
             ## Tool Use/Result Mismatch Fix
 
             Fixes the widespread `tool_use ids were found without tool_result blocks` error ([#16749](https://github.com/anomalyco/opencode/issues/16749)) that corrupts sessions when stream errors cause lost step boundaries. Injects synthetic step-start boundaries at reconstruction time to prevent interleaved tool_use/text in assistant messages.
-
-            ## Retry Cap
-
-            Caps model-stream retries at `MAX_RETRIES = 8` and adds downward-only backoff jitter.
 
             ## Installation
 
@@ -405,7 +436,6 @@ jobs:
             **Gemini empty parts patch**: [PR #28669](https://github.com/anomalyco/opencode/pull/28669)
             **Tool fix patch**: [PR #16751](https://github.com/anomalyco/opencode/pull/16751)
             **Cache thinking-skip**: [Issue #17883](https://github.com/anomalyco/opencode/issues/17883) (local patch; caching.patch dropped, see note above)
-            **Retry cap**: local patch
             **Vim patch**: [PR #12679](https://github.com/anomalyco/opencode/pull/12679)
           files: |
             artifacts/opencode-linux-arm64.tar.gz
@@ -453,8 +483,9 @@ jobs:
             1. **Gemini empty parts patch conflict**: The local gemini-empty-parts.patch may not apply to v${version}
             2. **Tool fix patch conflict**: The local tool-fix.patch may not apply to v${version}
             3. **Cache thinking-skip patch conflict**: The local cache-thinking-skip.patch may not apply to v${version} (it targets \`applyCaching\` in \`provider/transform.ts\`; if upstream refactored that function, re-derive the backward-scan hunk)
-            4. **Retry cap patch conflict**: The local retry-cap.patch may not apply to v${version}
-            5. **Vim patch conflict**: The local vim.patch may not apply to v${version}
+            4. **Vim patch conflict**: The local vim.patch may not apply to v${version}
+            5. **Any other patch in \`patches/apply.sh\`**: that file is the authoritative
+               list; the failing patch name is printed in the log above
             6. **Build failure**: OpenCode build process may have changed
 
             ### Action Required
@@ -471,7 +502,6 @@ jobs:
                gh pr diff 16751 --repo anomalyco/opencode > patches/tool-fix.patch
                # Review changes, commit and push
                \`\`\`
-            5. If retry cap patch failed, review upstream changes to \`session/retry.ts\` and update manually
             6. Re-run: \`gh workflow run build-release.yml --field version=${version}\` (or add \`--field revision=N\` to re-release the same upstream version with updated patches; the release tag becomes \`v${version}-patched.N\`)
             `;
 

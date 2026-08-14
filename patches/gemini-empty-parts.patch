@@ -1,8 +1,8 @@
 diff --git a/packages/llm/src/protocols/gemini.ts b/packages/llm/src/protocols/gemini.ts
-index c8fa34b50..2f5527c77 100644
+index c4bb9476a4..835e060762 100644
 --- a/packages/llm/src/protocols/gemini.ts
 +++ b/packages/llm/src/protocols/gemini.ts
-@@ -220,6 +220,7 @@ const lowerMessages = Effect.fn("Gemini.lowerMessages")(function* (request: LLMR
+@@ -222,6 +222,7 @@ const lowerMessages = Effect.fn("Gemini.lowerMessages")(function* (request: LLMR
            return yield* ProviderShared.unsupportedContent("Gemini", "user", ["text", "media"])
          parts.push(yield* lowerUserPart(part))
        }
@@ -10,7 +10,7 @@ index c8fa34b50..2f5527c77 100644
        contents.push({ role: "user", parts })
        continue
      }
-@@ -242,6 +243,7 @@ const lowerMessages = Effect.fn("Gemini.lowerMessages")(function* (request: LLMR
+@@ -244,6 +245,7 @@ const lowerMessages = Effect.fn("Gemini.lowerMessages")(function* (request: LLMR
            continue
          }
        }
@@ -18,7 +18,7 @@ index c8fa34b50..2f5527c77 100644
        contents.push({ role: "model", parts })
        continue
      }
-@@ -279,6 +281,7 @@ const lowerMessages = Effect.fn("Gemini.lowerMessages")(function* (request: LLMR
+@@ -281,6 +283,7 @@ const lowerMessages = Effect.fn("Gemini.lowerMessages")(function* (request: LLMR
          parts.push({ inlineData: { mimeType: media.mime, data: media.base64 } })
        }
      }
@@ -27,7 +27,7 @@ index c8fa34b50..2f5527c77 100644
    }
  
 diff --git a/packages/llm/test/provider/gemini.test.ts b/packages/llm/test/provider/gemini.test.ts
-index d30742c47..90be8607e 100644
+index 1dc253c0ea..f662145d3f 100644
 --- a/packages/llm/test/provider/gemini.test.ts
 +++ b/packages/llm/test/provider/gemini.test.ts
 @@ -232,6 +232,30 @@ describe("Gemini route", () => {
@@ -62,10 +62,10 @@ index d30742c47..90be8607e 100644
      Effect.gen(function* () {
        const prepared = yield* LLMClient.prepare(
 diff --git a/packages/opencode/src/provider/transform.ts b/packages/opencode/src/provider/transform.ts
-index cce3c7014..1b4f4b8ea 100644
+index fdd03d5205..5fe977cdf5 100644
 --- a/packages/opencode/src/provider/transform.ts
 +++ b/packages/opencode/src/provider/transform.ts
-@@ -186,6 +186,41 @@ function normalizeMessages(
+@@ -222,6 +222,41 @@ function normalizeMessages(
        .filter((msg): msg is ModelMessage => msg !== undefined && msg.content !== "")
    }
  
@@ -108,11 +108,11 @@ index cce3c7014..1b4f4b8ea 100644
      const scrub = (id: string) => id.replace(/[^a-zA-Z0-9_-]/g, "_")
      msgs = msgs.map((msg) => {
 diff --git a/packages/opencode/test/provider/transform.test.ts b/packages/opencode/test/provider/transform.test.ts
-index c3c8cbf81..2a3cca9a7 100644
+index 7016589874..c297df1ee1 100644
 --- a/packages/opencode/test/provider/transform.test.ts
 +++ b/packages/opencode/test/provider/transform.test.ts
-@@ -4118,3 +4118,80 @@ describe("ProviderTransform.providerOptions - ai-gateway-provider", () => {
-     expect(result).toEqual({ openaiCompatible: { reasoningEffort: "high" } })
+@@ -5666,3 +5666,80 @@ describe("ProviderTransform.options - kimi family adaptive thinking", () => {
+     expect(result.thinking).toBeUndefined()
    })
  })
 +
