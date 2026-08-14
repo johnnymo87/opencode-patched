@@ -154,6 +154,18 @@ jobs:
           cd opencode-src/packages/core
           bun test test/session/serve-provenance.test.ts test/session/serve-provenance-gate.test.ts
 
+      # db-isolation-guard: the arming condition for the guard that refuses to
+      # open a database XDG_DATA_HOME says should be isolated. Wrong in the
+      # armed direction it BREAKS THE SERVE POOL (every pool member sets an
+      # absolute OPENCODE_DB), so the pool-shaped environment is pinned as an
+      # explicit must-not-fire case alongside the incident's environment. Named
+      # here for the same reason as the steps above: an unnamed patch-carried
+      # test is inert.
+      - name: Database isolation guard tests
+        run: |
+          cd opencode-src/packages/core
+          bun test test/database/isolation.test.ts
+
       - name: Build CLI
         run: |
           cd opencode-src/packages/opencode
