@@ -2,15 +2,28 @@
 # Apply local patches to opencode source for the v1.17 release line.
 # Usage: ./apply.sh <path-to-opencode-source>
 #
-# TARGET UPSTREAM: opencode v1.17.13
+# TARGET UPSTREAM: opencode v1.18.18
 #
-# PATCH SET (v1.17 line; rebased 2026-06-11 from the v1.15 line, rolled forward
-# from v1.17.7 to v1.17.13 on 2026-07-06):
+# PATCH SET (v1.18 line; rebased 2026-06-11 from the v1.15 line, rolled forward
+# v1.17.7 -> v1.17.13 on 2026-07-06, and v1.17.13 -> v1.18.18 on 2026-08-14 to
+# pick up the 48-bit message-ID wrap fix db581e47a3 that muted live sessions --
+# see workstation docs/plans/2026-08-14-opencode-118-rollforward-research.md).
+#
+# NUMBERING IS A STABLE IDENTITY, NOT A POSITION: a dropped patch keeps its
+# number as a tombstone (see 4, 15, 24) and new patches take the next free
+# number, so header numbers do NOT track the apply order in PATCHES below.
 #   1. gemini-empty-parts.patch   (PR #28669) - pad empty Gemini/Vertex parts arrays
 #                                               (gemini.ts lowerMessages + transform.ts normalizeMessages)
 #   2. tool-fix.patch             (PR #16751) - synthetic step-start boundaries (tool_use/result mismatch)
 #   3. cache-thinking-skip.patch  (#17883)    - cache breakpoint scans past trailing thinking/reasoning blocks
-#   4. retry-cap.patch            (local)     - MAX_RETRIES=8 + backoff jitter (Vertex/Gemini runaway cure)
+#   4. retry-cap.patch            REMOVED (2026-08-14, v1.18.18 roll-forward) — UPSTREAMED.
+#                                               Upstream commit c78986831c (in v1.18.17) adds its own
+#                                               retry cap. Verified BY CONTENT at the tag, not by
+#                                               `git tag --contains` (unreliable on this repo, history
+#                                               rewritten). Upstream MAX=5 is STRICTER than our 8, and
+#                                               our patch was a cap where upstream previously had NONE,
+#                                               so accepting upstream is strictly safer. Do not
+#                                               re-litigate 5-vs-8.
 #   5. vim.patch                  (PR #12679) - vim keybindings, re-ported to the new
 #                                               packages/tui/ TUI package for 1.17 (TUI moved
 #                                               out of packages/opencode in 1.16/1.17).
@@ -277,23 +290,16 @@
 #                                               repoints toggle + post-toggle refresh to session-scoped SDK methods,
 #                                               resolves root session ID for child/subagent sessions, and leaves
 #                                               bootstrap status call global.
-#  24. opus5-adaptive-thinking.patch (PR #38757) - generalize Claude adaptive-thinking gating in
-#                                               provider/transform.ts. Upstream commit 2b2aacc9 (in v1.18.5)
-#                                               replaces the two-part-version regexes anthropicOpus47OrLater
-#                                               (/opus-(\d+)[.-](\d+)/) and anthropicSonnet5OrLater with a single
-#                                               anthropicUsesModernAdaptiveThinking that makes the minor OPTIONAL
-#                                               (/claude-(?:[a-z]+-)?(\d+)(?:[.-](\d{1,2}))?/), so single-part IDs
-#                                               like claude-opus-5 are recognized (major 5 > 4 -> adaptive).
-#                                               WHY: on v1.17.13 claude-opus-5 fell through anthropicAdaptiveEfforts
-#                                               (=null), so variants() emitted the legacy {thinking:{type:"enabled",
-#                                               budgetTokens}} for the high/max variants. Vertex/Anthropic opus-5
-#                                               REJECTS type:"enabled" ("use thinking.type.adaptive + output_config.
-#                                               effort") -> 400 on any build/plan turn carrying variant high/max.
-#                                               Only the transform.ts source hunks are ported (the upstream test hunk
-#                                               and the opus-4-5 anthropicEffort/reasoningEffort hunks target a later
-#                                               refactor not present in v1.17.13; opus-4-5 keeps its v1.17.13 {effort}
-#                                               body via the new anthropicOpus45 predicate). SUNSET: drop on the
-#                                               upstream bump to >= v1.18.5.
+#  24. opus5-adaptive-thinking.patch REMOVED (2026-08-14, v1.18.18 roll-forward) — UPSTREAMED.
+#                                               Upstream commit 2b2aacc939 (in v1.18.5) replaces the
+#                                               two-part-version regexes with a single predicate that
+#                                               makes the minor OPTIONAL, so single-part ids like
+#                                               claude-opus-5 are recognized natively. Verified by
+#                                               content at v1.18.18.
+#                                               DO NOT HAND-PORT the old hunk #3. Upstream moved PAST
+#                                               our port to anthropicOpus45Effort() with real
+#                                               budgetTokens; re-applying our version REGRESSES
+#                                               opus-4-5. This tombstone exists mainly to say that.
 #  25. tui-reconcile-bound.patch (local)     - PART B (bead workstation-fdb1): bound the TUI's
 #                                               fetch-on-reconnect pending reconcile so a PERSISTENT reconcile
 #                                               error can no longer brick the TUI. tui-door-attach's
@@ -480,6 +486,22 @@
 #                                               Touches projector.ts, which sqlite-foreign-key-wrap also
 #                                               patches, but at disjoint hunks (that one at ~23/270/321,
 #                                               this at ~75); ordered after it regardless.
+#  29. globalbus-maxlisteners.patch (local)  - raise the process-global EventEmitter max-listener
+#                                               ceiling so a long-lived serve with many concurrent
+#                                               sessions stops emitting MaxListenersExceededWarning
+#                                               (bead workstation-qjk4). Applied since the v1.17 line
+#                                               but never given a header entry; documented here on the
+#                                               v1.18.18 roll-forward (bead workstation-dqng).
+#                                               NOTE FOR THE NEXT PATCH AUTHOR: 29 is now TAKEN.
+#                                               opencode-patched PR #42 (db-isolation-guard, held out
+#                                               of this release deliberately) also claims 29 and must
+#                                               renumber to 30 before it lands.
+#
+# DROPPED on the v1.18.18 roll-forward (2026-08-14; full rationale lives in the
+# numbered tombstones above, not duplicated here):
+#   - retry-cap.patch            -> tombstone  4. UPSTREAMED c78986831c / v1.18.17.
+#   - opus5-adaptive-thinking.patch -> tombstone 24. UPSTREAMED 2b2aacc939 / v1.18.5.
+#     Do NOT hand-port its hunk #3; doing so regresses opus-4-5.
 #
 # DROPPED on the v1.17 line (see workstation docs/plans/2026-06-11-opencode-1.17-cutover-runbook.md):
 #   - integration-list-batch.patch: DROPPED on the v1.17.13 roll-forward (2026-07-06).
@@ -545,7 +567,6 @@ PATCHES=(
   gemini-empty-parts
   tool-fix
   cache-thinking-skip
-  retry-cap
   vim
   sqlite-foreign-key-wrap
   event-session-scope
@@ -565,7 +586,6 @@ PATCHES=(
   tui-door-tests
   session-mcp-routes
   tui-mcp-dialog
-  opus5-adaptive-thinking
   tui-reconcile-bound
   registry-port-fence
   plugin-loader-observability
