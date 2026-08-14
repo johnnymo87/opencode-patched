@@ -1,5 +1,5 @@
 diff --git a/packages/core/src/event.ts b/packages/core/src/event.ts
-index c92ac0a..f3732ad 100644
+index c92ac0ac2c..f3732ad003 100644
 --- a/packages/core/src/event.ts
 +++ b/packages/core/src/event.ts
 @@ -6,6 +6,7 @@ import type { Data, Definition, Payload } from "@opencode-ai/schema/event"
@@ -111,7 +111,7 @@ index c92ac0a..f3732ad 100644
                          }),
                        { behavior: "immediate" },
 diff --git a/packages/core/test/event.test.ts b/packages/core/test/event.test.ts
-index e4329a2..840a590 100644
+index e4329a2dde..1f6e1f40bc 100644
 --- a/packages/core/test/event.test.ts
 +++ b/packages/core/test/event.test.ts
 @@ -16,6 +16,13 @@ import { eq } from "drizzle-orm"
@@ -143,7 +143,7 @@ index e4329a2..840a590 100644
 +      delete process.env["OPENCODE_EXPERIMENTAL_WORKSPACES"]
 +      try {
 +        const event = yield* events.publish(SyncMessage, { id: "gated", text: "hello" })
-+        expect(event.seq).toBe(0)
++        expect(event.durable?.seq).toBe(0)
 +
 +        const rows = yield* db
 +          .select()
@@ -162,7 +162,7 @@ index e4329a2..840a590 100644
 +        expect(seqRow?.seq).toBe(0)
 +
 +        const second = yield* events.publish(SyncMessage, { id: "gated", text: "again" })
-+        expect(second.seq).toBe(1)
++        expect(second.durable?.seq).toBe(1)
 +      } finally {
 +        process.env["OPENCODE_EXPERIMENTAL_WORKSPACES"] = prev ?? "1"
 +      }
