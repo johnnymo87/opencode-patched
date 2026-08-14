@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Apply local patches to opencode source for the v1.17 release line.
+# Apply local patches to opencode source for the v1.18 release line.
 # Usage: ./apply.sh <path-to-opencode-source>
 #
 # TARGET UPSTREAM: opencode v1.18.18
