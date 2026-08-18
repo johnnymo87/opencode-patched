@@ -503,7 +503,7 @@
 #   - opus5-adaptive-thinking.patch -> tombstone 24. UPSTREAMED 2b2aacc939 / v1.18.5.
 #     Do NOT hand-port its hunk #3; doing so regresses opus-4-5.
 #
-#  29. db-isolation-guard.patch  (local)     - refuse to open a database that XDG_DATA_HOME says
+#  30. db-isolation-guard.patch  (local)     - refuse to open a database that XDG_DATA_HOME says
 #                                               should be isolated (incident 2026-08-14).
 #                                               PRECEDENCE BUG: Database.path() checks
 #                                               Flag.OPENCODE_DB FIRST and returns it verbatim when
