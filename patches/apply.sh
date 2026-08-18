@@ -503,6 +503,61 @@
 #   - opus5-adaptive-thinking.patch -> tombstone 24. UPSTREAMED 2b2aacc939 / v1.18.5.
 #     Do NOT hand-port its hunk #3; doing so regresses opus-4-5.
 #
+#  30. db-isolation-guard.patch  (local)     - refuse to open a database that XDG_DATA_HOME says
+#                                               should be isolated (incident 2026-08-14).
+#                                               PRECEDENCE BUG: Database.path() checks
+#                                               Flag.OPENCODE_DB FIRST and returns it verbatim when
+#                                               absolute, BEFORE Global.Path.data (the only thing
+#                                               XDG_DATA_HOME feeds) is consulted. On any host that
+#                                               exports OPENCODE_DB as a session variable — ours does,
+#                                               to defeat the channel-suffixed opencode-<channel>.db
+#                                               default — every child inherits it, so the documented
+#                                               "throwaway serve with XDG_DATA_HOME pointed at a COPY
+#                                               of the DB" recipe isolates logs, config, state and
+#                                               storage while the DATABASE stays production. The
+#                                               scratch logfile lands exactly where expected, so the
+#                                               isolation LOOKS like it worked; on 2026-08-14 a
+#                                               throwaway serve mutated live session rows this way and
+#                                               an assertion against the never-opened copy returned a
+#                                               clean "0 rows" FALSE GREEN.
+#                                               Guards the analogous hazard to the OPENCODE_SERVE_ID /
+#                                               OPENCODE_ROUTING_DB fence in serve.ts (registry-port-
+#                                               fence), which already refuses to start on an inherited
+#                                               pool identity. That one corrupts a routing table; this
+#                                               one writes the production database — the more dangerous
+#                                               of the two was the unguarded one.
+#                                               ARMED ONLY when XDG_DATA_HOME is explicitly set AND an
+#                                               absolute OPENCODE_DB resolves outside it. MEASURED on
+#                                               cloudbox 2026-08-14: all four pool serves run with
+#                                               XDG_DATA_HOME UNSET (they export OPENCODE_DB +
+#                                               OPENCODE_DISABLE_CHANNEL_DB and nothing XDG), so the
+#                                               guard is unarmed for every legitimate production
+#                                               consumer and CANNOT break the pool. `env -u OPENCODE_DB`
+#                                               scratch serves (pkgs/opencode-frontdoor/route-gate.nix,
+#                                               test.sh) are likewise unarmed — already isolated.
+#                                               NOT an auto-fix: deriving the DB path from
+#                                               XDG_DATA_HOME when the two disagree would silently
+#                                               repoint the database of any process that sets
+#                                               XDG_DATA_HOME for unrelated reasons, reintroducing the
+#                                               split-brain that pinning OPENCODE_DB exists to prevent.
+#                                               Trading a silent write to the wrong DB for a silent
+#                                               write to a different wrong DB is not an improvement.
+#                                               Escape hatch OPENCODE_DB_ALLOW_FOREIGN_XDG=1 downgrades
+#                                               FATAL to a once-per-process WARNING.
+#                                               Enforced in packages/core/src/database/database.ts
+#                                               path() — the SINGLE choke point every consumer goes
+#                                               through (serve, run, TUI, `db path`, stats, import) —
+#                                               before any handle is opened; exits 22. Decision logic
+#                                               lives in packages/core/src/database/isolation.ts with
+#                                               NO imports beyond node builtins, so its 14 tests
+#                                               (packages/core/test/database/isolation.test.ts) run
+#                                               without a workspace install.
+#                                               Touches database/database.ts, which no other patch
+#                                               modifies (serve-lease only NAMES it in a comment), so
+#                                               it is order-independent; listed last.
+#                                               Applies clean to BOTH v1.17.13 (on top of the full
+#                                               stack) and v1.18.18, so it survives the roll-forward.
+#
 # DROPPED on the v1.17 line (see workstation docs/plans/2026-06-11-opencode-1.17-cutover-runbook.md):
 #   - integration-list-batch.patch: DROPPED on the v1.17.13 roll-forward (2026-07-06).
 #     UPSTREAMED — v1.17.13 Integration.list now does the bulk shape natively:
@@ -590,6 +645,7 @@ PATCHES=(
   registry-port-fence
   plugin-loader-observability
   message-serve-provenance
+  db-isolation-guard
 )
 
 for name in "${PATCHES[@]}"; do

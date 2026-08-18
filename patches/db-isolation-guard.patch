@@ -1,0 +1,442 @@
+diff --git a/packages/core/src/database/database.ts b/packages/core/src/database/database.ts
+index d61adf047e..79b6460e9c 100644
+--- a/packages/core/src/database/database.ts
++++ b/packages/core/src/database/database.ts
+@@ -7,6 +7,7 @@ import { Global } from "../global"
+ import { Flag } from "../flag/flag"
+ import { isAbsolute, join } from "path"
+ import { DatabaseMigration } from "./migration"
++import { enforceDatabaseIsolation } from "./isolation"
+ import { InstallationChannel } from "../installation/version"
+ import { makeGlobalNode } from "../effect/app-node"
+ 
+@@ -42,6 +43,17 @@ export function layerFromPath(filename: string) {
+ 
+ export function path() {
+   if (Flag.OPENCODE_DB) {
++    // DATABASE ISOLATION GUARD (incident 2026-08-14). An absolute OPENCODE_DB
++    // wins over XDG_DATA_HOME here, which silently defeats the documented
++    // "throwaway serve on a copy of the DB" recipe: everything else honours the
++    // scratch data dir while the DB stays production. Refuse, loudly, before any
++    // handle is opened. Unarmed when XDG_DATA_HOME is unset, which is how every
++    // legitimate pool member runs. See ./isolation.ts for the full rationale.
++    enforceDatabaseIsolation({
++      db: Flag.OPENCODE_DB,
++      xdgDataHome: process.env["XDG_DATA_HOME"],
++      allowForeign: process.env["OPENCODE_DB_ALLOW_FOREIGN_XDG"],
++    })
+     if (Flag.OPENCODE_DB === ":memory:" || isAbsolute(Flag.OPENCODE_DB)) return Flag.OPENCODE_DB
+     return join(Global.Path.data, Flag.OPENCODE_DB)
+   }
+diff --git a/packages/core/src/database/isolation.ts b/packages/core/src/database/isolation.ts
+new file mode 100644
+index 0000000000..ef06554c69
+--- /dev/null
++++ b/packages/core/src/database/isolation.ts
+@@ -0,0 +1,184 @@
++/**
++ * Database isolation guard (bead: opencode-db-guard; incident 2026-08-14).
++ *
++ * WHAT WENT WRONG
++ * ---------------
++ * The documented way to validate a new opencode build "without touching
++ * production" is a throwaway `opencode serve` with XDG_DATA_HOME pointed at a
++ * COPY of the database. That isolation is a NO-OP for the database whenever
++ * OPENCODE_DB is set in the environment, because `Database.path()` consults
++ * OPENCODE_DB FIRST and returns it verbatim when absolute — before
++ * `Global.Path.data` (the only thing XDG_DATA_HOME feeds) is ever read.
++ *
++ * On hosts that export OPENCODE_DB as a login/session variable (ours does, to
++ * defeat the channel-suffixed default `opencode-<channel>.db`), every child
++ * process inherits it, so the "isolated" serve opens the LIVE database while
++ * every OTHER path — logs, config, storage, state — honours the scratch
++ * XDG_DATA_HOME. The scratch logfile appearing exactly where expected is what
++ * makes the failure look like success. On 2026-08-14 a throwaway serve
++ * mutated real rows in the production DB this way, and an assertion run
++ * against the never-opened copy returned a clean "0 rows" FALSE GREEN.
++ *
++ * WHY A GUARD AND NOT A SILENT FIX
++ * --------------------------------
++ * Deriving the DB path from XDG_DATA_HOME when the two disagree would "make
++ * isolation work", but it silently repoints the database of any process that
++ * sets XDG_DATA_HOME for unrelated reasons — reintroducing exactly the
++ * split-brain (two opencode.db files, writers divided between them) that
++ * pinning OPENCODE_DB exists to prevent. Trading a silent write to the wrong
++ * DB for a silent write to a different wrong DB is not an improvement. So:
++ * refuse to open anything, name both variables, and print the one line that
++ * makes the isolation real.
++ *
++ * This mirrors the existing routing-slot guard in `serve.ts`
++ * (OPENCODE_SERVE_ID / OPENCODE_ROUTING_DB), which already refuses to start
++ * when a throwaway serve inherits a pool identity. That hazard corrupts a
++ * routing table; this one writes to the production database.
++ *
++ * ARMING
++ * ------
++ * The guard is ARMED only when XDG_DATA_HOME is explicitly set, which is the
++ * signal that the operator asked for a redirected data dir. The real serve
++ * pool leaves XDG_DATA_HOME unset (measured on cloudbox 2026-08-14: pool units
++ * export OPENCODE_DB + OPENCODE_DISABLE_CHANNEL_DB and nothing XDG), so the
++ * guard is unarmed for every legitimate production consumer and cannot break
++ * the pool. A scratch serve that scrubs OPENCODE_DB (`env -u OPENCODE_DB`) is
++ * likewise unarmed — it is already isolated.
++ *
++ * This module deliberately has NO imports beyond node builtins so it can be
++ * unit-tested (and reasoned about) in isolation.
++ */
++
++import { isAbsolute, resolve, sep } from "node:path"
++import { realpathSync } from "node:fs"
++
++export interface IsolationInput {
++  /** Raw OPENCODE_DB value (Flag.OPENCODE_DB). */
++  db: string | undefined
++  /** Raw XDG_DATA_HOME value. */
++  xdgDataHome: string | undefined
++  /** Raw OPENCODE_DB_ALLOW_FOREIGN_XDG value (escape hatch). */
++  allowForeign: string | undefined
++}
++
++export type IsolationResult =
++  | { armed: false; reason: "db-unset" | "db-memory" | "db-relative" | "xdg-unset" }
++  | { armed: true; ok: true; reason: "db-inside-xdg" }
++  | { armed: true; ok: true; reason: "override"; db: string; xdgDataHome: string }
++  | { armed: true; ok: false; db: string; xdgDataHome: string; suggested: string }
++
++function truthy(value: string | undefined) {
++  const v = value?.toLowerCase()
++  return v === "1" || v === "true"
++}
++
++/** resolve(), plus the realpath of the nearest existing ancestor, so that a
++ * symlinked data dir (e.g. XDG_DATA_HOME naming the symlink and OPENCODE_DB
++ * naming its target) does not read as "outside". Never throws. */
++function candidates(p: string): string[] {
++  const abs = resolve(p)
++  const out = [abs]
++  try {
++    out.push(realpathSync(abs))
++  } catch {
++    // Path (or an ancestor) does not exist yet: walk up to the nearest
++    // existing ancestor and re-attach the remainder.
++    const parts = abs.split(sep)
++    for (let i = parts.length - 1; i > 1; i--) {
++      const head = parts.slice(0, i).join(sep) || sep
++      try {
++        const real = realpathSync(head)
++        out.push([real, ...parts.slice(i)].join(sep))
++        break
++      } catch {
++        continue
++      }
++    }
++  }
++  return [...new Set(out)]
++}
++
++function contains(root: string, child: string) {
++  if (root === child) return true
++  const prefix = root.endsWith(sep) ? root : root + sep
++  return child.startsWith(prefix)
++}
++
++export function checkDatabaseIsolation(input: IsolationInput): IsolationResult {
++  const db = input.db
++  if (!db) return { armed: false, reason: "db-unset" }
++  if (db === ":memory:") return { armed: false, reason: "db-memory" }
++  // A relative OPENCODE_DB is joined onto Global.Path.data, which IS derived
++  // from XDG_DATA_HOME — that case is already isolated correctly.
++  if (!isAbsolute(db)) return { armed: false, reason: "db-relative" }
++
++  const xdg = input.xdgDataHome
++  if (!xdg || xdg.trim() === "") return { armed: false, reason: "xdg-unset" }
++
++  const roots = candidates(xdg)
++  const dbs = candidates(db)
++  for (const root of roots) for (const file of dbs) if (contains(root, file)) return { armed: true, ok: true, reason: "db-inside-xdg" }
++
++  if (truthy(input.allowForeign))
++    return { armed: true, ok: true, reason: "override", db: resolve(db), xdgDataHome: resolve(xdg) }
++
++  return {
++    armed: true,
++    ok: false,
++    db: resolve(db),
++    xdgDataHome: resolve(xdg),
++    suggested: resolve(xdg, "opencode", "opencode.db"),
++  }
++}
++
++export function fatalMessage(result: Extract<IsolationResult, { ok: false }>) {
++  return (
++    `FATAL: refusing to open the opencode database at ${result.db}: XDG_DATA_HOME is set to ` +
++    `${result.xdgDataHome}, but OPENCODE_DB points outside it. ` +
++    `XDG_DATA_HOME DOES NOT redirect the database — an absolute OPENCODE_DB is returned verbatim ` +
++    `before Global.Path.data is consulted, so this process would read and WRITE that database ` +
++    `while its logs, config and state went to the scratch dir. That is silent: the scratch logfile ` +
++    `shows up exactly where you expect and the isolation looks like it worked (2026-08-14 incident: ` +
++    `a "throwaway" serve mutated live sessions this way). ` +
++    `To get real isolation, set OPENCODE_DB="${result.suggested}" as well, or drop it entirely ` +
++    `(env -u OPENCODE_DB ...) to take the XDG-derived default. ` +
++    `To use this database deliberately with a redirected XDG_DATA_HOME, set ` +
++    `OPENCODE_DB_ALLOW_FOREIGN_XDG=1. Exiting.`
++  )
++}
++
++export function overrideMessage(result: Extract<IsolationResult, { reason: "override" }>) {
++  return (
++    `WARNING: OPENCODE_DB (${result.db}) points outside XDG_DATA_HOME (${result.xdgDataHome}); ` +
++    `continuing only because OPENCODE_DB_ALLOW_FOREIGN_XDG is set. This process shares the database ` +
++    `with every other opencode writer — it is NOT isolated.`
++  )
++}
++
++let warned = false
++
++/** Test seam: the override warning is once-per-process, so reset it between cases. */
++export function __resetIsolationWarning() {
++  warned = false
++}
++
++/** Enforce at the single choke point where a DB path is resolved. Exits 22
++ * BEFORE any handle is opened, so no write of any kind can precede it. */
++export function enforceDatabaseIsolation(
++  input: IsolationInput,
++  exit: (code: number) => never = process.exit as (code: number) => never,
++  log: { error: (m: string) => void; warn: (m: string) => void } = console,
++) {
++  const result = checkDatabaseIsolation(input)
++  if (result.armed && !result.ok) {
++    log.error(fatalMessage(result))
++    exit(22)
++  }
++  // `path()` is called from several commands, so warn once per process rather
++  // than once per call. The FATAL above is deliberately NOT deduped: it exits.
++  if (result.armed && result.ok && result.reason === "override" && !warned) {
++    warned = true
++    log.warn(overrideMessage(result))
++  }
++  return result
++}
+diff --git a/packages/core/test/database/isolation.test.ts b/packages/core/test/database/isolation.test.ts
+new file mode 100644
+index 0000000000..726d21fea4
+--- /dev/null
++++ b/packages/core/test/database/isolation.test.ts
+@@ -0,0 +1,216 @@
++import { describe, expect, test } from "bun:test"
++import { mkdtempSync, mkdirSync, symlinkSync } from "node:fs"
++import { tmpdir } from "node:os"
++import path from "node:path"
++import {
++  checkDatabaseIsolation,
++  enforceDatabaseIsolation,
++  fatalMessage,
++  __resetIsolationWarning,
++} from "../../src/database/isolation"
++
++/**
++ * Database isolation guard (incident 2026-08-14).
++ *
++ * The two cases that matter most are the first two: the guard MUST fire on the
++ * incident's environment, and MUST NOT fire on the production serve pool's
++ * environment (measured on cloudbox: XDG_DATA_HOME unset, OPENCODE_DB pinned).
++ */
++describe("checkDatabaseIsolation", () => {
++  test("REFUSES the 2026-08-14 incident environment (scratch XDG, production OPENCODE_DB)", () => {
++    const result = checkDatabaseIsolation({
++      db: "/home/dev/.local/share/opencode/opencode.db",
++      xdgDataHome: "/tmp/oc-validate-1234/data",
++      allowForeign: undefined,
++    })
++    expect(result).toMatchObject({ armed: true, ok: false })
++    if (result.armed && !result.ok) {
++      expect(result.suggested).toBe("/tmp/oc-validate-1234/data/opencode/opencode.db")
++      const msg = fatalMessage(result)
++      expect(msg).toStartWith("FATAL:")
++      expect(msg).toContain("OPENCODE_DB")
++      expect(msg).toContain("XDG_DATA_HOME")
++      expect(msg).toContain("env -u OPENCODE_DB")
++      expect(msg).toContain("OPENCODE_DB_ALLOW_FOREIGN_XDG=1")
++    }
++  })
++
++  test("ALLOWS the production serve pool environment (XDG_DATA_HOME unset)", () => {
++    expect(
++      checkDatabaseIsolation({
++        db: "/home/dev/.local/share/opencode/opencode.db",
++        xdgDataHome: undefined,
++        allowForeign: undefined,
++      }),
++    ).toEqual({ armed: false, reason: "xdg-unset" })
++  })
++
++  test("ALLOWS an empty-string XDG_DATA_HOME (treated as unset, per xdg-basedir)", () => {
++    expect(
++      checkDatabaseIsolation({
++        db: "/home/dev/.local/share/opencode/opencode.db",
++        xdgDataHome: "   ",
++        allowForeign: undefined,
++      }),
++    ).toEqual({ armed: false, reason: "xdg-unset" })
++  })
++
++  test("ALLOWS a genuinely isolated throwaway (OPENCODE_DB inside the scratch XDG)", () => {
++    expect(
++      checkDatabaseIsolation({
++        db: "/tmp/scratch/data/opencode/opencode.db",
++        xdgDataHome: "/tmp/scratch/data",
++        allowForeign: undefined,
++      }),
++    ).toMatchObject({ armed: true, ok: true, reason: "db-inside-xdg" })
++  })
++
++  test("ALLOWS an XDG that merely names the real data dir explicitly", () => {
++    expect(
++      checkDatabaseIsolation({
++        db: "/home/dev/.local/share/opencode/opencode.db",
++        xdgDataHome: "/home/dev/.local/share",
++        allowForeign: undefined,
++      }),
++    ).toMatchObject({ armed: true, ok: true })
++  })
++
++  test("ALLOWS `env -u OPENCODE_DB` scratch serves (db unset)", () => {
++    expect(checkDatabaseIsolation({ db: undefined, xdgDataHome: "/tmp/x", allowForeign: undefined })).toEqual({
++      armed: false,
++      reason: "db-unset",
++    })
++  })
++
++  test("ALLOWS :memory: and relative OPENCODE_DB (both already XDG-scoped or ephemeral)", () => {
++    expect(checkDatabaseIsolation({ db: ":memory:", xdgDataHome: "/tmp/x", allowForeign: undefined })).toEqual({
++      armed: false,
++      reason: "db-memory",
++    })
++    expect(checkDatabaseIsolation({ db: "opencode.db", xdgDataHome: "/tmp/x", allowForeign: undefined })).toEqual({
++      armed: false,
++      reason: "db-relative",
++    })
++  })
++
++  test("is not fooled by a trailing slash or a non-normalized path", () => {
++    expect(
++      checkDatabaseIsolation({
++        db: "/tmp/scratch/data/../data/opencode/opencode.db",
++        xdgDataHome: "/tmp/scratch/data/",
++        allowForeign: undefined,
++      }),
++    ).toMatchObject({ armed: true, ok: true })
++  })
++
++  test("does not treat a sibling prefix as containment", () => {
++    expect(
++      checkDatabaseIsolation({
++        db: "/tmp/scratch/data-other/opencode/opencode.db",
++        xdgDataHome: "/tmp/scratch/data",
++        allowForeign: undefined,
++      }),
++    ).toMatchObject({ armed: true, ok: false })
++  })
++
++  test("resolves symlinked data dirs on both sides (no false FATAL)", () => {
++    const root = mkdtempSync(path.join(tmpdir(), "oc-iso-"))
++    const real = path.join(root, "real")
++    mkdirSync(path.join(real, "opencode"), { recursive: true })
++    const link = path.join(root, "link")
++    symlinkSync(real, link)
++
++    // XDG names the symlink, OPENCODE_DB names the target.
++    expect(
++      checkDatabaseIsolation({
++        db: path.join(real, "opencode", "opencode.db"),
++        xdgDataHome: link,
++        allowForeign: undefined,
++      }),
++    ).toMatchObject({ armed: true, ok: true })
++
++    // ...and the other way round.
++    expect(
++      checkDatabaseIsolation({
++        db: path.join(link, "opencode", "opencode.db"),
++        xdgDataHome: real,
++        allowForeign: undefined,
++      }),
++    ).toMatchObject({ armed: true, ok: true })
++  })
++
++  test("escape hatch downgrades FATAL to a warning", () => {
++    expect(
++      checkDatabaseIsolation({
++        db: "/home/dev/.local/share/opencode/opencode.db",
++        xdgDataHome: "/tmp/scratch/data",
++        allowForeign: "1",
++      }),
++    ).toMatchObject({ armed: true, ok: true, reason: "override" })
++  })
++})
++
++describe("enforceDatabaseIsolation", () => {
++  const capture = () => {
++    const errors: string[] = []
++    const warns: string[] = []
++    const exits: number[] = []
++    return {
++      errors,
++      warns,
++      exits,
++      log: { error: (m: string) => errors.push(m), warn: (m: string) => warns.push(m) },
++      exit: ((code: number) => {
++        exits.push(code)
++        // Real process.exit never returns; the test double must, so the caller
++        // sees the write-preventing exit as "the code after this never ran".
++        return undefined as never
++      }) as (code: number) => never,
++    }
++  }
++
++  test("exits 22 with the FATAL message on the incident environment", () => {
++    const c = capture()
++    enforceDatabaseIsolation(
++      { db: "/home/dev/.local/share/opencode/opencode.db", xdgDataHome: "/tmp/scratch", allowForeign: undefined },
++      c.exit,
++      c.log,
++    )
++    expect(c.exits).toEqual([22])
++    expect(c.errors[0]).toStartWith("FATAL: refusing to open the opencode database")
++    expect(c.warns).toEqual([])
++  })
++
++  test("is silent for the pool environment", () => {
++    const c = capture()
++    enforceDatabaseIsolation(
++      { db: "/home/dev/.local/share/opencode/opencode.db", xdgDataHome: undefined, allowForeign: undefined },
++      c.exit,
++      c.log,
++    )
++    expect(c.exits).toEqual([])
++    expect(c.errors).toEqual([])
++    expect(c.warns).toEqual([])
++  })
++
++  test("warns but continues under the escape hatch, once per process", () => {
++    __resetIsolationWarning()
++    const c = capture()
++    enforceDatabaseIsolation(
++      { db: "/home/dev/.local/share/opencode/opencode.db", xdgDataHome: "/tmp/scratch", allowForeign: "true" },
++      c.exit,
++      c.log,
++    )
++    expect(c.exits).toEqual([])
++    expect(c.warns[0]).toStartWith("WARNING: OPENCODE_DB")
++
++    // `path()` is called by several commands; a long-running serve must not
++    // repeat this line on every call.
++    enforceDatabaseIsolation(
++      { db: "/home/dev/.local/share/opencode/opencode.db", xdgDataHome: "/tmp/scratch", allowForeign: "true" },
++      c.exit,
++      c.log,
++    )
++    expect(c.warns).toHaveLength(1)
++  })
++})
