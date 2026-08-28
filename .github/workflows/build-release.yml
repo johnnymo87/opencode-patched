@@ -161,6 +161,13 @@ jobs:
       # explicit must-not-fire case alongside the incident's environment. Named
       # here for the same reason as the steps above: an unnamed patch-carried
       # test is inert.
+      - name: TUI message scroll tests
+        working-directory: opencode-src/packages/tui
+        # Named here because build-release runs only the files it names; a
+        # patch-carried test that no step names is inert.
+        run: |
+          bun test test/routes/session/scroll-target.test.ts
+
       - name: Database isolation guard tests
         run: |
           cd opencode-src/packages/core

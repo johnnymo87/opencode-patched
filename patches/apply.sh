@@ -558,6 +558,41 @@
 #                                               Applies clean to BOTH v1.17.13 (on top of the full
 #                                               stack) and v1.18.18, so it survives the roll-forward.
 #
+#  31. tui-message-scroll.patch       Scroll the TUI to a specific message, so the session
+#                                     switcher can land you where the unread work starts instead
+#                                     of at the bottom (workstation-v8jh phase 2; plan in
+#                                     workstation docs/plans/2026-08-28-scroll-to-unread-plan.md).
+#                                     Route is POST /session/:sessionID/scroll-to-message,
+#                                     session-scoped for the same reason as session-mcp-routes:
+#                                     the front door owner-routes it for free. It CANNOT live
+#                                     under /tui/ -- the door classifies every /tui/* route as a
+#                                     class-level 501 by design, and it never reads the request
+#                                     body, so a sessionID carried only in the payload could not
+#                                     route at all and would land on the anchor serve.
+#                                     The TUI handler RECORDS a target rather than scrolling: the
+#                                     anchor may not be fetched or laid out when the event lands,
+#                                     so a reactive effect fires when the message actually exists.
+#                                     Reactivity is the readiness signal -- one delivered request
+#                                     suffices however slowly content loads, which matters because
+#                                     readiness is NOT observable from outside the process (the
+#                                     tui-control RPC that would allow it is dead on both ends).
+#                                     It also suppresses the post-sync scrollBy(100_000), which
+#                                     would otherwise clobber the jump at exactly the wrong moment.
+#                                     Tests: packages/tui/test/routes/session/scroll-target.test.ts,
+#                                     run by the "TUI message scroll tests" step in
+#                                     build-release.yml -- a patch-carried test that no workflow
+#                                     names is inert. Verified non-vacuous by mutation: 7 mutants,
+#                                     6 caught. The 7th (dropping the Math.max clamp in atBottom)
+#                                     SURVIVES and is documented rather than papered over -- for
+#                                     every reachable input (scrollTop >= 0) the clamped and
+#                                     unclamped forms agree, so no test can distinguish them.
+#                                     Touches groups/session.ts and handlers/session.ts, which
+#                                     session-mcp-routes also edits, but in disjoint regions and
+#                                     ordered AFTER it. Generated SDK types are HAND-CARRIED, as
+#                                     session-mcp-routes does: a full SDK regen silently drops
+#                                     that patch's mcp* client methods, so do NOT regenerate
+#                                     wholesale.
+#
 # DROPPED on the v1.17 line (see workstation docs/plans/2026-06-11-opencode-1.17-cutover-runbook.md):
 #   - integration-list-batch.patch: DROPPED on the v1.17.13 roll-forward (2026-07-06).
 #     UPSTREAMED — v1.17.13 Integration.list now does the bulk shape natively:
@@ -646,6 +681,7 @@ PATCHES=(
   plugin-loader-observability
   message-serve-provenance
   db-isolation-guard
+  tui-message-scroll
 )
 
 for name in "${PATCHES[@]}"; do

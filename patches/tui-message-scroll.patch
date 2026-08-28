@@ -1,0 +1,419 @@
+diff --git a/packages/opencode/src/server/routes/instance/httpapi/groups/session.ts b/packages/opencode/src/server/routes/instance/httpapi/groups/session.ts
+index ca7e625fa5..4c310d1581 100644
+--- a/packages/opencode/src/server/routes/instance/httpapi/groups/session.ts
++++ b/packages/opencode/src/server/routes/instance/httpapi/groups/session.ts
+@@ -131,10 +131,20 @@ export const SessionPaths = {
+   mcpStatus: `${root}/:sessionID/mcp`,
+   mcpConnect: `${root}/:sessionID/mcp/:name/connect`,
+   mcpDisconnect: `${root}/:sessionID/mcp/:name/disconnect`,
+-  deleteMessage: `${root}/:sessionID/message/:messageID`,
+-  deletePart: `${root}/:sessionID/message/:messageID/part/:partID`,
+-  updatePart: `${root}/:sessionID/message/:messageID/part/:partID`,
+-} as const
++    deleteMessage: `${root}/:sessionID/message/:messageID`,
++    deletePart: `${root}/:sessionID/message/:messageID/part/:partID`,
++    updatePart: `${root}/:sessionID/message/:messageID/part/:partID`,
++    // Scroll the TUI to a message (bead workstation-v8jh, phase 2). Session-scoped
++    // for the same reason as the MCP routes above: the front door owner-routes it
++    // for free, and it must, because the effect lands in ONE process -- the serve
++    // whose TUI is mounted on this session.
++    //
++    // Deliberately NOT under /tui/. The door classifies every /tui/* route as a
++    // class-level 501 by design, so the picker could not reach it there; and the
++    // door never reads the request body, so a sessionID carried only in the payload
++    // could not route at all and would land on the anchor serve.
++    scrollToMessage: `${root}/:sessionID/scroll-to-message`,
++  } as const
+ 
+ export const SessionApi = HttpApi.make("session")
+   .add(
+@@ -499,6 +509,23 @@ export const SessionApi = HttpApi.make("session")
+             description: "Get the status of all Model Context Protocol (MCP) servers (process-global, addressable by session for front-door routing).",
+           }),
+         ),
++        HttpApiEndpoint.post("scrollToMessage", SessionPaths.scrollToMessage, {
++          params: { sessionID: SessionID },
++          query: WorkspaceRoutingQuery,
++          payload: Schema.Struct({
++            messageID: Schema.String,
++            force: Schema.optional(Schema.Boolean),
++          }),
++          success: described(Schema.Boolean, "Scroll request published"),
++          error: [ApiNotFoundError],
++        }).annotateMerge(
++          OpenApi.annotations({
++            identifier: "session.scrollToMessage",
++            summary: "Scroll TUI to message",
++            description:
++              "Ask the TUI mounted on this session to scroll to a message (process-local effect, addressable by session for front-door routing).",
++          }),
++        ),
+         HttpApiEndpoint.post("mcpConnect", SessionPaths.mcpConnect, {
+           params: { sessionID: SessionID, name: Schema.String },
+           query: WorkspaceRoutingQuery,
+diff --git a/packages/opencode/src/server/routes/instance/httpapi/handlers/session.ts b/packages/opencode/src/server/routes/instance/httpapi/handlers/session.ts
+index eb568377af..4d3aeddf1d 100644
+--- a/packages/opencode/src/server/routes/instance/httpapi/handlers/session.ts
++++ b/packages/opencode/src/server/routes/instance/httpapi/handlers/session.ts
+@@ -3,6 +3,7 @@ import { Agent } from "@/agent/agent"
+ import { MCP } from "@/mcp"
+ import { SessionV1 } from "@opencode-ai/core/v1/session"
+ import { EventV2Bridge } from "@/event-v2-bridge"
++import { TuiEvent } from "@/server/tui-event"
+ import { Command } from "@/command"
+ import { Permission } from "@/permission"
+ import { Question } from "@/question"
+@@ -447,6 +448,25 @@ export const sessionHandlers = HttpApiBuilder.group(InstanceHttpApi, "session",
+       return yield* mcp.status()
+     })
+ 
++    const scrollToMessage = Effect.fn("SessionHttpApi.scrollToMessage")(function* (ctx: {
++      params: { sessionID: SessionID }
++      payload: { messageID: string; force?: boolean }
++    }) {
++      yield* requireSession(ctx.params.sessionID)
++      // sessionID comes from the PATH, never the payload: it is what the front door
++      // routed on, so trusting the body could publish a scroll for a session this
++      // serve does not own.
++      yield* events.publish(TuiEvent.MessageScroll, {
++        sessionID: ctx.params.sessionID,
++        messageID: ctx.payload.messageID,
++        force: ctx.payload.force ?? false,
++      })
++      // True means "published", NOT "a TUI scrolled" -- the bus cannot tell us
++      // whether anyone is subscribed. Callers must not read this as an ack; the
++      // meaningful signal is 404 from a serve whose build predates this route.
++      return true
++    })
++
+     const mcpConnect = Effect.fn("SessionHttpApi.mcpConnect")(function* (ctx: {
+       params: { sessionID: SessionID; name: string }
+     }) {
+@@ -542,6 +562,7 @@ export const sessionHandlers = HttpApiBuilder.group(InstanceHttpApi, "session",
+       .handle("questionReply", questionReply)
+       .handle("questionReject", questionReject)
+       .handle("mcpStatus", mcpStatus)
++      .handle("scrollToMessage", scrollToMessage)
+       .handle("mcpConnect", mcpConnect)
+       .handle("mcpDisconnect", mcpDisconnect)
+       .handle("deleteMessage", deleteMessage)
+diff --git a/packages/schema/src/tui-event.ts b/packages/schema/src/tui-event.ts
+index 800094e61e..6401be19bc 100644
+--- a/packages/schema/src/tui-event.ts
++++ b/packages/schema/src/tui-event.ts
+@@ -56,4 +56,23 @@ export const SessionSelect = Event.define({
+   },
+ })
+ 
+-export const Definitions = Event.inventory(PromptAppend, CommandExecute, ToastShow, SessionSelect)
++export const MessageScroll = Event.define({
++  type: "tui.message.scroll",
++  schema: {
++    // REQUIRED, and load-bearing beyond mere addressing. event-session-scope.patch
++    // filters the SSE stream on `data.sessionID` and passes through anything that
++    // lacks a string one, so an event without this field would not be "unrouted" --
++    // it would be BROADCAST to every attached TUI on this serve, scrolling sessions
++    // nobody asked about.
++    sessionID: SessionID.annotate({ description: "Session containing the message" }),
++    messageID: Schema.String.annotate({ description: "Message ID to scroll to" }),
++    // True only for the caller's first, user-initiated attempt. Later attempts are
++    // speculative retries of a delivery whose success cannot be observed, and must
++    // not move a viewport the user has since taken over.
++    force: Schema.Boolean.pipe(Schema.withDecodingDefault(Effect.succeed(false))).annotate({
++      description: "Scroll even if the viewport is not parked at the bottom",
++    }),
++  },
++})
++
++export const Definitions = Event.inventory(PromptAppend, CommandExecute, ToastShow, SessionSelect, MessageScroll)
+diff --git a/packages/sdk/js/src/v2/gen/types.gen.ts b/packages/sdk/js/src/v2/gen/types.gen.ts
+index 8b8f88a11e..a791b5860f 100644
+--- a/packages/sdk/js/src/v2/gen/types.gen.ts
++++ b/packages/sdk/js/src/v2/gen/types.gen.ts
+@@ -75,6 +75,7 @@ export type Event =
+   | EventTuiCommandExecute2
+   | EventTuiToastShow2
+   | EventTuiSessionSelect2
++  | EventTuiMessageScroll2
+   | EventMcpToolsChanged
+   | EventMcpBrowserOpenFailed
+   | EventCommandExecuted
+@@ -1451,6 +1452,21 @@ export type GlobalEvent = {
+           sessionID: string
+         }
+       }
++    | {
++        id: string
++        type: "tui.message.scroll"
++        properties: {
++          /**
++           * Session containing the message
++           */
++          sessionID: string
++          /**
++           * Message ID to scroll to
++           */
++          messageID: string
++          force?: boolean
++        }
++      }
+     | {
+         id: string
+         type: "mcp.tools.changed"
+@@ -3016,6 +3032,22 @@ export type EventTuiSessionSelect2 = {
+   }
+ }
+ 
++export type EventTuiMessageScroll2 = {
++  id: string
++  type: "tui.message.scroll"
++  properties: {
++    /**
++     * Session containing the message
++     */
++    sessionID: string
++    /**
++     * Message ID to scroll to
++     */
++    messageID: string
++    force?: boolean
++  }
++}
++
+ export type CredentialValue = CredentialOAuth | CredentialKey
+ 
+ export type IntegrationInputs = {
+diff --git a/packages/tui/src/routes/session/index.tsx b/packages/tui/src/routes/session/index.tsx
+index 61abe4abd8..f7bbdc2255 100644
+--- a/packages/tui/src/routes/session/index.tsx
++++ b/packages/tui/src/routes/session/index.tsx
+@@ -21,6 +21,7 @@ import { useRoute, useRouteData } from "../../context/route"
+ import { useProject } from "../../context/project"
+ import { useSync } from "../../context/sync"
+ import { useEvent } from "../../context/event"
++import { atBottom, shouldAccept } from "./scroll-target"
+ import { SplitBorder } from "../../ui/border"
+ import { useTuiPaths, useTuiTerminalEnvironment } from "../../context/runtime"
+ import { Spinner } from "../../component/spinner"
+@@ -211,6 +212,24 @@ export function Session() {
+       .toSorted((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0))
+   })
+   const messages = createMemo(() => sync.data.message[route.sessionID] ?? [])
++
++  // workstation-v8jh phase 2: a scroll target that outlives its own delivery.
++  //
++  // The transport is live-only SSE with no replay, so a request published before
++  // this route mounts is dropped and the caller retries blind -- it cannot observe
++  // TUI readiness from outside the process (the tui-control RPC that would allow
++  // that is dead on both ends, and an SSE subscription proves a client connected,
++  // not that this route mounted).
++  //
++  // But the SECOND wait -- for the anchor message to be fetched and rendered -- is
++  // observable right here, so it is waited on rather than retried: the handler
++  // records a target and an effect below fires when the message actually exists.
++  // One delivered request therefore suffices forever, however slowly content loads.
++  //
++  // Declared HERE, above the post-sync bottom-scroll that reads it, rather than
++  // beside that effect: the read sits after an await so a later declaration would
++  // happen to work, which is not the same as being correct.
++  const [pendingScroll, setPendingScroll] = createSignal<string | undefined>()
+   const messagesBeforeRevert = () => {
+     const messageID = session()?.revert?.messageID
+     if (!messageID) return messages()
+@@ -312,7 +331,10 @@ export function Session() {
+       }
+       editor.reconnect(result.data.directory)
+       await sync.session.sync(sessionID)
+-      if (route.sessionID === sessionID && scroll) scroll.scrollBy(100_000)
++        // Suppressed when a scroll target is pending, or this would clobber the
++        // jump: it runs the moment sync resolves, which is exactly when the anchor
++        // becomes available. Suppressing is explicit; racing the two effects is not.
++        if (route.sessionID === sessionID && scroll && !pendingScroll()) scroll.scrollBy(100_000)
+     })().catch((error) => {
+       if (route.sessionID !== sessionID) return
+       toast.show({
+@@ -355,6 +377,49 @@ export function Session() {
+   const dialog = useDialog()
+   const renderer = useRenderer()
+ 
++  // Records; does not scroll. See pendingScroll above. Decision logic lives in
++  // ./scroll-target so it is testable without a renderer.
++  onCleanup(
++    event.on("tui.message.scroll", (evt) => {
++      const live = scroll && !scroll.isDestroyed ? scroll : undefined
++      const accept = shouldAccept({
++        eventSessionID: evt.properties.sessionID,
++        routeSessionID: route.sessionID,
++        // Optional on the wire (the schema supplies the default server-side), so
++        // default again here rather than trusting a field that may be absent.
++        // Absent must mean "guarded", never "force".
++        force: evt.properties.force ?? false,
++        bottom: live ? atBottom(live.scrollTop, live.scrollHeight, live.viewport.height) : undefined,
++      })
++      if (!accept) return
++      setPendingScroll(evt.properties.messageID)
++    }),
++  )
++
++  // The anchor may not be fetched or laid out yet. Reactivity is the readiness
++  // signal: this re-runs when messages() changes and fires exactly once, whenever
++  // that turns out to be. A target that never arrives (compacted away, or older
++  // than the newest 100 messages sync fetches) simply never resolves, leaving the
++  // viewport where it was -- which is today's behaviour.
++  createEffect(() => {
++    const id = pendingScroll()
++    if (!id) return
++    if (!messages().some((m) => m.id === id)) return
++    if (!scroll || scroll.isDestroyed) return
++    scroll.scrollChildIntoView(id)
++    setPendingScroll(undefined)
++  })
++
++  // A target is meaningless once the user navigates elsewhere; without this it
++  // would follow them into the next session and scroll it.
++  createEffect(
++    on(
++      () => route.sessionID,
++      () => setPendingScroll(undefined),
++      { defer: true },
++    ),
++  )
++
+   event.on("session.status", (evt) => {
+     if (evt.properties.sessionID !== route.sessionID) return
+     if (evt.properties.status.type !== "retry") return
+diff --git a/packages/tui/src/routes/session/scroll-target.ts b/packages/tui/src/routes/session/scroll-target.ts
+new file mode 100644
+index 0000000000..73b95e92d2
+--- /dev/null
++++ b/packages/tui/src/routes/session/scroll-target.ts
+@@ -0,0 +1,51 @@
++/**
++ * Decision logic for tui.message.scroll (workstation-v8jh phase 2).
++ *
++ * Extracted from the session route so the delicate parts -- an off-by-one bottom
++ * test and a force override that has to beat that test -- can be exercised without
++ * standing up a renderer. The route keeps the effects; this keeps the choices.
++ */
++
++/**
++ * Is the viewport parked at the bottom, i.e. has the user NOT taken it over?
++ *
++ * Tolerance of one row matches opentui's own isAtStickyReengagePoint. Without it a
++ * token streaming in mid-jump moves scrollTop a row and reads as "the user
++ * scrolled", which would drop the very scroll the user asked for.
++ *
++ * A session with no scrollback has maxScrollTop 0 and scrollTop 0, which is at the
++ * bottom -- correct: there is nothing to take over.
++ */
++export function atBottom(scrollTop: number, scrollHeight: number, viewportHeight: number): boolean {
++  // The Math.max clamp mirrors opentui's own maxScrollTop computation. It is kept
++  // for that correspondence, not because it changes an answer: for every reachable
++  // input (scrollTop >= 0) the clamped and unclamped forms agree, so no test can
++  // distinguish them and mutating it away survives. Said plainly rather than
++  // covered by a test that would only appear to pin it.
++  const maxScrollTop = Math.max(0, scrollHeight - viewportHeight)
++  return scrollTop >= maxScrollTop - 1
++}
++
++/**
++ * Should this scroll request be recorded as the pending target?
++ *
++ * `force` marks the caller's first, user-initiated attempt -- the jump itself. It
++ * must win even against a viewport the user left scrolled up days ago, because
++ * ignoring it would silently discard an explicit request. Every later attempt is a
++ * speculative retry of a delivery whose success cannot be observed, and must not
++ * yank a viewport the user has since taken over.
++ *
++ * `bottom` is undefined when the scrollbox does not exist yet (the event can arrive
++ * before first paint). That is not "the user scrolled away", so it accepts: the
++ * effect will scroll once the anchor renders.
++ */
++export function shouldAccept(opts: {
++  eventSessionID: string
++  routeSessionID: string
++  force: boolean
++  bottom: boolean | undefined
++}): boolean {
++  if (opts.eventSessionID !== opts.routeSessionID) return false
++  if (opts.force) return true
++  return opts.bottom !== false
++}
+diff --git a/packages/tui/test/routes/session/scroll-target.test.ts b/packages/tui/test/routes/session/scroll-target.test.ts
+new file mode 100644
+index 0000000000..19c9456ef3
+--- /dev/null
++++ b/packages/tui/test/routes/session/scroll-target.test.ts
+@@ -0,0 +1,72 @@
++import { describe, expect, test } from "bun:test"
++import { atBottom, shouldAccept } from "../../../src/routes/session/scroll-target"
++
++// workstation-v8jh phase 2. These pin the two decisions that are easy to get
++// subtly wrong and impossible to notice: the one-row tolerance on the bottom
++// test, and force having to beat that test.
++
++describe("atBottom", () => {
++  test("exactly at the bottom", () => {
++    // scrollHeight 500, viewport 100 -> maxScrollTop 400
++    expect(atBottom(400, 500, 100)).toBe(true)
++  })
++
++  test("one row up still counts, so a streaming token does not read as a user scroll", () => {
++    expect(atBottom(399, 500, 100)).toBe(true)
++  })
++
++  test("two rows up does not count -- that is a user who scrolled", () => {
++    expect(atBottom(398, 500, 100)).toBe(false)
++  })
++
++  test("far from the bottom", () => {
++    expect(atBottom(0, 500, 100)).toBe(false)
++  })
++
++  test("a session with no scrollback is at the bottom", () => {
++    // Nothing to take over: maxScrollTop clamps to 0 and scrollTop is 0.
++    expect(atBottom(0, 40, 100)).toBe(true)
++  })
++
++  test("content shorter than the viewport never reports 'scrolled away'", () => {
++    expect(atBottom(0, 10, 100)).toBe(true)
++  })
++})
++
++describe("shouldAccept", () => {
++  const base = { eventSessionID: "ses_a", routeSessionID: "ses_a", force: false, bottom: true }
++
++  test("accepts a bottom-parked viewport", () => {
++    expect(shouldAccept(base)).toBe(true)
++  })
++
++  test("rejects another session's event", () => {
++    // The SSE filter scopes by sessionID, but a serve hosting two sessions can
++    // still deliver here; without this the wrong transcript jumps.
++    expect(shouldAccept({ ...base, eventSessionID: "ses_b" })).toBe(false)
++  })
++
++  test("rejects a speculative retry once the user has scrolled away", () => {
++    expect(shouldAccept({ ...base, bottom: false })).toBe(false)
++  })
++
++  test("force beats a scrolled-away viewport -- it is the user's own jump", () => {
++    // The warm case this exists for: a session left scrolled up days ago. Without
++    // force, every attempt drops and pressing jump appears to do nothing.
++    expect(shouldAccept({ ...base, force: true, bottom: false })).toBe(true)
++  })
++
++  test("force does NOT cross sessions", () => {
++    expect(shouldAccept({ ...base, eventSessionID: "ses_b", force: true, bottom: false })).toBe(false)
++  })
++
++  test("accepts before first paint, when there is no scrollbox to judge", () => {
++    // Arriving pre-render is the common cold-attach case; treating "unknown" as
++    // "scrolled away" would drop precisely the attempts that matter most.
++    expect(shouldAccept({ ...base, bottom: undefined })).toBe(true)
++  })
++
++  test("accepts before first paint even without force", () => {
++    expect(shouldAccept({ ...base, force: false, bottom: undefined })).toBe(true)
++  })
++})
