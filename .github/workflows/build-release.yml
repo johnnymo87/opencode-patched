@@ -166,6 +166,13 @@ jobs:
           cd opencode-src/packages/core
           bun test test/database/isolation.test.ts
 
+      - name: TUI message scroll tests
+        working-directory: opencode-src/packages/tui
+        # Named here because build-release runs only the files it names; a
+        # patch-carried test that no step names is inert.
+        run: |
+          bun test test/routes/session/scroll-target.test.ts
+
       - name: Build CLI
         run: |
           cd opencode-src/packages/opencode
