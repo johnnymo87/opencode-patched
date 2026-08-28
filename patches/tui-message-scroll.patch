@@ -1,28 +1,22 @@
 diff --git a/packages/opencode/src/server/routes/instance/httpapi/groups/session.ts b/packages/opencode/src/server/routes/instance/httpapi/groups/session.ts
-index ca7e625fa5..4c310d1581 100644
+index ca7e625fa5..9de649a868 100644
 --- a/packages/opencode/src/server/routes/instance/httpapi/groups/session.ts
 +++ b/packages/opencode/src/server/routes/instance/httpapi/groups/session.ts
-@@ -131,10 +131,20 @@ export const SessionPaths = {
-   mcpStatus: `${root}/:sessionID/mcp`,
-   mcpConnect: `${root}/:sessionID/mcp/:name/connect`,
-   mcpDisconnect: `${root}/:sessionID/mcp/:name/disconnect`,
--  deleteMessage: `${root}/:sessionID/message/:messageID`,
--  deletePart: `${root}/:sessionID/message/:messageID/part/:partID`,
--  updatePart: `${root}/:sessionID/message/:messageID/part/:partID`,
+@@ -134,7 +134,17 @@ export const SessionPaths = {
+   deleteMessage: `${root}/:sessionID/message/:messageID`,
+   deletePart: `${root}/:sessionID/message/:messageID/part/:partID`,
+   updatePart: `${root}/:sessionID/message/:messageID/part/:partID`,
 -} as const
-+    deleteMessage: `${root}/:sessionID/message/:messageID`,
-+    deletePart: `${root}/:sessionID/message/:messageID/part/:partID`,
-+    updatePart: `${root}/:sessionID/message/:messageID/part/:partID`,
-+    // Scroll the TUI to a message (bead workstation-v8jh, phase 2). Session-scoped
-+    // for the same reason as the MCP routes above: the front door owner-routes it
-+    // for free, and it must, because the effect lands in ONE process -- the serve
-+    // whose TUI is mounted on this session.
-+    //
-+    // Deliberately NOT under /tui/. The door classifies every /tui/* route as a
-+    // class-level 501 by design, so the picker could not reach it there; and the
-+    // door never reads the request body, so a sessionID carried only in the payload
-+    // could not route at all and would land on the anchor serve.
-+    scrollToMessage: `${root}/:sessionID/scroll-to-message`,
++  // Scroll the TUI to a message (bead workstation-v8jh, phase 2). Session-scoped
++  // for the same reason as the MCP routes above: the front door owner-routes it
++  // for free, and it must, because the effect lands in ONE process -- the serve
++  // whose TUI is mounted on this session.
++  //
++  // Deliberately NOT under /tui/. The door classifies every /tui/* route as a
++  // class-level 501 by design, so the picker could not reach it there; and the
++  // door never reads the request body, so a sessionID carried only in the payload
++  // could not route at all and would land on the anchor serve.
++  scrollToMessage: `${root}/:sessionID/scroll-to-message`,
 +  } as const
  
  export const SessionApi = HttpApi.make("session")
@@ -184,7 +178,7 @@ index 8b8f88a11e..a791b5860f 100644
  
  export type IntegrationInputs = {
 diff --git a/packages/tui/src/routes/session/index.tsx b/packages/tui/src/routes/session/index.tsx
-index 61abe4abd8..f7bbdc2255 100644
+index 61abe4abd8..5d76bba390 100644
 --- a/packages/tui/src/routes/session/index.tsx
 +++ b/packages/tui/src/routes/session/index.tsx
 @@ -21,6 +21,7 @@ import { useRoute, useRouteData } from "../../context/route"
@@ -225,14 +219,14 @@ index 61abe4abd8..f7bbdc2255 100644
        editor.reconnect(result.data.directory)
        await sync.session.sync(sessionID)
 -      if (route.sessionID === sessionID && scroll) scroll.scrollBy(100_000)
-+        // Suppressed when a scroll target is pending, or this would clobber the
-+        // jump: it runs the moment sync resolves, which is exactly when the anchor
-+        // becomes available. Suppressing is explicit; racing the two effects is not.
-+        if (route.sessionID === sessionID && scroll && !pendingScroll()) scroll.scrollBy(100_000)
++      // Suppressed when a scroll target is pending, or this would clobber the
++      // jump: it runs the moment sync resolves, which is exactly when the anchor
++      // becomes available. Suppressing is explicit; racing the two effects is not.
++      if (route.sessionID === sessionID && scroll && !pendingScroll()) scroll.scrollBy(100_000)
      })().catch((error) => {
        if (route.sessionID !== sessionID) return
        toast.show({
-@@ -355,6 +377,49 @@ export function Session() {
+@@ -355,6 +377,65 @@ export function Session() {
    const dialog = useDialog()
    const renderer = useRenderer()
  
@@ -255,18 +249,34 @@ index 61abe4abd8..f7bbdc2255 100644
 +    }),
 +  )
 +
-+  // The anchor may not be fetched or laid out yet. Reactivity is the readiness
-+  // signal: this re-runs when messages() changes and fires exactly once, whenever
-+  // that turns out to be. A target that never arrives (compacted away, or older
-+  // than the newest 100 messages sync fetches) simply never resolves, leaving the
-+  // viewport where it was -- which is today's behaviour.
++  // The anchor may not be fetched yet. Reactivity covers that half: this re-runs
++  // when messages() changes, so a target that arrives late still lands, and one
++  // that never arrives (compacted away, or older than the newest 100 messages sync
++  // fetches) simply never resolves -- leaving the viewport where it was, which is
++  // today's behaviour.
++  //
++  // Being in the store is NOT enough to scroll, though. Solid creates the
++  // renderable synchronously with the store write, but opentui only runs layout
++  // once per frame (updateFromLayout is gated on _lastLayoutFrame === frameId), so
++  // right now the child's y is stale and scrollChildIntoView would compute a delta
++  // of ~0, appear to succeed, and land nowhere. Hence one deferred hop before
++  // acting -- the same 50ms the neighbouring toBottom() uses for exactly this
++  // reason. It is a timer, but a one-shot wait for layout, not a retry loop
++  // guessing at readiness.
 +  createEffect(() => {
 +    const id = pendingScroll()
 +    if (!id) return
 +    if (!messages().some((m) => m.id === id)) return
-+    if (!scroll || scroll.isDestroyed) return
-+    scroll.scrollChildIntoView(id)
-+    setPendingScroll(undefined)
++    const timer = setTimeout(() => {
++      if (scroll && !scroll.isDestroyed) scroll.scrollChildIntoView(id)
++      // Cleared only here, after the attempt. If the message is in the store but
++      // has no renderable (reverted, or a synthetic-only turn that renders no id'd
++      // box) then it never will have one -- renderable creation is synchronous with
++      // the store write -- so one attempt is the right number, not zero and not
++      // forever.
++      setPendingScroll(undefined)
++    }, 50)
++    onCleanup(() => clearTimeout(timer))
 +  })
 +
 +  // A target is meaningless once the user navigates elsewhere; without this it
@@ -284,10 +294,10 @@ index 61abe4abd8..f7bbdc2255 100644
      if (evt.properties.status.type !== "retry") return
 diff --git a/packages/tui/src/routes/session/scroll-target.ts b/packages/tui/src/routes/session/scroll-target.ts
 new file mode 100644
-index 0000000000..73b95e92d2
+index 0000000000..7d26b32a24
 --- /dev/null
 +++ b/packages/tui/src/routes/session/scroll-target.ts
-@@ -0,0 +1,51 @@
+@@ -0,0 +1,53 @@
 +/**
 + * Decision logic for tui.message.scroll (workstation-v8jh phase 2).
 + *
@@ -308,10 +318,12 @@ index 0000000000..73b95e92d2
 + */
 +export function atBottom(scrollTop: number, scrollHeight: number, viewportHeight: number): boolean {
 +  // The Math.max clamp mirrors opentui's own maxScrollTop computation. It is kept
-+  // for that correspondence, not because it changes an answer: for every reachable
-+  // input (scrollTop >= 0) the clamped and unclamped forms agree, so no test can
-+  // distinguish them and mutating it away survives. Said plainly rather than
-+  // covered by a test that would only appear to pin it.
++  // for that correspondence, not because it changes an answer: the scrollbox content
++  // carries minHeight:"100%", so post-layout scrollHeight >= viewportHeight and the
++  // subtraction is never negative. For every reachable input the clamped and
++  // unclamped forms therefore agree, no test can distinguish them, and mutating it
++  // away survives. Said plainly, with the invariant named, rather than covered by a
++  // test that would only appear to pin it.
 +  const maxScrollTop = Math.max(0, scrollHeight - viewportHeight)
 +  return scrollTop >= maxScrollTop - 1
 +}
@@ -341,10 +353,10 @@ index 0000000000..73b95e92d2
 +}
 diff --git a/packages/tui/test/routes/session/scroll-target.test.ts b/packages/tui/test/routes/session/scroll-target.test.ts
 new file mode 100644
-index 0000000000..19c9456ef3
+index 0000000000..365ddfe98d
 --- /dev/null
 +++ b/packages/tui/test/routes/session/scroll-target.test.ts
-@@ -0,0 +1,72 @@
+@@ -0,0 +1,73 @@
 +import { describe, expect, test } from "bun:test"
 +import { atBottom, shouldAccept } from "../../../src/routes/session/scroll-target"
 +
@@ -413,7 +425,8 @@ index 0000000000..19c9456ef3
 +    expect(shouldAccept({ ...base, bottom: undefined })).toBe(true)
 +  })
 +
-+  test("accepts before first paint even without force", () => {
-+    expect(shouldAccept({ ...base, force: false, bottom: undefined })).toBe(true)
++  test("force with no scrollbox yet still accepts", () => {
++    // The cold-attach shape: attempt 0 arrives before first paint.
++    expect(shouldAccept({ ...base, force: true, bottom: undefined })).toBe(true)
 +  })
 +})
