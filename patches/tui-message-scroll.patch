@@ -177,8 +177,138 @@ index 8b8f88a11e..a791b5860f 100644
  export type CredentialValue = CredentialOAuth | CredentialKey
  
  export type IntegrationInputs = {
+diff --git a/packages/tui/src/context/sync.tsx b/packages/tui/src/context/sync.tsx
+index ba69d66811..eaa0c5c2e5 100644
+--- a/packages/tui/src/context/sync.tsx
++++ b/packages/tui/src/context/sync.tsx
+@@ -29,6 +29,7 @@ import { createSimpleContext } from "./helper"
+ import { useExit } from "./exit"
+ import { useArgs } from "./args"
+ import { resolveRootSessionID } from "../util/session"
++import { REACH_DEFAULT_CAP, REACH_LIMIT, REACH_MARGIN, mergeReach, planReach } from "../routes/session/scroll-target"
+ import { batch, onMount, onCleanup } from "solid-js"
+ import path from "path"
+ import { useKV } from "./kv"
+@@ -156,6 +157,16 @@ export const {
+     })
+ 
+     const fullSyncedSessions = new Set<string>()
++    // workstation-psh9. The message store deliberately holds only the newest
++    // REACH_DEFAULT_CAP messages per session, because the transcript is NOT
++    // virtualized -- every stored message is a live renderable. Jumping to an older
++    // anchor means rendering everything between it and the present, so that session
++    // gets a temporarily larger cap. Per-session and temporary: the default is
++    // restored when the user leaves, so one deep jump does not permanently raise the
++    // cost of every session in the process.
++    const messageCaps = new Map<string, number>()
++    const reachingSessions = new Map<string, Promise<"hit" | "miss">>()
++    const capFor = (sessionID: string) => messageCaps.get(sessionID) ?? REACH_DEFAULT_CAP
+     const syncingSessions = new Map<string, Promise<void>>()
+     const hydratingSessions = new Map<string, { messages: Set<string>; parts: Set<string> }>()
+     const touchMessage = (sessionID: string, messageID: string) => {
+@@ -358,7 +369,7 @@ export const {
+             }),
+           )
+           const updated = store.message[event.properties.info.sessionID]
+-          if (updated.length > 100) {
++          if (updated.length > capFor(event.properties.info.sessionID)) {
+             const oldest = updated[0]
+             batch(() => {
+               setStore(
+@@ -659,8 +670,9 @@ export const {
+                   ),
+                 )
+                 infos.sort(compareMessage)
+-                const removed = infos.slice(0, -100)
+-                const visible = infos.slice(-100)
++                const cap = capFor(sessionID)
++                const removed = infos.slice(0, -cap)
++                const visible = infos.slice(-cap)
+                 const visibleIDs = new Set(visible.map((message) => message.id))
+                 for (const message of messages.data ?? []) {
+                   if (!visibleIDs.has(message.info.id)) {
+@@ -702,6 +714,79 @@ export const {
+           syncingSessions.set(sessionID, task)
+           return task
+         },
++        /**
++         * workstation-psh9. Pull enough history into the store that `targetID` is
++         * rendered, so the scroll-to-unread jump has something to scroll to.
++         *
++         * Returns "miss" when the anchor is older than REACH_LIMIT, so the caller can
++         * say so instead of appearing to do nothing. One fetch, never a walk backwards:
++         * an unbounded page-until-found on a very old anchor is exactly the cost the
++         * cap exists to avoid.
++         */
++        async reach(sessionID: string, targetID: string): Promise<"hit" | "miss"> {
++          // Must settle first. sync() trims to the cap when it lands, so a deep fetch
++          // racing an in-flight sync would be cut straight back down.
++          await result.session.sync(sessionID)
++          if ((store.message[sessionID] ?? []).some((message) => message.id === targetID)) return "hit"
++          // One deep fetch per session at a time. Without this a user who jumps twice
++          // inside the ~7.6s fetch gets two merges racing, and the second reconciles
++          // against a list the first has not written yet.
++          const running = reachingSessions.get(sessionID)
++          if (running) return running
++
++          const task = (async (): Promise<"hit" | "miss"> => {
++            const response = await sdk.client.session.messages({ sessionID, limit: REACH_LIMIT })
++            const items = response.data ?? []
++            const plan = planReach({
++              fetched: items.map((item) => item.info.id),
++              target: targetID,
++              margin: REACH_MARGIN,
++            })
++            if (plan.outcome === "miss") return "miss"
++
++            const byID = new Map(items.map((item) => [item.info.id, item]))
++            setStore(
++              produce((draft) => {
++                const current = draft.message[sessionID] ?? []
++                const candidates = plan.window.flatMap((id) => {
++                  const item = byID.get(id)
++                  return item ? [item.info] : []
++                })
++                // Reconciled against the draft, NOT a snapshot taken before the fetch:
++                // seconds have passed and messages may have arrived meanwhile.
++                const merged = mergeReach({ current, candidates })
++                // Every message in the store must have a parts entry or it renders empty.
++                // Only for messages actually being added -- writing parts for one already
++                // present would clobber live streaming state with a stale copy and strand
++                // its text mid-stream.
++                for (const info of merged.prepend) {
++                  const item = byID.get(info.id)
++                  if (item) draft.part[info.id] = item.parts
++                }
++                draft.message[sessionID] = [...merged.prepend, ...current]
++                messageCaps.set(sessionID, merged.cap)
++              }),
++            )
++            return "hit"
++          })().finally(() => {
++            reachingSessions.delete(sessionID)
++          })
++          reachingSessions.set(sessionID, task)
++          return task
++        },
++        release(sessionID: string) {
++          if (!messageCaps.has(sessionID)) return
++          messageCaps.delete(sessionID)
++          setStore(
++            produce((draft) => {
++              const current = draft.message[sessionID] ?? []
++              if (current.length <= REACH_DEFAULT_CAP) return
++              const removed = current.slice(0, -REACH_DEFAULT_CAP)
++              draft.message[sessionID] = current.slice(-REACH_DEFAULT_CAP)
++              for (const message of removed) delete draft.part[message.id]
++            }),
++          )
++        },
+       },
+       bootstrap,
+     }
 diff --git a/packages/tui/src/routes/session/index.tsx b/packages/tui/src/routes/session/index.tsx
-index 61abe4abd8..5d76bba390 100644
+index 61abe4abd8..bd2cc0bfcc 100644
 --- a/packages/tui/src/routes/session/index.tsx
 +++ b/packages/tui/src/routes/session/index.tsx
 @@ -21,6 +21,7 @@ import { useRoute, useRouteData } from "../../context/route"
@@ -189,7 +319,7 @@ index 61abe4abd8..5d76bba390 100644
  import { SplitBorder } from "../../ui/border"
  import { useTuiPaths, useTuiTerminalEnvironment } from "../../context/runtime"
  import { Spinner } from "../../component/spinner"
-@@ -211,6 +212,24 @@ export function Session() {
+@@ -211,6 +212,27 @@ export function Session() {
        .toSorted((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0))
    })
    const messages = createMemo(() => sync.data.message[route.sessionID] ?? [])
@@ -211,10 +341,13 @@ index 61abe4abd8..5d76bba390 100644
 +  // beside that effect: the read sits after an await so a later declaration would
 +  // happen to work, which is not the same as being correct.
 +  const [pendingScroll, setPendingScroll] = createSignal<string | undefined>()
++  // Targets already deep-fetched for, so a store write cannot re-trigger the fetch
++  // that caused it. Cleared on navigation along with the pending target.
++  const reachAttempted = new Set<string>()
    const messagesBeforeRevert = () => {
      const messageID = session()?.revert?.messageID
      if (!messageID) return messages()
-@@ -312,7 +331,10 @@ export function Session() {
+@@ -312,7 +334,10 @@ export function Session() {
        }
        editor.reconnect(result.data.directory)
        await sync.session.sync(sessionID)
@@ -226,7 +359,7 @@ index 61abe4abd8..5d76bba390 100644
      })().catch((error) => {
        if (route.sessionID !== sessionID) return
        toast.show({
-@@ -355,6 +377,65 @@ export function Session() {
+@@ -355,6 +380,135 @@ export function Session() {
    const dialog = useDialog()
    const renderer = useRenderer()
  
@@ -266,7 +399,71 @@ index 61abe4abd8..5d76bba390 100644
 +  createEffect(() => {
 +    const id = pendingScroll()
 +    if (!id) return
-+    if (!messages().some((m) => m.id === id)) return
++    if (!messages().some((m) => m.id === id)) {
++      // Not loaded. The store holds only the newest REACH_DEFAULT_CAP messages and
++      // the anchor is usually older than that -- measured over 118 real anchored
++      // events the median sits 192 messages back, and only 27% land inside the
++      // default window -- so waiting on reactivity alone would leave this pending
++      // forever and the viewport at the bottom. Pull the history in instead.
++      //
++      // Once per target: reach() writes to the store, which re-runs this effect, and
++      // an unguarded call would fetch in a loop.
++      if (reachAttempted.has(id)) return
++      reachAttempted.add(id)
++      const sessionID = route.sessionID
++      // Measured against a real 759-message session: the deep fetch takes ~7.6s and
++      // moves ~5MiB, against ~2.1s for the ordinary one. Without a notice that is
++      // eight seconds of a transcript sitting at the bottom looking like the jump
++      // failed -- which is the exact symptom this change exists to remove.
++      // The toast is single-slot with no dismiss, so this is deliberately longer
++      // than the fetch (~7.6s measured on a 759-message session) and every outcome
++      // below REPLACES it. A duration tuned to the average would expire mid-fetch on
++      // a slow one -- looking like the failure this change exists to remove -- and
++      // linger after a fast one, claiming to load something already loaded.
++      toast.show({
++        message: "Loading earlier messages...",
++        variant: "info",
++        duration: 15000,
++      })
++      void sync.session
++        .reach(sessionID, id)
++        .then((outcome) => {
++          // Left mid-fetch. onCleanup already ran -- before this write raised the cap
++          // -- so reclaim it here or the deep history leaks for the process's life.
++          if (route.sessionID !== sessionID) {
++            sync.session.release(sessionID)
++            return
++          }
++          if (outcome !== "miss") {
++            // Replaces the loading notice rather than leaving it to expire. The scroll
++            // itself happens when this effect re-runs through messages().
++            toast.show({ message: "Jumped to unread message", variant: "info", duration: 1500 })
++            return
++          }
++          // Older than we are willing to fetch. Say so: the failure this whole
++          // change exists to remove is the jump that silently does nothing.
++          toast.show({
++            message: "Unread message is too far back to jump to",
++            variant: "info",
++            duration: 4000,
++          })
++          setPendingScroll(undefined)
++        })
++        .catch(() => {
++          // Un-guard so a later request for the same anchor can try again: the failure
++          // is usually transient, and leaving it guarded would make this target
++          // permanently unjumpable for the life of the component.
++          reachAttempted.delete(id)
++          if (route.sessionID !== sessionID) return
++          toast.show({
++            message: "Could not load earlier messages",
++            variant: "error",
++            duration: 4000,
++          })
++          setPendingScroll(undefined)
++        })
++      return
++    }
 +    const timer = setTimeout(() => {
 +      if (scroll && !scroll.isDestroyed) scroll.scrollChildIntoView(id)
 +      // Cleared only here, after the attempt. If the message is in the store but
@@ -279,25 +476,31 @@ index 61abe4abd8..5d76bba390 100644
 +    onCleanup(() => clearTimeout(timer))
 +  })
 +
-+  // A target is meaningless once the user navigates elsewhere; without this it
-+  // would follow them into the next session and scroll it.
-+  createEffect(
-+    on(
-+      () => route.sessionID,
-+      () => setPendingScroll(undefined),
-+      { defer: true },
-+    ),
-+  )
++  // Hand back the memory and render cost of a deep jump when the user leaves.
++  //
++  // onCleanup rather than an effect on route.sessionID, because app.tsx mounts this
++  // route as `<Show when={sessionID} keyed>{() => <Session />}</Show>`: a keyed Show
++  // DISPOSES this component and builds a new one per session, so route.sessionID is
++  // constant for an instance's entire life and an `on(() => route.sessionID)` here
++  // can never fire. The same block used to clear pendingScroll on navigation; that
++  // was dead for the same reason, and harmless only because a fresh instance gets a
++  // fresh signal -- not because the clearing worked.
++  //
++  // Releasing on the way out and not before is deliberate: trimming a session while
++  // it is on screen removes children above the viewport and shifts the view under the
++  // reader.
++  const mountedSessionID = route.sessionID
++  onCleanup(() => sync.session.release(mountedSessionID))
 +
    event.on("session.status", (evt) => {
      if (evt.properties.sessionID !== route.sessionID) return
      if (evt.properties.status.type !== "retry") return
 diff --git a/packages/tui/src/routes/session/scroll-target.ts b/packages/tui/src/routes/session/scroll-target.ts
 new file mode 100644
-index 0000000000..7d26b32a24
+index 0000000000..69dea84b9a
 --- /dev/null
 +++ b/packages/tui/src/routes/session/scroll-target.ts
-@@ -0,0 +1,53 @@
+@@ -0,0 +1,146 @@
 +/**
 + * Decision logic for tui.message.scroll (workstation-v8jh phase 2).
 + *
@@ -351,14 +554,107 @@ index 0000000000..7d26b32a24
 +  if (opts.force) return true
 +  return opts.bottom !== false
 +}
++
++/** Messages kept above the anchor so it is not flush against the top edge, and so
++ * the shift-one eviction in sync's message.updated handler has something to eat
++ * before it reaches the anchor itself. */
++export const REACH_MARGIN = 20
++
++/** How deep a single fetch goes. Sized from measurement, not taste: over 118 real
++ * anchored events the anchor sat a median of 192 messages from the end, p75 340,
++ * max 498. 512 clears the observed maximum by only 14, so expect a low
++ * single-digit percentage of jumps to fall past it in the tail -- those degrade
++ * visibly rather than being fetched unboundedly. */
++export const REACH_LIMIT = 512
++
++/** The store's default per-session message cap, and the floor for an expanded one. */
++export const REACH_DEFAULT_CAP = 100
++
++export type ReachPlan = { outcome: "miss" } | { outcome: "hit"; window: string[] }
++
++/**
++ * Which slice of a deep fetch is worth keeping, given the anchor we must render.
++ *
++ * The renderer is not virtualized (`<For each={messages()}>`), so scrolling to a
++ * message requires it to be rendered, which requires it to be in the store. But the
++ * store deliberately holds only the newest REACH_DEFAULT_CAP to bound render cost, so
++ * reaching an older anchor means paying for everything between it and the present. We
++ * therefore keep only what the jump needs -- anchor minus a margin, not the whole
++ * fetch -- so the rendered count is the anchor's distance plus the margin (median
++ * ~210 for real anchors) rather than REACH_LIMIT every time.
++ *
++ * Deliberately says nothing about what is already in the store: by the time the fetch
++ * returns, that snapshot is seconds stale. Reconciling against the live list is
++ * mergeReach's job.
++ */
++export function planReach(opts: { fetched: string[]; target: string; margin: number }): ReachPlan {
++  const index = opts.fetched.indexOf(opts.target)
++  // Not in the deepest fetch we are willing to make. The caller degrades visibly; it
++  // must not fetch again, or a very old anchor becomes an unbounded walk backwards.
++  if (index === -1) return { outcome: "miss" }
++  return { outcome: "hit", window: opts.fetched.slice(Math.max(0, index - opts.margin)) }
++}
++
++type Ordered = { id: string; time: { created: number } }
++
++/**
++ * Is `a` strictly older than `b`?
++ *
++ * Mirrors sync's compareMessage (created time, then id as the tiebreak) because the
++ * store's message list must stay sorted -- an unsorted list silently breaks the
++ * binary search that later inserts rely on, which would duplicate messages rather
++ * than fail. Duplicated here rather than imported to avoid a cycle: sync imports this
++ * module, not the other way round.
++ */
++export function isOlderThan(a: Ordered, b: Ordered): boolean {
++  if (a.time.created !== b.time.created) return a.time.created < b.time.created
++  return a.id.localeCompare(b.id) < 0
++}
++
++/**
++ * Reconcile a deep fetch against the CURRENT store contents.
++ *
++ * Must run against the live list, not a snapshot taken before the fetch: the fetch
++ * takes seconds (~7.6s measured on a 759-message session) and messages can arrive
++ * meanwhile. Re-adding one of those would both duplicate it and overwrite its live
++ * streaming parts with a stale copy, which strands the text mid-stream.
++ *
++ * The ordering guard is what keeps the store's invariant: only strictly-older
++ * messages may be prepended, so the result stays sorted no matter what the fetch
++ * returned or what arrived while it was in flight.
++ */
++export function mergeReach<T extends Ordered>(opts: {
++  current: T[]
++  candidates: T[]
++}): { prepend: T[]; cap: number } {
++  const have = new Set(opts.current.map((message) => message.id))
++  const oldest = opts.current[0]
++  // Two guards. The strictly-older test is the load-bearing one: it alone rejects a
++  // message that is absent from the store but newer than its oldest entry -- which
++  // happens when a revert has punched a hole in the retained window. The
++  // already-present test is redundant while `current` is sorted (anything in it is by
++  // definition not older than its first element), so no test can distinguish it and
++  // removing it survives mutation. It is kept as the cheap direct expression of "do
++  // not re-add what we already have", and said plainly here rather than covered by a
++  // test that would only appear to pin it.
++  const prepend = opts.candidates.filter(
++    (candidate) => !have.has(candidate.id) && (!oldest || isOlderThan(candidate, oldest)),
++  )
++  // Computed from what is actually in the list after this merge, not from the
++  // pre-fetch snapshot, or arrivals during the fetch would push the real length past
++  // the cap and the shift-one eviction would start eating the history we just paid
++  // seven seconds for.
++  const cap = Math.max(REACH_DEFAULT_CAP, prepend.length + opts.current.length)
++  return { prepend, cap }
++}
 diff --git a/packages/tui/test/routes/session/scroll-target.test.ts b/packages/tui/test/routes/session/scroll-target.test.ts
 new file mode 100644
-index 0000000000..365ddfe98d
+index 0000000000..d64f8ecbd5
 --- /dev/null
 +++ b/packages/tui/test/routes/session/scroll-target.test.ts
-@@ -0,0 +1,73 @@
+@@ -0,0 +1,166 @@
 +import { describe, expect, test } from "bun:test"
-+import { atBottom, shouldAccept } from "../../../src/routes/session/scroll-target"
++import { atBottom, isOlderThan, mergeReach, planReach, shouldAccept } from "../../../src/routes/session/scroll-target"
 +
 +// workstation-v8jh phase 2. These pin the two decisions that are easy to get
 +// subtly wrong and impossible to notice: the one-row tolerance on the bottom
@@ -428,5 +724,98 @@ index 0000000000..365ddfe98d
 +  test("force with no scrollbox yet still accepts", () => {
 +    // The cold-attach shape: attempt 0 arrives before first paint.
 +    expect(shouldAccept({ ...base, force: true, bottom: undefined })).toBe(true)
++  })
++})
++
++// workstation-psh9. The reach fix: the anchor is usually NOT in the store (median
++// 192 messages back, only 27% within the newest 100), so a deep fetch has to
++// decide what to prepend and how far to raise the per-session cap. These pin the
++// arithmetic; the store mutation itself lives in sync.tsx.
++
++describe("planReach", () => {
++  const ids = (from: number, to: number) => Array.from({ length: to - from + 1 }, (_, i) => `msg_${from + i}`)
++
++  test("anchor absent from the deep fetch is a miss -- caller shows the degraded notice", () => {
++    expect(planReach({ fetched: ids(50, 99), target: "msg_1", margin: 20 }).outcome).toBe("miss")
++  })
++
++  test("window starts a margin above the anchor, not at the start of the fetch", () => {
++    const plan = planReach({ fetched: ids(50, 99), target: "msg_80", margin: 5 })
++    if (plan.outcome !== "hit") throw new Error("expected hit")
++    expect(plan.window[0]).toBe("msg_75")
++    // and runs to the present, so the merge can splice it onto the live tail
++    expect(plan.window.at(-1)).toBe("msg_99")
++  })
++
++  test("margin is clamped at the start of the fetch rather than going negative", () => {
++    const plan = planReach({ fetched: ids(50, 99), target: "msg_52", margin: 20 })
++    if (plan.outcome !== "hit") throw new Error("expected hit")
++    expect(plan.window[0]).toBe("msg_50")
++  })
++
++  test("margin 0 puts the anchor itself at the start of the window", () => {
++    const plan = planReach({ fetched: ids(50, 99), target: "msg_80", margin: 0 })
++    if (plan.outcome !== "hit") throw new Error("expected hit")
++    expect(plan.window[0]).toBe("msg_80")
++  })
++})
++
++// The merge runs against the LIVE store, seconds after the fetch was issued, so these
++// pin what happens when the world moved underneath it.
++describe("mergeReach", () => {
++  const m = (n: number, created = n) => ({ id: `msg_${String(n).padStart(3, "0")}`, time: { created } })
++  const range = (from: number, to: number) => Array.from({ length: to - from + 1 }, (_, i) => m(from + i))
++
++  test("prepends only what the store lacks", () => {
++    const merged = mergeReach({ current: range(90, 99), candidates: range(75, 99) })
++    expect(merged.prepend.map((x) => x.id)).toEqual(range(75, 89).map((x) => x.id))
++  })
++
++  test("a message that ARRIVED during the fetch is not re-added or re-parted", () => {
++    // fetch returned 75..99; meanwhile msg_100 landed live. It must not be prepended:
++    // doing so would duplicate it and clobber its streaming parts with a stale copy.
++    const merged = mergeReach({ current: [...range(90, 99), m(100)], candidates: [...range(75, 99), m(100)] })
++    expect(merged.prepend.some((x) => x.id === "msg_100")).toBe(false)
++  })
++
++  test("a candidate NEWER than the store's oldest is refused, keeping the list sorted", () => {
++    // Only strictly-older messages may be prepended; an out-of-order splice would
++    // silently break the binary search that later inserts rely on.
++    const merged = mergeReach({ current: range(90, 99), candidates: [m(95), m(80)] })
++    expect(merged.prepend.map((x) => x.id)).toEqual(["msg_080"])
++  })
++
++  test("a fetched message filling a GAP in the store is refused, not spliced out of order", () => {
++    // The store can have holes: message.removed (a revert) can delete something in the
++    // middle of the retained window. The fetch still returns it, and it is NOT in the
++    // store -- so the already-present check passes it -- but prepending it would put a
++    // newer message in front of older ones and silently break the sortedness that the
++    // store's binary-search inserts depend on. Only the strictly-older test catches
++    // this, which is why both guards exist.
++    const withHole = [m(90), ...range(92, 99)]
++    const merged = mergeReach({ current: withHole, candidates: [m(80), m(91)] })
++    expect(merged.prepend.map((x) => x.id)).toEqual(["msg_080"])
++  })
++
++  test("cap reflects the ACTUAL post-merge length, not a pre-fetch snapshot", () => {
++    const merged = mergeReach({ current: range(400, 499), candidates: range(280, 499) })
++    expect(merged.prepend.length).toBe(120)
++    expect(merged.cap).toBe(220)
++  })
++
++  test("cap never drops below the default, so a small session is not left tighter than normal", () => {
++    const merged = mergeReach({ current: range(98, 99), candidates: range(95, 99) })
++    expect(merged.cap).toBe(100)
++  })
++
++  test("empty store still merges (nothing to be older than)", () => {
++    const merged = mergeReach({ current: [], candidates: range(75, 99) })
++    expect(merged.prepend.length).toBe(25)
++  })
++
++  test("ties on created time fall back to id, matching the store's own comparator", () => {
++    expect(isOlderThan(m(1, 500), m(2, 500))).toBe(true)
++    expect(isOlderThan(m(2, 500), m(1, 500))).toBe(false)
++    expect(isOlderThan(m(9, 100), m(1, 500))).toBe(true)
 +  })
 +})
