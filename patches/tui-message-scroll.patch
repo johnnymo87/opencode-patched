@@ -308,7 +308,7 @@ index ba69d66811..eaa0c5c2e5 100644
        bootstrap,
      }
 diff --git a/packages/tui/src/routes/session/index.tsx b/packages/tui/src/routes/session/index.tsx
-index 61abe4abd8..d196e64cf4 100644
+index 61abe4abd8..3c69d83e3a 100644
 --- a/packages/tui/src/routes/session/index.tsx
 +++ b/packages/tui/src/routes/session/index.tsx
 @@ -21,6 +21,7 @@ import { useRoute, useRouteData } from "../../context/route"
@@ -376,7 +376,7 @@ index 61abe4abd8..d196e64cf4 100644
      })().catch((error) => {
        if (route.sessionID !== sessionID) return
        toast.show({
-@@ -355,6 +397,147 @@ export function Session() {
+@@ -355,6 +397,156 @@ export function Session() {
    const dialog = useDialog()
    const renderer = useRenderer()
  
@@ -418,18 +418,20 @@ index 61abe4abd8..d196e64cf4 100644
 +    if (!id) return
 +    if (!messages().some((m) => m.id === id)) {
 +      // Not loaded. The store holds only the newest REACH_DEFAULT_CAP messages, and
-+      // a minority of anchors are older than that: over 66 real anchored events,
-+      // ordered the way the store orders them, 74% land INSIDE the default window
-+      // and the other 26% do not (median distance 39, p75 109, max 381). For that
-+      // 26%, waiting on reactivity alone would leave this pending forever with the
-+      // viewport at the bottom. Pull the history in instead.
++      // a minority of anchors are older than that. Measured 2026-09-15 over the 73
++      // anchored sessions then resolvable, ordered by time_created as this store
++      // orders: median distance 36, p75 87, p90 201, max 384; 76% land INSIDE the
++      // default window. For the other 24%, waiting on reactivity alone would leave
++      // this pending forever with the viewport at the bottom, so pull history in.
 +      //
-+      // An earlier comment here claimed the median was 192 and that only 27% landed
-+      // inside the window. That was computed with ORDER BY id; the server and this
-+      // store both order by time_created (compareMessage, sync.tsx), and on a
-+      // database carrying pre-wrap message ids the two orderings disagree
-+      // everywhere. The work below is still needed -- for a quarter of jumps, not
-+      // three quarters.
++      // An earlier comment here claimed a median of 192 and only 27% inside the
++      // window, and a later correction blamed that entirely on ORDER BY id. Both
++      // were wrong. Re-measured across a FIXED population, the ordering moves only
++      // 7 of 73 distances -- but it moves those enormously (max 1936 by id versus
++      // 384 by time, and one real session 1744 versus 42). It is a TAIL effect, not
++      // a median one; the original median came from a different, unreconstructable
++      // population. Quote n and a date with any number here, because this database
++      // keeps growing and the figures drift.
 +      //
 +      // Once per target: reach() writes to the store, which re-runs this effect, and
 +      // an unguarded call would fetch in a loop.
@@ -466,7 +468,14 @@ index 61abe4abd8..d196e64cf4 100644
 +          if (outcome !== "miss") {
 +            // Replaces the loading notice rather than leaving it to expire. The scroll
 +            // itself happens when this effect re-runs through messages().
-+            toast.show({ message: "Jumped to unread message", variant: "info", duration: 1500 })
++            //
++            // Says what actually finished. This fires when the FETCH succeeds, which
++            // is strictly before the scroll is attempted, so the old wording
++            // ("Jumped to unread message") asserted an outcome it could not yet
++            // observe -- and would have kept asserting it if the scroll then landed
++            // nowhere. A notice that claims a jump that did not happen is the exact
++            // failure this whole change exists to remove, so it claims only the load.
++            toast.show({ message: "Loaded earlier messages", variant: "info", duration: 1500 })
 +            return
 +          }
 +          // Older than we are willing to fetch. Say so: the failure this whole
@@ -526,10 +535,10 @@ index 61abe4abd8..d196e64cf4 100644
      if (evt.properties.status.type !== "retry") return
 diff --git a/packages/tui/src/routes/session/scroll-target.ts b/packages/tui/src/routes/session/scroll-target.ts
 new file mode 100644
-index 0000000000..e4c1b59ffd
+index 0000000000..03bb0f6172
 --- /dev/null
 +++ b/packages/tui/src/routes/session/scroll-target.ts
-@@ -0,0 +1,208 @@
+@@ -0,0 +1,215 @@
 +/**
 + * Decision logic for tui.message.scroll (workstation-v8jh phase 2).
 + *
@@ -589,17 +598,24 @@ index 0000000000..e4c1b59ffd
 + * before it reaches the anchor itself. */
 +export const REACH_MARGIN = 20
 +
-+/** How deep a single fetch goes. Sized from measurement, not taste: over 66 real
-+ * anchored events, ordered by time_created as the store orders them, the anchor sat
-+ * a median of 39 messages from the end, p75 109, p90 208, max 381. 512 therefore
-+ * covers every observed case with ~25% headroom.
++/** How deep a single fetch goes. Sized from measurement, not taste: measured
++ * 2026-09-15 over the 73 anchored sessions then resolvable, ordered by
++ * time_created as the store orders them, the anchor sat a median of 36 messages
++ * from the end, p75 87, p90 201, max 384. 512 covers every observed case, the
++ * worst by 128.
 + *
-+ * The number is unchanged but its justification was wrong: it previously cited a
-+ * median of 192 and a max of 498, measured with ORDER BY id on a database whose
-+ * message ids predate the 48-bit wrap fix, where id order and time order disagree
-+ * at every position. 512 was picked to clear a maximum of 498 by 14 and happens to
-+ * clear the real maximum by 131. Right answer, wrong evidence -- recorded so a
-+ * future change does not "restore headroom" that was never missing. */
++ * The number is unchanged; its justification was wrong twice and the second
++ * attempt is worth keeping straight. It first cited a median of 192 and a max of
++ * 498. That was corrected to blame ORDER BY id, which is the column the store does
++ * NOT sort on -- but re-measuring both orderings across one fixed population shows
++ * the ordering changes only 7 of 73 distances. What it changes, it changes hugely:
++ * the maximum is 1936 by id against 384 by time, because ids predating the 48-bit
++ * wrap sort nowhere near their timestamps. So ordering governs the TAIL -- which is
++ * exactly what a limit is sized against -- while the original median came from a
++ * different population that can no longer be reconstructed.
++ *
++ * Recorded at this length so nobody "restores headroom" that was never missing,
++ * and so the next person re-measures rather than trusting a bare number. */
 +export const REACH_LIMIT = 512
 +
 +/** The store's default per-session message cap, and the floor for an expanded one. */
@@ -616,7 +632,7 @@ index 0000000000..e4c1b59ffd
 + * reaching an older anchor means paying for everything between it and the present. We
 + * therefore keep only what the jump needs -- anchor minus a margin, not the whole
 + * fetch -- so the rendered count is the anchor's distance plus the margin (median
-+ * ~59 for real anchors, worst observed ~401) rather than REACH_LIMIT every time.
++ * ~56 for real anchors, worst observed ~404) rather than REACH_LIMIT every time.
 + *
 + * Deliberately says nothing about what is already in the store: by the time the fetch
 + * returns, that snapshot is seconds stale. Reconciling against the live list is
