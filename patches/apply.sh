@@ -609,10 +609,14 @@
 #                                    PAIRED WITH THE BUN BUMP in build-release.yml: the
 #                                    rejection is latent under the bun 1.3.14 this repo
 #                                    used to compile with, and becomes fatal the moment
-#                                    that pin moves to 1.4.x. Do NOT drop this patch while
-#                                    that pin is >= 1.4.0. Sunsets when the upstream line
-#                                    we track includes #44944 (i.e. any roll-forward past
-#                                    2026-09-02); check by content, not by tag.
+#                                    that pin moves to 1.4.x. SUNSET: drop this patch when
+#                                    the upstream tree we track ALREADY CONTAINS #44944
+#                                    (any roll-forward past 2026-09-02) -- at which point
+#                                    `git apply --check` fails and dropping it is
+#                                    mandatory, pin or no pin. Check by content, not by
+#                                    tag. Until then, do not drop it while the pin is
+#                                    >= 1.4.0: that combination ships a serve that dies
+#                                    on a stalled stream.
 #                                    Two one-line hunks, byte-identical to upstream's
 #                                    (`reader.cancel(err).catch(() => {})`). Upstream's
 #                                    third hunk -- relaxing a load-sensitive PTY poll
