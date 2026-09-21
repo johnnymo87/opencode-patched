@@ -65,12 +65,46 @@ jobs:
           # PINNED, was `latest`. bun's version demonstrably moves results in
           # this tree -- the packages/opencode failure count moved 25 -> 19/20
           # between 1.3.3 and 1.3.14 -- so `latest` meant the release build ran
-          # a bun that nothing had validated. 1.3.14 is what the v1.18.18
-          # roll-forward gate was measured on AND what upstream v1.18.18
-          # declares in its own package.json `packageManager`.
-          # To bump: match upstream's packageManager, then re-run the stacked
-          # build gate before releasing (workstation-l60f is the template).
-          bun-version: 1.3.14
+          # a bun that nothing had validated.
+          #
+          # 1.4.2 (was 1.3.14, 2026-09-21). This is the ONE knob that fixes the
+          # /tmp leak, because `bun build --compile` bakes the bun runtime --
+          # and therefore its embedded-file extractor -- into the shipped
+          # binary. A host upgrading its own bun changes nothing.
+          #
+          # THE LEAK. @opentui/core-linux-*/index.bun.js is
+          #     import("./libopentui.so", { with: { type: "file" } })
+          # so the 13.35 MB libopentui.so is an embedded file that bun must
+          # materialize on disk before the TUI can dlopen it. bun < 1.4.0 wrote
+          # a FRESH $TMPDIR/.<16 hex>-<8 digit>.so on every launch and never
+          # unlinked it -- not even on clean exit. Measured on cloudbox
+          # 2026-09-21: 1626 orphaned copies, 19.84 GB, accruing 1.1-2.1 GB/day
+          # across ~15 concurrent TUIs (workstation-o5s1.24 / .27).
+          # That is upstream bun issue #40076 (closed 2026-08-22, and it names
+          # opencode's libopentui.so as the real-world case), a duplicate of
+          # #29585, fixed by #29587 in bun 1.4.0: an embedded file now extracts
+          # ONCE to a content-hashed, reused `$TMPDIR/.bun-{uid}-{hash}.{ext}`.
+          # Nothing in opencode or @opentui can fix this from above; @opentui
+          # 0.4.5 is what upstream opencode dev still pins as of 2026-09-21.
+          #
+          # VERIFIED LOCALLY on aarch64 with the #40076 repro (a 69 KB lib.so
+          # imported `with { type: "file" }` and dlopen'd, compiled + run 3x):
+          #   bun 1.3.3 binary -> 3 files, /tmp/.19f7edb7*-00000000.so, one per
+          #                       launch, and $TMPDIR was ignored
+          #   bun 1.4.2 binary -> 1 file, $TMPDIR/.bun-1000-3a39a40e08be468e.so,
+          #                       reused by all 3 launches, $TMPDIR honored
+          #
+          # DELIBERATE DEVIATION FROM UPSTREAM. opencode v1.18.18 (and dev at
+          # 2026-09-21) declares `packageManager: bun@1.3.14`, so this pin no
+          # longer matches it -- the previous rule was "match upstream's
+          # packageManager". Upstream has not bumped, and waiting for it costs
+          # ~1.5 GB/day on a disk already at 81%. The rule this replaces it
+          # with is unchanged in substance: a bun bump ships only after a
+          # `dry_run: true` run of THIS workflow on the bumped branch is green
+          # (build + the named test steps + the macOS sign/smoke gate), which
+          # is what workstation-l60f templates. Revert to 1.3.14 if that gate
+          # regresses; the leak is cheaper than a broken TUI.
+          bun-version: 1.4.2
 
       - name: Clone upstream opencode
         run: |
@@ -187,8 +221,9 @@ jobs:
           # internal Mach-O signer (broken in bun 1.3.12, see the build-macos job)
           # so the darwin binaries carry NO signature slot. They are ad-hoc signed
           # on a real macOS runner in build-macos. Remove once bun >1.3.12 ships.
-          # SUNSET CONDITION NOW MET (2026-08-14): this workflow pins bun 1.3.14,
-          # which is > 1.3.12. Kept anyway because it is harmless (macOS re-signs)
+          # SUNSET CONDITION NOW MET (2026-08-14): this workflow pins bun 1.4.2
+          # (1.3.14 at the time), which is > 1.3.12. Kept anyway because it is
+          # harmless (macOS re-signs)
           # and removing it is a separate, separately-verifiable change -- but it
           # is now dead weight rather than a live workaround. Delete deliberately.
           BUN_NO_CODESIGN_MACHO_BINARY: "1"
