@@ -65,12 +65,109 @@ jobs:
           # PINNED, was `latest`. bun's version demonstrably moves results in
           # this tree -- the packages/opencode failure count moved 25 -> 19/20
           # between 1.3.3 and 1.3.14 -- so `latest` meant the release build ran
-          # a bun that nothing had validated. 1.3.14 is what the v1.18.18
-          # roll-forward gate was measured on AND what upstream v1.18.18
-          # declares in its own package.json `packageManager`.
-          # To bump: match upstream's packageManager, then re-run the stacked
-          # build gate before releasing (workstation-l60f is the template).
-          bun-version: 1.3.14
+          # a bun that nothing had validated.
+          #
+          # 1.4.0 (was 1.3.14, 2026-09-21). This is the ONE knob that fixes
+          # the /tmp leak, because `bun build --compile` bakes the bun runtime
+          # -- and therefore its embedded-file extractor -- into the shipped
+          # binary. A host upgrading its own bun changes nothing.
+          #
+          # THE LEAK. @opentui/core-linux-*/index.bun.js is
+          #     import("./libopentui.so", { with: { type: "file" } })
+          # so the 13.35 MB libopentui.so is an embedded file that bun must
+          # materialize on disk before the TUI can dlopen it. bun < 1.4.0 wrote
+          # a FRESH `.<16 hex>-<8 digit>.so` on every launch and never unlinked
+          # it -- not even on clean exit. Measured on cloudbox 2026-09-21: 1626
+          # orphaned copies, 19.84 GB, accruing 1.1-2.1 GB/day across ~15
+          # concurrent TUIs (workstation-o5s1.24 / .27).
+          # That is upstream bun issue #40076 (closed 2026-08-22, and it names
+          # opencode's libopentui.so as the real-world case), a duplicate of
+          # #29585, fixed by #29587 in bun 1.4.0: an embedded file now extracts
+          # ONCE to a content-hashed, reused `$TMPDIR/.bun-{uid}-{hash}.{ext}`,
+          # which bun reuses only after an lstat confirms same-uid, regular
+          # file, exact size. Nothing in opencode or @opentui can fix this from
+          # above; @opentui 0.4.5 is what upstream opencode dev still pins as
+          # of 2026-09-21.
+          #
+          # WHY 1.4.0 AND NOT 1.4.2, which is current. bun 1.4.1 rewrote
+          # `--splitting`, and `packages/opencode/script/build.ts` compiles with
+          # `minify: true, splitting: true`. A 1.4.1/1.4.2-compiled opencode
+          # binary crashes on the FIRST AGENT TURN with
+          #     TypeError: undefined is not an object (evaluating 'node.name')
+          #     at resolve (packages/core/src/effect/layer-node.ts)
+          # -- reported against stock upstream `dev` on darwin-arm64 in
+          # anomalyco/opencode#44946 (the upstream bun-bump PR, still open for
+          # this reason) and tracked as oven-sh/bun#42837 and
+          # anomalyco/opencode#48397, which traces it to a filesystem import
+          # cycle that 1.4.1's chunk-ordering change exposes. WATCH BOTH: the
+          # fix may well land in opencode rather than in bun.
+          # REPRODUCED HERE, not merely cited: the 1.4.2-built linux-arm64
+          # artifact of this workflow crashes that way on a real agent turn,
+          # and the 1.4.0-built one completes it. (Do not lean on #42837's own
+          # pass/fail matrix -- its PASS criterion is an /api/agent 200, which
+          # is exactly the smoke test that returns 200 on a broken binary.)
+          # 1.4.0 therefore has the leak fix and predates the splitting
+          # rewrite. Do not move to 1.4.x > 1.4.0 until that bug is fixed, and
+          # prefer waiting for it over patching build.ts to `splitting: false`
+          # -- upstream keeps splitting on, so that patch would put us on a
+          # bundle shape nobody else runs, which is the same class of hazard.
+          #
+          # WHAT STAYING ON 1.4.0 COSTS. 1.4.1 fixed real bugs we forgo:
+          # oven-sh/bun#39846 (a streamed response tail can be lost on
+          # ECONNRESET, which could truncate an early 4xx body into a worse
+          # error message), #39952 (numeric fetch `timeout` fires early -- not
+          # hit here, the provider path uses AbortSignal.timeout), and #40573
+          # (macOS node:dns lookups on split-DNS resolvers; fetch() unaffected).
+          # None is a crash; all are cheaper than a binary that dies on turn 1.
+          #
+          # PAIRED PATCH. Bun 1.4 makes `reader.cancel()` on an aborted fetch
+          # body REJECT, and v1.18.18 discards that promise with `void` in both
+          # SSE chunk-timeout wrappers -- an unhandled rejection, which bun
+          # answers by killing the process, and chunkTimeout is armed on four
+          # providers in the deployed config. patches/sse-cancel-rejection.patch
+          # (upstream #44944, which lands after v1.18.18) is what makes this pin
+          # safe for the serve pool. Moving this pin back below 1.4.0 without
+          # dropping that patch is harmless; moving it to 1.4.x without the
+          # patch is not.
+          #
+          # VERIFIED on aarch64, three ways:
+          #   1. The #40076 repro (a 69 KB lib.so imported `with { type: "file"
+          #      }` and dlopen'd, compiled + run 3x). bun 1.3.3 -> 3 files, one
+          #      per launch, in /tmp. bun 1.4.0 and 1.4.2 -> 1 reused
+          #      $TMPDIR/.bun-1000-<hash>.so. (The 1.3.x binaries this repo
+          #      actually ships DO honor $TMPDIR; the 1.3.3 one in that repro
+          #      did not. Either way they leak one file per launch.)
+          #   2. A `dry_run: true` run of this workflow on the bumped branch.
+          #   3. The linux-arm64 artifact from that run, executed locally: 3
+          #      TUI launches left exactly ONE .bun-1000-<hash>.so of
+          #      13,995,736 bytes (libopentui.so to the byte), mtime unchanged;
+          #      the currently-deployed 1.3.14 binary left one fresh file per
+          #      launch under the same invocation. Then a real agent turn
+          #      against a real provider, which is what #44946 says a --version
+          #      smoke test cannot stand in for.
+          # NOT verified: darwin. The macOS job smoke-tests `--version` only,
+          # and the crash class above is bundle-init ordering, which has
+          # already shown platform variance. The Mac consumes darwin-arm64.
+          #
+          # DELIBERATE DEVIATION FROM UPSTREAM. opencode v1.18.18 (and dev at
+          # 2026-09-21) declares `packageManager: bun@1.3.14`, so this pin no
+          # longer matches it -- the previous rule was "match upstream's
+          # packageManager". Upstream has not bumped (#44946 is still open, for
+          # the splitting reason above), and waiting for it costs ~1.5 GB/day on
+          # a disk already at 81%.
+          # TO BUMP THIS PIN AGAIN: a green `dry_run: true` run of this workflow
+          # is necessary and NOT sufficient -- it never EXECUTES a linux binary
+          # and never takes an agent turn, which is exactly the shape of the
+          # 1.4.1 regression. Download the dry run's artifact FOR EACH PLATFORM
+          # A DEPLOYED HOST CONSUMES -- linux-arm64 on cloudbox, darwin-arm64 on
+          # the Mac -- and complete one real agent turn with each (isolated
+          # OPENCODE_DB and XDG dirs, real credentials) before releasing. Check
+          # anomalyco/opencode#44946, #48397 and oven-sh/bun#42837 for the
+          # current state of the splitting bug; the `packageManager` field is
+          # no longer the thing to compare against.
+          # Revert to 1.3.14 if any of that regresses -- the leak is cheaper
+          # than a broken TUI.
+          bun-version: 1.4.0
 
       - name: Clone upstream opencode
         run: |
@@ -173,6 +270,28 @@ jobs:
         run: |
           bun test test/routes/session/scroll-target.test.ts
 
+      # sse-cancel-rejection.patch has no test of its own -- it is a two-line
+      # backport of upstream #44944 -- but this UPSTREAM test is what goes red
+      # without it under bun 1.4 (#44943): the discarded `reader.cancel()`
+      # rejection surfaces as an unhandled rejection and fails the test whose
+      # assertions otherwise pass. VERIFIED NON-VACUOUS, not assumed: with the
+      # patch this step is green, and on a throwaway branch with the patch
+      # removed from apply.sh the same step fails exactly
+      # `(fail) chunkTimeout raises a response stream error when SSE body
+      # stalls` under the same bun 1.4.0. It needs no network or credentials
+      # (local http server, fixture models.dev path). If this step is red, do
+      # not ship the bun bump.
+      # `-t` narrows to the one test that exercises wrapSSE: the five
+      # headerTimeout tests in this file return early before the chunk-timeout
+      # path and would only add flake surface (one races a 500 ms margin on a
+      # cold runner). Note this covers the provider.ts wrapper only -- the
+      # identical one in packages/core/src/aisdk.ts (the plugin-provider path)
+      # is patched but NOT tripwired.
+      - name: SSE chunk-timeout cancel-rejection tests
+        working-directory: opencode-src/packages/opencode
+        run: |
+          bun test test/provider/header-timeout.test.ts -t "chunkTimeout raises"
+
       - name: Build CLI
         run: |
           cd opencode-src/packages/opencode
@@ -187,8 +306,9 @@ jobs:
           # internal Mach-O signer (broken in bun 1.3.12, see the build-macos job)
           # so the darwin binaries carry NO signature slot. They are ad-hoc signed
           # on a real macOS runner in build-macos. Remove once bun >1.3.12 ships.
-          # SUNSET CONDITION NOW MET (2026-08-14): this workflow pins bun 1.3.14,
-          # which is > 1.3.12. Kept anyway because it is harmless (macOS re-signs)
+          # SUNSET CONDITION NOW MET (2026-08-14): this workflow pins bun 1.4.0
+          # (1.3.14 at the time), which is > 1.3.12. Kept anyway because it is
+          # harmless (macOS re-signs)
           # and removing it is a separate, separately-verifiable change -- but it
           # is now dead weight rather than a live workaround. Delete deliberately.
           BUN_NO_CODESIGN_MACHO_BINARY: "1"
