@@ -1,0 +1,26 @@
+diff --git a/packages/core/src/aisdk.ts b/packages/core/src/aisdk.ts
+index b604dac..a1a973b 100644
+--- a/packages/core/src/aisdk.ts
++++ b/packages/core/src/aisdk.ts
+@@ -35,7 +35,7 @@ function wrapSSE(res: Response, ms: number, ctl: AbortController) {
+         const id = setTimeout(() => {
+           const err = new Error("SSE read timed out")
+           ctl.abort(err)
+-          void reader.cancel(err)
++          reader.cancel(err).catch(() => {})
+           reject(err)
+         }, ms)
+ 
+diff --git a/packages/opencode/src/provider/provider.ts b/packages/opencode/src/provider/provider.ts
+index 85b7fd3..fe9ff9d 100644
+--- a/packages/opencode/src/provider/provider.ts
++++ b/packages/opencode/src/provider/provider.ts
+@@ -46,7 +46,7 @@ function wrapSSE(res: Response, ms: number, ctl: AbortController) {
+         const id = setTimeout(() => {
+           const err = new ProviderError.ResponseStreamError("SSE read timed out")
+           ctl.abort(err)
+-          void reader.cancel(err)
++          reader.cancel(err).catch(() => {})
+           reject(err)
+         }, ms)
+ 

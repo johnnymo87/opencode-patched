@@ -593,6 +593,33 @@
 #                                     that patch's mcp* client methods, so do NOT regenerate
 #                                     wholesale.
 #
+#  32. sse-cancel-rejection.patch    BACKPORT of upstream PR #44944 (merged 2026-09-02,
+#                                    issue #44943), which lands AFTER v1.18.18 and so is
+#                                    not in the line we are held on. Both SSE
+#                                    chunk-timeout wrappers -- packages/core/src/aisdk.ts
+#                                    and packages/opencode/src/provider/provider.ts -- do
+#                                    `void reader.cancel(err)` on the reader of a fetch
+#                                    body they just aborted. Under bun 1.4 that cancel
+#                                    REJECTS, and `void` discards the rejected promise:
+#                                    an unhandled rejection, which bun answers by killing
+#                                    the process. This is armed in production -- the
+#                                    deployed opencode.json sets chunkTimeout on four
+#                                    providers -- so one stalled stream would take the
+#                                    serve (and every session it owns) down with it.
+#                                    PAIRED WITH THE BUN BUMP in build-release.yml: the
+#                                    rejection is latent under the bun 1.3.14 this repo
+#                                    used to compile with, and becomes fatal the moment
+#                                    that pin moves to 1.4.x. Do NOT drop this patch while
+#                                    that pin is >= 1.4.0. Sunsets when the upstream line
+#                                    we track includes #44944 (i.e. any roll-forward past
+#                                    2026-09-02); check by content, not by tag.
+#                                    Two one-line hunks, byte-identical to upstream's
+#                                    (`reader.cancel(err).catch(() => {})`). Upstream's
+#                                    third hunk -- relaxing a load-sensitive PTY poll
+#                                    deadline in httpapi-v2-pty.test.ts from 5s to 20s --
+#                                    is deliberately NOT carried: it is a test-only
+#                                    flake fix for a file no build-release step runs.
+#
 # DROPPED on the v1.17 line (see workstation docs/plans/2026-06-11-opencode-1.17-cutover-runbook.md):
 #   - integration-list-batch.patch: DROPPED on the v1.17.13 roll-forward (2026-07-06).
 #     UPSTREAMED — v1.17.13 Integration.list now does the bulk shape natively:
@@ -682,6 +709,7 @@ PATCHES=(
   message-serve-provenance
   db-isolation-guard
   tui-message-scroll
+  sse-cancel-rejection
 )
 
 for name in "${PATCHES[@]}"; do
