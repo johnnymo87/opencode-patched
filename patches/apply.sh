@@ -623,6 +623,22 @@
 #                                    deadline in httpapi-v2-pty.test.ts from 5s to 20s --
 #                                    is deliberately NOT carried: it is a test-only
 #                                    flake fix for a file no build-release step runs.
+#  33. permission-refresh-per-step.patch (local) - re-read session.permission at the top of
+#                                    every run-loop step (bead workstation-xm06). runLoop
+#                                    read the session ONCE per run and handed that
+#                                    snapshot's permission to tool resolution on every
+#                                    step. A run outlives the prompt that started it --
+#                                    prompt_async to a busy session joins the running loop
+#                                    (ensureRunning) -- so a PATCH /session/:id made
+#                                    mid-run (oc-mcp-enable granting slack after an
+#                                    earlier --revoke) stayed invisible until the run
+#                                    ended: "Model tried to call unavailable tool
+#                                    'slack_conversations_add_message'". Reproduced live
+#                                    on cloudbox 2026-09-25. One SELECT by primary key per
+#                                    step, next to a step that already reloads every
+#                                    message. A failed re-read keeps the old ruleset.
+#                                    Carries its own test in session/prompt.test.ts, run by
+#                                    build-release. Upstream-able as-is.
 #
 # DROPPED on the v1.17 line (see workstation docs/plans/2026-06-11-opencode-1.17-cutover-runbook.md):
 #   - integration-list-batch.patch: DROPPED on the v1.17.13 roll-forward (2026-07-06).
@@ -714,6 +730,7 @@ PATCHES=(
   db-isolation-guard
   tui-message-scroll
   sse-cancel-rejection
+  permission-refresh-per-step
 )
 
 for name in "${PATCHES[@]}"; do

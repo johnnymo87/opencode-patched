@@ -1,0 +1,79 @@
+diff --git a/packages/opencode/src/session/prompt.ts b/packages/opencode/src/session/prompt.ts
+index 2ec4705bed..bd9608b688 100644
+--- a/packages/opencode/src/session/prompt.ts
++++ b/packages/opencode/src/session/prompt.ts
+@@ -1122,6 +1122,18 @@ const layer = Layer.effect(
+           yield* status.set(sessionID, { type: "busy" })
+           yield* Effect.logInfo("loop", { "session.id": sessionID, step })
+ 
++          // Re-read the permission ruleset every step. `session` is read once
++          // per run, but a run outlives the prompt that started it: a prompt
++          // posted to a busy session joins this loop, and PATCH /session/:id
++          // can change permissions mid-run (oc-mcp-enable granting an MCP
++          // server). Without this, a grant that follows an earlier deny stays
++          // invisible to the model until the whole run ends. A failed re-read
++          // keeps the ruleset we already had rather than killing the run.
++          session.permission = yield* sessions.get(sessionID).pipe(
++            Effect.map((fresh) => fresh.permission),
++            Effect.orElseSucceed(() => session.permission),
++          )
++
+           let msgs = yield* MessageV2.filterCompactedEffect(sessionID).pipe(
+             Effect.provideService(Database.Service, database),
+           )
+diff --git a/packages/opencode/test/session/prompt.test.ts b/packages/opencode/test/session/prompt.test.ts
+index 502dd1174a..9a1ecfd9dd 100644
+--- a/packages/opencode/test/session/prompt.test.ts
++++ b/packages/opencode/test/session/prompt.test.ts
+@@ -853,6 +853,51 @@ it.instance("loop continues when finish is tool-calls", () =>
+   }),
+ )
+ 
++// A permission change made WHILE a run is in flight (PATCH /session/:id, e.g.
++// oc-mcp-enable granting an MCP server) must reach the run's next step. The run
++// used to snapshot session.permission once at run start, so a grant that
++// followed an earlier deny stayed invisible until the run ended -- and a prompt
++// delivered to a busy session joins the running loop rather than starting one.
++it.instance("permission changes made mid-run apply to the next step's tools", () =>
++  Effect.gen(function* () {
++    const { llm } = yield* useServerConfig(providerCfg)
++    const prompt = yield* SessionPrompt.Service
++    const sessions = yield* Session.Service
++    const denied = [
++      { permission: "*", pattern: "*", action: "allow" as const },
++      { permission: "glob", pattern: "*", action: "deny" as const },
++    ]
++    const session = yield* sessions.create({ title: "Mid-run grant", permission: denied })
++    yield* prompt.prompt({
++      sessionID: session.id,
++      agent: "build",
++      noReply: true,
++      parts: [{ type: "text", text: "hello" }],
++    })
++
++    const gate = yield* Deferred.make<void>()
++    yield* llm.push(reply().wait(deferredAsPromise(gate)).tool("first", { value: "first" }))
++    yield* llm.text("second")
++
++    const run = yield* prompt.loop({ sessionID: session.id }).pipe(Effect.forkChild)
++    // Step 0's request has arrived, so the run has already read the session.
++    yield* llm.wait(1)
++    yield* sessions.setPermission({
++      sessionID: session.id,
++      permission: [...denied, { permission: "glob", pattern: "*", action: "allow" as const }],
++    })
++    yield* Deferred.succeed(gate, void 0)
++    yield* Fiber.join(run)
++
++    const toolNames = (body: Record<string, unknown> | undefined) =>
++      ((body?.tools as { function?: { name?: string } }[] | undefined) ?? []).map((t) => t.function?.name)
++    const inputs = yield* llm.inputs
++    expect(inputs).toHaveLength(2)
++    expect(toolNames(inputs[0])).not.toContain("glob")
++    expect(toolNames(inputs[1])).toContain("glob")
++  }),
++)
++
+ it.instance("glob tool keeps instance context during prompt runs", () =>
+   Effect.gen(function* () {
+     const { dir, llm } = yield* useServerConfig(providerCfg)
