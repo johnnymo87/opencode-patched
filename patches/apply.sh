@@ -636,7 +636,9 @@
 #                                    'slack_conversations_add_message'". Reproduced live
 #                                    on cloudbox 2026-09-25. One SELECT by primary key per
 #                                    step, next to a step that already reloads every
-#                                    message. A failed re-read keeps the old ruleset.
+#                                    message. Scope: the session's own run only -- a Task
+#                                    subagent child copies its parent's ruleset at create
+#                                    time and does not see a later grant to the parent.
 #                                    Carries its own test in session/prompt.test.ts, run by
 #                                    build-release. Upstream-able as-is.
 #
