@@ -292,6 +292,17 @@ jobs:
         run: |
           bun test test/provider/header-timeout.test.ts -t "chunkTimeout raises"
 
+      # permission-refresh-per-step.patch: a PATCH /session/:id made while a run
+      # is in flight must reach the run's next step (oc-mcp-enable granting an
+      # MCP server to a busy session). Named here because build-release runs only
+      # the files it names; a patch-carried test that no step names is inert.
+      # Verified non-vacuous: without the prompt.ts hunk this test fails on
+      # `expect(toolNames(inputs[1])).toContain("glob")`.
+      - name: Mid-run permission refresh test
+        working-directory: opencode-src/packages/opencode
+        run: |
+          bun test test/session/prompt.test.ts -t "permission changes made mid-run"
+
       - name: Build CLI
         run: |
           cd opencode-src/packages/opencode
