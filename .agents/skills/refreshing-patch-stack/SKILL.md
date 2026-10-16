@@ -1,4 +1,9 @@
-# Skill: patch-refresh
+---
+name: refreshing-patch-stack
+description: Use when refreshing or rebasing the opencode-patched patch stack onto a new upstream opencode release, when a patch in patches/ no longer applies or typechecks after an upstream bump, or when deciding which repo (opencode-patched vs opencode-cached) owns a broken patch and whether an upstream PR has made a patch obsolete.
+---
+
+# Refreshing the Patch Stack
 
 Guidance for refreshing the opencode patch stack when upstream releases a new version.
 

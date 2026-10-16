@@ -1,4 +1,9 @@
-# Skill: darwin-signing
+---
+name: signing-darwin-binaries
+description: Use when macOS darwin release binaries or zips need codesigning attention — editing .github/workflows/build-release.yml, bumping Bun, a darwin binary dying with "Killed: 9" / SIGKILL on Apple Silicon, codesign reporting "invalid or unsupported format for signature", or deciding whether BUN_NO_CODESIGN_MACHO_BINARY can be removed.
+---
+
+# Signing Darwin Binaries
 
 Use when editing `.github/workflows/build-release.yml`, bumping Bun, or debugging `Killed: 9` / SIGKILL reports for the darwin binaries.
 
